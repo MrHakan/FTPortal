@@ -14,7 +14,6 @@ $Global:Port          = 8080
 $Global:ShareFolder   = 'C:\SharedTransfer'
 $Global:CookieName    = 'LDSID'
 $Global:SessionTTL    = [TimeSpan]::FromHours(1)
-$Global:MaxUpload     = 512MB
 $Global:MaxThreads    = 16    # ayni anda islenebilecek istek sayisi (es zamanli kullanici)
 # Es zamanli erisim icin thread-safe: birden fazla worker ayni anda okur/yazar
 $Global:Sessions      = [hashtable]::Synchronized(@{})   # SessionID -> @{ Created; LastSeen }
@@ -474,7 +473,6 @@ function Get-DashboardPage {
   var queued=[];          // {file, id, status} biriken liste
   var uploading=false;
   var seq=0;
-  var MAX=$($Global:MaxUpload);
 
   function toast(msg,type){
     var t=document.createElement('div');t.className='toast '+(type||'ok');t.textContent=msg;
@@ -503,12 +501,10 @@ function Get-DashboardPage {
   function render(){
     fileList.innerHTML='';
     queued.forEach(function(q){
-      var big=q.file.size>MAX;
       var row=document.createElement('div');
-      row.className='fileitem'+(big?' toobig':'');
+      row.className='fileitem';
       var stat='';
-      if(big){stat='<span class="fi-stat err">cok buyuk</span>';}
-      else if(q.status==='ok'){stat='<span class="fi-stat ok">&#10003; yuklendi</span>';}
+      if(q.status==='ok'){stat='<span class="fi-stat ok">&#10003; yuklendi</span>';}
       else if(q.status==='err'){stat='<span class="fi-stat err">&#10007; hata</span>';}
       else if(q.status==='up'){stat='<span class="fi-stat up">yukleniyor...</span>';}
       var rm=(uploading?'':'<span class="fi-x" data-id="'+q.id+'">&#10005;</span>');
@@ -517,10 +513,9 @@ function Get-DashboardPage {
         '<span class="fi-size">'+fmtSize(q.file.size)+'</span>'+stat+rm;
       fileList.appendChild(row);
     });
-    var valid=queued.filter(function(q){return q.file.size<=MAX;}).length;
-    upBtn.disabled=(valid===0||uploading);
+    upBtn.disabled=(queued.length===0||uploading);
     clearBtn.style.display=(queued.length&&!uploading)?'inline-block':'none';
-    countLbl.textContent=queued.length?(queued.length+' dosya secildi'+(valid<queued.length?' ('+(queued.length-valid)+' limit asti)':'')):'';
+    countLbl.textContent=queued.length?(queued.length+' dosya secildi'):'';
   }
   fileList.addEventListener('click',function(ev){
     var x=ev.target.closest('.fi-x');
@@ -534,7 +529,6 @@ function Get-DashboardPage {
   clearBtn.addEventListener('click',function(){if(!uploading){queued=[];render();}});
 
   function uploadOne(item,done){
-    if(item.file.size>MAX){item.status='err';toast(item.file.name+' cok buyuk (512MB limit)','err');render();done();return;}
     item.status='up';render();
     var fd=new FormData();fd.append('file',item.file,item.file.name);
     var xhr=new XMLHttpRequest();xhr.open('POST','/upload',true);
@@ -550,7 +544,7 @@ function Get-DashboardPage {
     xhr.send(fd);
   }
   upBtn.addEventListener('click',function(){
-    var todo=queued.filter(function(q){return q.file.size<=MAX && q.status!=='ok';});
+    var todo=queued.filter(function(q){return q.status!=='ok';});
     if(!todo.length||uploading)return;
     uploading=true;render();
     barWrap.classList.add('show');bar.style.width='0';
@@ -576,75 +570,106 @@ function Get-DashboardPage {
 # ------------------------------------------------------------------------------
 #  MULTIPART PARSER (binary-safe, Latin1)
 # ------------------------------------------------------------------------------
-function Save-UploadedFile {
-    param($Req)
+function Save-UploadedFileStream {
+    # Streaming multipart parser: agi dogrudan diske akar, RAM'e tamamen yuklemez.
+    # Boyut limiti yok. 256KB chunk ile agi diske esit hizda yazar.
+    param([System.IO.Stream]$NetStream, [string]$ContentType)
 
-    $bytes = $Req.Body
-    if ($null -eq $bytes -or $bytes.Length -eq 0) { return @{ ok = $false; status = 400; msg = 'Bos istek' } }
-
-    $ctype = $Req.ContentType
-    if ($ctype -notmatch 'boundary=(.+)$') { return @{ ok = $false; status = 400; msg = 'Boundary bulunamadi' } }
+    if ($ContentType -notmatch 'boundary=(.+)$') { return @{ ok=$false; status=400; msg='Boundary bulunamadi' } }
     $boundary = $Matches[1].Trim().Trim('"')
-    $latin1 = [System.Text.Encoding]::GetEncoding(28591)  # ISO-8859-1 / Latin1
-    $body   = $latin1.GetString($bytes)
+    $latin1   = [System.Text.Encoding]::GetEncoding(28591)
 
-    $delim     = '--' + $boundary
-    $headerSep = "`r`n`r`n"
-
-    $partStart = $body.IndexOf($delim)
-    if ($partStart -lt 0) { return @{ ok = $false; status = 400; msg = 'Part bulunamadi' } }
-
-    $hdrStart = $partStart + $delim.Length
-    $hdrEnd   = $body.IndexOf($headerSep, $hdrStart)
-    if ($hdrEnd -lt 0) { return @{ ok = $false; status = 400; msg = 'Header ayristirilamadi' } }
-    $headerBlock = $body.Substring($hdrStart, $hdrEnd - $hdrStart)
-
+    # --- Adim 1: multipart header blogu oku (sadece ufak metin, ram'e alinir) ---
+    $hdrBuf = New-Object System.Collections.Generic.List[byte]
+    $b0=-1;$b1=-1;$b2=-1;$b3=-1
+    while ($true) {
+        $b = $NetStream.ReadByte()
+        if ($b -lt 0) { return @{ ok=$false; status=400; msg='Baglanti kesildi (header)' } }
+        $hdrBuf.Add([byte]$b)
+        $b0=$b1; $b1=$b2; $b2=$b3; $b3=$b
+        if ($b0 -eq 13 -and $b1 -eq 10 -and $b2 -eq 13 -and $b3 -eq 10) { break }
+        if ($hdrBuf.Count -gt 8192) { return @{ ok=$false; status=400; msg='Multipart header cok buyuk' } }
+    }
+    $hdrText  = $latin1.GetString($hdrBuf.ToArray())
     $fileName = $null
-    if ($headerBlock -match 'filename="([^"]*)"') { $fileName = $Matches[1] }
-    if ([string]::IsNullOrWhiteSpace($fileName)) { return @{ ok = $false; status = 400; msg = 'Dosya adi yok' } }
-    $fileName = [System.IO.Path]::GetFileName($fileName)  # path strip
+    if ($hdrText -match 'filename="([^"]*)"') { $fileName = $Matches[1] }
+    if ([string]::IsNullOrWhiteSpace($fileName)) { return @{ ok=$false; status=400; msg='Dosya adi yok' } }
+    $fileName = [System.IO.Path]::GetFileName($fileName)
 
-    $contentStartChar = $hdrEnd + $headerSep.Length
-    $contentEndChar = $body.IndexOf("`r`n" + $delim, $contentStartChar)
-    if ($contentEndChar -lt 0) { $contentEndChar = $body.IndexOf($delim, $contentStartChar) }
-    if ($contentEndChar -lt 0) { return @{ ok = $false; status = 400; msg = 'Icerik sonu bulunamadi' } }
-
-    $contentLen = $contentEndChar - $contentStartChar
-    if ($contentLen -le 0) { return @{ ok = $false; status = 400; msg = 'Bos dosya icerigi' } }
-
-    $fileBytes = New-Object byte[] $contentLen
-    [System.Array]::Copy($bytes, $contentStartChar, $fileBytes, 0, $contentLen)
-
-    # KISA KILIT: benzersiz ad sec + bos dosya olusturarak rezerve et.
-    # Iki kullanici ayni anda ayni adi atarsa biri dosya.txt, digeri dosya_1.txt alir.
+    # --- Adim 2: benzersiz dosya adi rezerve et (kisa kilit) ---
     $target = $null
     [System.Threading.Monitor]::Enter($Global:UploadLock)
     try {
-        $target = Join-Path $Global:ShareFolder $fileName
+        $target = Join-Path $ShareFolder $fileName
         if (Test-Path -LiteralPath $target) {
             $base = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
             $ext  = [System.IO.Path]::GetExtension($fileName)
-            $i = 1
-            do {
-                $candidate = Join-Path $Global:ShareFolder ("{0}_{1}{2}" -f $base, $i, $ext)
-                $i++
-            } while (Test-Path -LiteralPath $candidate)
+            $n = 1
+            do { $candidate = Join-Path $ShareFolder ("{0}_{1}{2}" -f $base,$n,$ext); $n++ } while (Test-Path -LiteralPath $candidate)
             $target = $candidate
         }
-        # Adi rezerve et (bos dosya). Disk yazimi kilit DISINDA yapilir -> es zamanlilik korunur.
-        (New-Object System.IO.FileStream($target, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)).Close()
+        (New-Object System.IO.FileStream($target,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None)).Close()
     } catch {
-        return @{ ok = $false; status = 500; msg = $_.Exception.Message }
+        return @{ ok=$false; status=500; msg=$_.Exception.Message }
     } finally {
         [System.Threading.Monitor]::Exit($Global:UploadLock)
     }
 
+    # --- Adim 3: dosya icerigini ag'dan diske aktar ---
+    # Durdurma sinyali: \r\n--<boundary>  (sonraki boundary veya son boundary)
+    $delimBytes = $latin1.GetBytes("`r`n--" + $boundary)
+    $delimLen   = $delimBytes.Length
+    $chunkSize  = 262144  # 256 KB
+    $chunk      = New-Object byte[] $chunkSize
+    $overlap    = New-Object byte[] ($delimLen - 1)
+    $overlapLen = 0
+
+    $fs = $null
     try {
-        [System.IO.File]::WriteAllBytes($target, $fileBytes)
-        return @{ ok = $true; status = 200; msg = ([System.IO.Path]::GetFileName($target)) }
+        $fs = New-Object System.IO.FileStream($target,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None,262144,[System.IO.FileOptions]::SequentialScan)
+        $found = $false
+
+        while (-not $found) {
+            $read = $NetStream.Read($chunk, 0, $chunkSize)
+            if ($read -le 0) { break }
+
+            # overlap + yeni chunk birlestir
+            $sbLen = $overlapLen + $read
+            $sb    = New-Object byte[] $sbLen
+            if ($overlapLen -gt 0) { [System.Array]::Copy($overlap, 0, $sb, 0, $overlapLen) }
+            [System.Array]::Copy($chunk, 0, $sb, $overlapLen, $read)
+
+            # boundary ara (ilk byte eslesmesine gore hizli atla)
+            $d0  = $delimBytes[0]
+            $pos = -1
+            for ($i = 0; $i -le $sbLen - $delimLen; $i++) {
+                if ($sb[$i] -ne $d0) { continue }
+                $ok = $true
+                for ($j = 1; $j -lt $delimLen; $j++) {
+                    if ($sb[$i+$j] -ne $delimBytes[$j]) { $ok=$false; break }
+                }
+                if ($ok) { $pos = $i; break }
+            }
+
+            if ($pos -ge 0) {
+                if ($pos -gt 0) { $fs.Write($sb, 0, $pos) }
+                $found = $true
+            } else {
+                $safe = $sbLen - ($delimLen - 1)
+                if ($safe -gt 0) { $fs.Write($sb, 0, $safe) }
+                $overlapLen = [Math]::Min($delimLen - 1, $sbLen)
+                if ($overlapLen -gt 0) { [System.Array]::Copy($sb, $sbLen - $overlapLen, $overlap, 0, $overlapLen) }
+            }
+        }
+
+        $fs.Flush()
+        return @{ ok=$true; status=200; msg=([System.IO.Path]::GetFileName($target)) }
     } catch {
+        try { if ($fs) { $fs.Close() } } catch {}
         try { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue } catch {}
-        return @{ ok = $false; status = 500; msg = $_.Exception.Message }
+        return @{ ok=$false; status=500; msg=$_.Exception.Message }
+    } finally {
+        try { if ($fs) { $fs.Close() } } catch {}
     }
 }
 
@@ -843,7 +868,7 @@ function Invoke-RequestRouter {
             } elseif ($method -ne 'POST') {
                 Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"Yalnizca POST"}' -Status 405
             } else {
-                $r = Save-UploadedFile -Req $Req
+                $r = Save-UploadedFileStream -NetStream $Stream -ContentType $Req.ContentType
                 if ($r.ok) {
                     Send-JsonResponse -Stream $Stream -Json '{"ok":true}' -Status 200
                 } else {
@@ -910,7 +935,7 @@ $funcNames = @(
     'Get-IconForFile','Format-Size','Remove-ExpiredSessions','New-SessionId',
     'Read-HttpRequest','Read-RequestBody','Get-HttpStatusText','Send-Response',
     'Send-HtmlResponse','Send-JsonResponse','Send-RedirectResponse','New-SessionCookieHeader',
-    'Test-ValidSession','Get-LoginPage','Get-DashboardPage','Save-UploadedFile',
+    'Test-ValidSession','Get-LoginPage','Get-DashboardPage','Save-UploadedFileStream',
     'Send-FileDownload','Invoke-RequestRouter'
 )
 foreach ($fn in $funcNames) {
@@ -924,7 +949,6 @@ $sharedVars = @{
     ShareFolder = $Global:ShareFolder
     CookieName  = $Global:CookieName
     SessionTTL  = $Global:SessionTTL
-    MaxUpload   = $Global:MaxUpload
     Sessions    = $Global:Sessions      # synchronized hashtable (paylasilan referans)
     UploadLock  = $Global:UploadLock
 }
@@ -953,14 +977,15 @@ $worker = {
 
         Write-Host ("[{0}] {1,-5} {2}" -f $ts, $req.Method, $req.RawTarget) -ForegroundColor DarkGray
 
-        if ($req.ContentLength -gt 0) {
-            if ($req.ContentLength -gt $MaxUpload) {
-                Send-JsonResponse -Stream $stream -Json '{"ok":false,"msg":"Dosya 512 MB limitini asiyor"}' -Status 413
-                return
+        # Upload: body RAM'e yuklenmez, stream dogrudan diske akar (boyut limiti yok).
+        # Diger istekler (login form vs): kucuk body RAM'e alinir.
+        $isUpload = ($req.Method -eq 'POST' -and $req.Path -eq '/upload')
+        if (-not $isUpload) {
+            if ($req.ContentLength -gt 0) {
+                $req.Body = Read-RequestBody -Stream $stream -Length $req.ContentLength
+            } else {
+                $req.Body = New-Object byte[] 0
             }
-            $req.Body = Read-RequestBody -Stream $stream -Length $req.ContentLength
-        } else {
-            $req.Body = New-Object byte[] 0
         }
 
         Invoke-RequestRouter -Req $req -Stream $stream
