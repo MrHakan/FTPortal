@@ -1,42 +1,71 @@
 # ==============================================================================
-#  LocalFilePortal.ps1  -  Parola Korumali Yerel Web Dosya Sunucusu (Captive Portal)
-#  Native PowerShell 5.1+  |  Harici bagimlilik YOK  |  Tek dosya
-#  ADMIN GEREKTIRMEZ  -  TcpListener (port 8080) ile dinler, ayni Wi-Fi/LAN paylasimi
+#  LocalFilePortal.ps1  v2.0
+#  Tek dosyalik PowerShell yerel dosya transfer portali
+#   - Sadece Wi-Fi uzerinden, admin yetkisi gerektirmez (TcpListener)
+#   - Bagli cihazlar gozukur, click ile secip dosya gonderme + public broadcast
+#   - Sure limiti YOK, boyut limiti YOK
+#   - Streaming multipart parser + C# FastScan boundary -> hizli yukleme
+#   - Native PowerShell 5.1+, harici bagimlilik YOK
 # ==============================================================================
 
 Add-Type -AssemblyName System.Web
 
-# ------------------------------------------------------------------------------
-#  AYARLAR
-# ------------------------------------------------------------------------------
-$Global:Password      = 'hako123'
-$Global:Port          = 8080
-$Global:ShareFolder   = 'C:\SharedTransfer'
-$Global:CookieName    = 'LDSID'
-$Global:SessionTTL    = [TimeSpan]::FromHours(1)
-$Global:MaxThreads    = 16    # ayni anda islenebilecek istek sayisi (es zamanli kullanici)
-# Es zamanli erisim icin thread-safe: birden fazla worker ayni anda okur/yazar
-$Global:Sessions      = [hashtable]::Synchronized(@{})   # SessionID -> @{ Created; LastSeen }
-$Global:UploadLock    = New-Object object                # upload isim cakismasi kilidi
+# ============================== AYARLAR ======================================
+$Global:Password    = 'hako123'
+$Global:Port        = 8080
+$Global:ShareFolder = 'C:\SharedTransfer'
+$Global:MetaFolder  = Join-Path $Global:ShareFolder '.meta'
+$Global:CookieName  = 'LDSID'
+$Global:SessionTTL  = [TimeSpan]::FromDays(365)     # pratikte oturum suresi yok
+$Global:DeviceTTL   = [TimeSpan]::FromMinutes(5)    # 'online' esigi
+$Global:MaxThreads  = 32
+$Global:SweepEvery  = [TimeSpan]::FromMinutes(2)
 
-# Paylasim klasoru yoksa olustur
-if (-not (Test-Path -LiteralPath $Global:ShareFolder)) {
-    New-Item -ItemType Directory -Path $Global:ShareFolder -Force | Out-Null
+$Global:Sessions   = [hashtable]::Synchronized(@{})   # sid -> @{Sid;PubId;Nick;IP;UA;Created;LastSeen}
+$Global:PubIndex   = [hashtable]::Synchronized(@{})   # pubId -> sid
+$Global:Transfers  = [hashtable]::Synchronized(@{})   # id -> @{Id;Name;Path;Size;Sender;SenderNick;Target;Created}
+$Global:UploadLock = New-Object object
+$Global:SweepState = [hashtable]::Synchronized(@{ Last = [datetime]::MinValue })
+
+foreach ($d in @($Global:ShareFolder, $Global:MetaFolder)) {
+    if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
 
-# ------------------------------------------------------------------------------
-#  YARDIMCI FONKSIYONLAR
-# ------------------------------------------------------------------------------
+# =================== HIZLI BOUNDARY TARAYICISI (C#) ===========================
+# PowerShell array indeks erisimi cok yavas. C# ile native scan -> ~100x hiz.
+if (-not ('LFP.FastScan' -as [type])) {
+    Add-Type -TypeDefinition @'
+namespace LFP {
+    public static class FastScan {
+        public static int IndexOf(byte[] hay, int start, int len, byte[] needle) {
+            int nlen = needle.Length;
+            if (nlen == 0 || len < nlen) return -1;
+            int end = start + len - nlen;
+            byte n0 = needle[0];
+            for (int i = start; i <= end; i++) {
+                if (hay[i] != n0) continue;
+                int j = 1;
+                while (j < nlen && hay[i+j] == needle[j]) j++;
+                if (j == nlen) return i;
+            }
+            return -1;
+        }
+    }
+}
+'@
+}
+
+# ============================== YARDIMCILAR ===================================
 function Get-IconForFile {
     param([string]$Name)
     $ext = [System.IO.Path]::GetExtension($Name).ToLowerInvariant().TrimStart('.')
     switch ($ext) {
-        'pdf'                                   { return [char]0xD83D + [char]0xDCC4 } # PDF
-        { $_ -in 'zip','rar','7z','tar','gz' }  { return [char]0xD83D + [char]0xDDDC } # ZIP
-        { $_ -in 'jpg','jpeg','png','gif','bmp','webp','svg','tiff' } { return [char]0xD83D + [char]0xDDBC } # IMG
-        { $_ -in 'mp4','mkv','avi','mov','wmv','flv','webm' }         { return [char]0xD83C + [char]0xDFAC } # VID
-        { $_ -in 'mp3','wav','flac','aac','ogg','m4a' }              { return [char]0xD83C + [char]0xDFB5 } # SES
-        { $_ -in 'exe','msi','bat','cmd','ps1' }                     { return [char]0x2699 + [char]0xFE0F } # EXE
+        'pdf'                                   { return [char]0xD83D + [char]0xDCC4 }
+        { $_ -in 'zip','rar','7z','tar','gz' }  { return [char]0xD83D + [char]0xDDDC }
+        { $_ -in 'jpg','jpeg','png','gif','bmp','webp','svg','tiff' } { return [char]0xD83D + [char]0xDDBC }
+        { $_ -in 'mp4','mkv','avi','mov','wmv','flv','webm' }         { return [char]0xD83C + [char]0xDFAC }
+        { $_ -in 'mp3','wav','flac','aac','ogg','m4a' }              { return [char]0xD83C + [char]0xDFB5 }
+        { $_ -in 'exe','msi','bat','cmd','ps1' }                     { return [char]0x2699 + [char]0xFE0F }
         { $_ -in 'doc','docx' }                 { return [char]0xD83D + [char]0xDCDD }
         { $_ -in 'xls','xlsx','csv' }           { return [char]0xD83D + [char]0xDCCA }
         { $_ -in 'ppt','pptx' }                 { return [char]0xD83D + [char]0xDCFD }
@@ -54,15 +83,6 @@ function Format-Size {
     return ('{0} B' -f [int]$Bytes)
 }
 
-function Remove-ExpiredSessions {
-    $now = Get-Date
-    $dead = @()
-    foreach ($k in @($Global:Sessions.Keys)) {
-        if (($now - $Global:Sessions[$k].LastSeen) -gt $Global:SessionTTL) { $dead += $k }
-    }
-    foreach ($k in $dead) { $Global:Sessions.Remove($k) }
-}
-
 function New-SessionId {
     $bytes = New-Object byte[] 32
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -70,15 +90,96 @@ function New-SessionId {
     return ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
 }
 
-# ------------------------------------------------------------------------------
-#  HTTP KATMANI (TcpListener uzerinde - admin gerektirmez)
-# ------------------------------------------------------------------------------
-# Request nesnesi: @{ Method; Path; Query; RawTarget; Headers(hash); Cookies(hash); Body([byte[]]); ContentType; ContentLength }
+function New-ShortId {
+    param([int]$Bytes = 4)
+    $b = New-Object byte[] $Bytes
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($b) } finally { $rng.Dispose() }
+    return ([System.BitConverter]::ToString($b) -replace '-','').ToLowerInvariant()
+}
 
+function Get-DeviceLabel {
+    param([string]$UA, [string]$IP)
+    $ua = if ($UA) { $UA.ToLowerInvariant() } else { '' }
+    $os = 'Cihaz'
+    if     ($ua -match 'windows nt')       { $os = 'Windows' }
+    elseif ($ua -match 'iphone')           { $os = 'iPhone' }
+    elseif ($ua -match 'ipad')             { $os = 'iPad' }
+    elseif ($ua -match 'android')          { $os = 'Android' }
+    elseif ($ua -match 'macintosh|mac os') { $os = 'Mac' }
+    elseif ($ua -match 'linux')            { $os = 'Linux' }
+    $last = if ($IP -match '\.(\d+)$') { $Matches[1] } else { 'x' }
+    return "$os-$last"
+}
+
+function Invoke-PeriodicSweep {
+    $now = Get-Date
+    [System.Threading.Monitor]::Enter($Global:SweepState)
+    try {
+        if (($now - $Global:SweepState.Last) -lt $Global:SweepEvery) { return }
+        $Global:SweepState.Last = $now
+    } finally { [System.Threading.Monitor]::Exit($Global:SweepState) }
+
+    $dead = @()
+    foreach ($k in @($Global:Sessions.Keys)) {
+        $s = $Global:Sessions[$k]
+        if ($null -eq $s -or ($now - $s.LastSeen) -gt $Global:SessionTTL) { $dead += $k }
+    }
+    foreach ($k in $dead) {
+        $s = $Global:Sessions[$k]
+        if ($s -and $s.PubId) { [void]$Global:PubIndex.Remove($s.PubId) }
+        [void]$Global:Sessions.Remove($k)
+    }
+}
+
+function Save-TransferMeta {
+    param($T)
+    $obj = [ordered]@{
+        id         = $T.Id
+        name       = $T.Name
+        path       = $T.Path
+        size       = $T.Size
+        sender     = $T.Sender
+        senderNick = $T.SenderNick
+        target     = $T.Target
+        created    = $T.Created.ToString('o')
+    }
+    $json = $obj | ConvertTo-Json -Compress
+    [System.IO.File]::WriteAllText((Join-Path $Global:MetaFolder ($T.Id + '.json')), $json, [System.Text.Encoding]::UTF8)
+}
+
+function Import-AllTransfers {
+    if (-not (Test-Path -LiteralPath $Global:MetaFolder)) { return }
+    Get-ChildItem -LiteralPath $Global:MetaFolder -File -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            $raw = Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8
+            $j   = $raw | ConvertFrom-Json
+            if (Test-Path -LiteralPath $j.path -PathType Leaf) {
+                $Global:Transfers[$j.id] = @{
+                    Id=$j.id; Name=$j.name; Path=$j.path; Size=[int64]$j.size
+                    Sender=$j.sender; SenderNick=$j.senderNick; Target=$j.target
+                    Created=[DateTime]::Parse($j.created)
+                }
+            } else {
+                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+        } catch {}
+    }
+}
+
+function Remove-Transfer {
+    param([string]$Id)
+    $t = $Global:Transfers[$Id]
+    if ($null -eq $t) { return $false }
+    try { Remove-Item -LiteralPath $t.Path -Force -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Item -LiteralPath (Join-Path $Global:MetaFolder ($Id + '.json')) -Force -ErrorAction SilentlyContinue } catch {}
+    [void]$Global:Transfers.Remove($Id)
+    return $true
+}
+
+# ============================== HTTP KATMANI ==================================
 function Read-HttpRequest {
     param([System.IO.Stream]$Stream)
-
-    # Header bloklarini \r\n\r\n gorene kadar byte byte oku
     $headerBytes = New-Object System.Collections.Generic.List[byte]
     $b0=-1;$b1=-1;$b2=-1;$b3=-1
     while ($true) {
@@ -87,7 +188,7 @@ function Read-HttpRequest {
         $headerBytes.Add([byte]$b)
         $b0=$b1; $b1=$b2; $b2=$b3; $b3=$b
         if ($b0 -eq 13 -and $b1 -eq 10 -and $b2 -eq 13 -and $b3 -eq 10) { break }
-        if ($headerBytes.Count -gt 65536) { break }  # asiri header korumasi
+        if ($headerBytes.Count -gt 65536) { break }
     }
     if ($headerBytes.Count -eq 0) { return $null }
 
@@ -117,12 +218,10 @@ function Read-HttpRequest {
         }
     }
 
-    # Cookies
     $cookies = @{}
     if ($headers.ContainsKey('cookie')) {
         foreach ($pair in $headers['cookie'].Split(';')) {
-            $kv = $pair.Trim()
-            $ei = $kv.IndexOf('=')
+            $kv = $pair.Trim(); $ei = $kv.IndexOf('=')
             if ($ei -gt 0) { $cookies[$kv.Substring(0,$ei).Trim()] = $kv.Substring($ei+1).Trim() }
         }
     }
@@ -131,32 +230,28 @@ function Read-HttpRequest {
     if ($headers.ContainsKey('content-length')) { [void][int64]::TryParse($headers['content-length'], [ref]$contentLength) }
     $contentType = ''
     if ($headers.ContainsKey('content-type')) { $contentType = $headers['content-type'] }
+    $userAgent = ''
+    if ($headers.ContainsKey('user-agent')) { $userAgent = $headers['user-agent'] }
 
     return [pscustomobject]@{
-        Method        = $method
-        Path          = $path.ToLowerInvariant()
-        RawTarget     = $rawTarget
-        Query         = $query
-        Headers       = $headers
-        Cookies       = $cookies
-        ContentLength = $contentLength
-        ContentType   = $contentType
-        Stream        = $Stream
-        Body          = $null
+        Method=$method; Path=$path.ToLowerInvariant(); RawTarget=$rawTarget; Query=$query
+        Headers=$headers; Cookies=$cookies; ContentLength=$contentLength; ContentType=$contentType
+        UserAgent=$userAgent; Stream=$Stream; Body=$null; ClientIp='?'
     }
 }
 
 function Read-RequestBody {
-    param([System.IO.Stream]$Stream, [int64]$Length)
+    param([System.IO.Stream]$Stream, [int64]$Length, [int64]$Cap = 4194304)
     if ($Length -le 0) { return New-Object byte[] 0 }
-    $buf = New-Object byte[] $Length
+    $effective = [int][Math]::Min($Length, $Cap)
+    $buf = New-Object byte[] $effective
     $got = 0
-    while ($got -lt $Length) {
-        $r = $Stream.Read($buf, $got, [int][Math]::Min(81920, $Length - $got))
+    while ($got -lt $effective) {
+        $r = $Stream.Read($buf, $got, [int][Math]::Min(81920, $effective - $got))
         if ($r -le 0) { break }
         $got += $r
     }
-    if ($got -lt $Length) {
+    if ($got -lt $effective) {
         $trim = New-Object byte[] $got
         [System.Array]::Copy($buf, 0, $trim, 0, $got)
         return $trim
@@ -167,25 +262,24 @@ function Read-RequestBody {
 function Get-HttpStatusText {
     param([int]$Code)
     switch ($Code) {
-        200 { 'OK' } 302 { 'Found' } 400 { 'Bad Request' } 401 { 'Unauthorized' }
-        403 { 'Forbidden' } 404 { 'Not Found' } 405 { 'Method Not Allowed' }
-        413 { 'Payload Too Large' } 500 { 'Internal Server Error' } default { 'OK' }
+        200 { 'OK' } 204 { 'No Content' } 302 { 'Found' } 400 { 'Bad Request' }
+        401 { 'Unauthorized' } 403 { 'Forbidden' } 404 { 'Not Found' }
+        405 { 'Method Not Allowed' } 500 { 'Internal Server Error' } default { 'OK' }
     }
 }
 
 function Send-Response {
     param(
-        [System.IO.Stream]$Stream,
-        [int]$Status = 200,
+        [System.IO.Stream]$Stream, [int]$Status = 200,
         [string]$ContentType = 'text/html; charset=utf-8',
-        [byte[]]$Body = $null,
-        [hashtable]$ExtraHeaders = $null
+        [byte[]]$Body = $null, [hashtable]$ExtraHeaders = $null
     )
     if ($null -eq $Body) { $Body = New-Object byte[] 0 }
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append("HTTP/1.1 $Status " + (Get-HttpStatusText $Status) + "`r`n")
     [void]$sb.Append("Content-Type: $ContentType`r`n")
     [void]$sb.Append("Content-Length: $($Body.Length)`r`n")
+    [void]$sb.Append("Cache-Control: no-store`r`n")
     [void]$sb.Append("Connection: close`r`n")
     if ($ExtraHeaders) {
         foreach ($k in $ExtraHeaders.Keys) { [void]$sb.Append("$k`: $($ExtraHeaders[$k])`r`n") }
@@ -199,14 +293,12 @@ function Send-Response {
 
 function Send-HtmlResponse {
     param([System.IO.Stream]$Stream, [string]$Html, [int]$Status = 200, [hashtable]$ExtraHeaders = $null)
-    $buf = [System.Text.Encoding]::UTF8.GetBytes($Html)
-    Send-Response -Stream $Stream -Status $Status -ContentType 'text/html; charset=utf-8' -Body $buf -ExtraHeaders $ExtraHeaders
+    Send-Response -Stream $Stream -Status $Status -ContentType 'text/html; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($Html)) -ExtraHeaders $ExtraHeaders
 }
 
 function Send-JsonResponse {
     param([System.IO.Stream]$Stream, [string]$Json, [int]$Status = 200, [hashtable]$ExtraHeaders = $null)
-    $buf = [System.Text.Encoding]::UTF8.GetBytes($Json)
-    Send-Response -Stream $Stream -Status $Status -ContentType 'application/json; charset=utf-8' -Body $buf -ExtraHeaders $ExtraHeaders
+    Send-Response -Stream $Stream -Status $Status -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($Json)) -ExtraHeaders $ExtraHeaders
 }
 
 function Send-RedirectResponse {
@@ -219,8 +311,7 @@ function Send-RedirectResponse {
 function New-SessionCookieHeader {
     param([string]$Sid, [bool]$Expire = $false)
     if ($Expire) {
-        $exp = 'Thu, 01 Jan 1970 00:00:00 GMT'
-        return "$Global:CookieName=deleted; Path=/; HttpOnly; SameSite=Strict; Expires=$exp"
+        return "$Global:CookieName=deleted; Path=/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
     }
     $exp = (Get-Date).Add($Global:SessionTTL).ToUniversalTime().ToString('R')
     return "$Global:CookieName=$Sid; Path=/; HttpOnly; SameSite=Strict; Expires=$exp"
@@ -228,358 +319,58 @@ function New-SessionCookieHeader {
 
 function Test-ValidSession {
     param($Req)
-    Remove-ExpiredSessions
     $sid = $Req.Cookies[$Global:CookieName]
     if ($sid -and $Global:Sessions.ContainsKey($sid)) {
         $Global:Sessions[$sid].LastSeen = Get-Date
-        return $true
+        return $sid
     }
-    return $false
+    return $null
 }
 
-# ------------------------------------------------------------------------------
-#  HTML SAYFALARI
-# ------------------------------------------------------------------------------
-function Get-LoginPage {
-    param([bool]$Error = $false)
-    $errBlock = if ($Error) { '<div class="error-msg">Hatali parola. Tekrar deneyin.</div>' } else { '' }
-    return @"
-<!DOCTYPE html>
-<html lang="tr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Yerel Dosya Portali - Giris</title>
-<style>
-  :root{
-    --bg:#0d0f12; --card:#141720; --border:#1e2330; --accent:#4f8ef7;
-    --text:#e8ecf5; --muted:#5a6480; --ok:#4ff78e; --err:#f74f6a;
-  }
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{
-    font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);
-    min-height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden;
-  }
-  .grid-bg{
-    position:fixed;inset:0;z-index:0;
-    background-image:linear-gradient(rgba(79,142,247,.07) 1px,transparent 1px),
-                     linear-gradient(90deg,rgba(79,142,247,.07) 1px,transparent 1px);
-    background-size:42px 42px;animation:drift 22s linear infinite;
-  }
-  @keyframes drift{from{background-position:0 0}to{background-position:42px 42px}}
-  .card{
-    position:relative;z-index:1;background:var(--card);border:1px solid var(--border);
-    border-radius:18px;padding:42px 38px;width:380px;max-width:92vw;
-    box-shadow:0 24px 60px rgba(0,0,0,.55);
-  }
-  .logo{display:flex;align-items:center;gap:12px;margin-bottom:6px}
-  .logo .icon{font-size:34px}
-  .logo h1{font-size:20px;font-weight:700;letter-spacing:.5px}
-  .sub{color:var(--muted);font-size:13px;margin-bottom:26px}
-  label{display:block;font-size:12px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}
-  .pw-wrap{position:relative;margin-bottom:18px}
-  input[type=password],input[type=text].pw{
-    width:100%;padding:13px 46px 13px 14px;background:var(--bg);border:1px solid var(--border);
-    border-radius:10px;color:var(--text);font-size:15px;outline:none;transition:border .2s;
-  }
-  input:focus{border-color:var(--accent)}
-  .toggle{
-    position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;
-    color:var(--muted);cursor:pointer;font-size:18px;padding:6px;
-  }
-  button.submit{
-    width:100%;padding:13px;background:var(--accent);color:#fff;border:none;border-radius:10px;
-    font-size:15px;font-weight:600;cursor:pointer;transition:filter .2s;
-  }
-  button.submit:hover{filter:brightness(1.1)}
-  .error-msg{
-    background:rgba(247,79,106,.12);border:1px solid var(--err);color:var(--err);
-    padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:18px;
-  }
-  .status{display:flex;align-items:center;gap:8px;margin-top:22px;font-size:12px;color:var(--muted);justify-content:center}
-  .dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);animation:blink 1.4s ease-in-out infinite}
-  @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
-</style>
-</head>
-<body>
-  <div class="grid-bg"></div>
-  <div class="card">
-    <div class="logo"><span class="icon">&#128274;</span><h1>YEREL DOSYA PORTALI</h1></div>
-    <div class="sub">Devam etmek icin erisim parolasini girin.</div>
-    $errBlock
-    <form method="POST" action="/">
-      <label for="pw">Parola</label>
-      <div class="pw-wrap">
-        <input id="pw" name="password" type="password" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;" autofocus required>
-        <button type="button" class="toggle" id="tgl" title="Goster/Gizle">&#128065;</button>
-      </div>
-      <button type="submit" class="submit">Giris Yap</button>
-    </form>
-    <div class="status"><span class="dot"></span> Sunucu aktif - dinleniyor</div>
-  </div>
-<script>
-  var pw=document.getElementById('pw'),tgl=document.getElementById('tgl');
-  tgl.addEventListener('click',function(){
-    if(pw.type==='password'){pw.type='text';tgl.style.color='#4f8ef7';}
-    else{pw.type='password';tgl.style.color='';}
-  });
-</script>
-</body>
-</html>
-"@
+function Resolve-TargetSid {
+    param([string]$TargetParam)
+    if ([string]::IsNullOrWhiteSpace($TargetParam) -or $TargetParam -eq 'public') { return 'public' }
+    if ($Global:PubIndex.ContainsKey($TargetParam)) { return $Global:PubIndex[$TargetParam] }
+    return $null
 }
 
-function Get-DashboardPage {
-    $files = @(Get-ChildItem -LiteralPath $Global:ShareFolder -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
-    $count = $files.Count
-    $total = ($files | Measure-Object -Property Length -Sum).Sum
-    if (-not $total) { $total = 0 }
-    $totalStr = Format-Size $total
-
-    if ($count -eq 0) {
-        $rows = '<tr><td colspan="5" class="empty">&#128230; Henuz dosya yok. Asagidan dosya yukleyin.</td></tr>'
-    } else {
-        $sb = New-Object System.Text.StringBuilder
-        foreach ($f in $files) {
-            $icon = Get-IconForFile $f.Name
-            $size = Format-Size $f.Length
-            $date = $f.LastWriteTime.ToString('dd.MM.yyyy HH:mm')
-            $nameEnc = [System.Web.HttpUtility]::UrlEncode($f.Name)
-            $nameHtml = [System.Web.HttpUtility]::HtmlEncode($f.Name)
-            [void]$sb.Append("<tr><td class='ic'>$icon</td><td class='nm'>$nameHtml</td><td>$size</td><td class='dt'>$date</td><td><a class='dl' href='/download?file=$nameEnc'>&#11015; Indir</a></td></tr>")
+function Get-MultipartField {
+    # Kucuk multipart field okuyucu (nick/id gibi). Buyuk dosyalar Save-UploadedFileStream'de.
+    param([byte[]]$BodyBytes, [string]$ContentType, [string]$FieldName)
+    if (-not $BodyBytes -or $BodyBytes.Length -eq 0) { return $null }
+    if ($ContentType -notmatch 'boundary=(.+)$') { return $null }
+    $boundary = $Matches[1].Trim().Trim('"')
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    $text = $latin1.GetString($BodyBytes)
+    $parts = $text -split [regex]::Escape('--' + $boundary)
+    foreach ($p in $parts) {
+        if ($p -match ('name="' + [regex]::Escape($FieldName) + '"')) {
+            $idx = $p.IndexOf("`r`n`r`n")
+            if ($idx -ge 0) {
+                $val = $p.Substring($idx + 4)
+                if ($val.EndsWith("`r`n")) { $val = $val.Substring(0, $val.Length - 2) }
+                $bytes = $latin1.GetBytes($val)
+                return [System.Text.Encoding]::UTF8.GetString($bytes)
+            }
         }
-        $rows = $sb.ToString()
     }
-
-    return @"
-<!DOCTYPE html>
-<html lang="tr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Yerel Dosya Portali - Panel</title>
-<style>
-  :root{
-    --bg:#0d0f12; --card:#141720; --border:#1e2330; --accent:#4f8ef7;
-    --text:#e8ecf5; --muted:#5a6480; --ok:#4ff78e; --err:#f74f6a;
-  }
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
-  header{
-    position:sticky;top:0;z-index:10;background:rgba(20,23,32,.92);backdrop-filter:blur(8px);
-    border-bottom:1px solid var(--border);padding:16px 28px;display:flex;align-items:center;justify-content:space-between;
-  }
-  .brand{display:flex;align-items:center;gap:11px}
-  .brand .icon{font-size:26px}
-  .brand h1{font-size:17px;letter-spacing:.5px}
-  .stats{display:flex;gap:22px;align-items:center}
-  .stat{font-size:13px;color:var(--muted)}
-  .stat b{color:var(--text);font-weight:600}
-  .logout{color:var(--err);text-decoration:none;font-size:13px;border:1px solid var(--border);padding:7px 14px;border-radius:8px;transition:background .2s}
-  .logout:hover{background:rgba(247,79,106,.1)}
-  .wrap{max-width:1000px;margin:0 auto;padding:28px}
-  .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;margin-bottom:24px}
-  .panel h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:16px}
-  table{width:100%;border-collapse:collapse}
-  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);padding:8px 10px;border-bottom:1px solid var(--border)}
-  td{padding:11px 10px;border-bottom:1px solid var(--border);font-size:14px}
-  td.ic{font-size:20px;width:40px}
-  td.nm{word-break:break-all}
-  td.dt{color:var(--muted);font-size:13px}
-  tr:last-child td{border-bottom:none}
-  tr:hover td{background:rgba(79,142,247,.04)}
-  .dl{color:var(--accent);text-decoration:none;font-size:13px;white-space:nowrap}
-  .dl:hover{text-decoration:underline}
-  .empty{text-align:center;color:var(--muted);padding:34px;font-size:14px}
-  .drop{
-    border:2px dashed var(--border);border-radius:12px;padding:38px;text-align:center;
-    color:var(--muted);cursor:pointer;transition:all .2s;
-  }
-  .drop.over{border-color:var(--accent);background:rgba(79,142,247,.06);color:var(--text)}
-  .drop .big{font-size:38px;margin-bottom:10px}
-  .filelist{display:flex;flex-direction:column;gap:8px;margin:16px 0 0}
-  .fileitem{
-    display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--bg);
-    border:1px solid var(--border);border-radius:10px;font-size:13px;
-  }
-  .fileitem .fi-ic{font-size:18px}
-  .fileitem .fi-name{flex:1;word-break:break-all}
-  .fileitem .fi-size{color:var(--muted);font-size:12px;white-space:nowrap}
-  .fileitem .fi-stat{font-size:12px;white-space:nowrap}
-  .fileitem .fi-stat.ok{color:var(--ok)}
-  .fileitem .fi-stat.err{color:var(--err)}
-  .fileitem .fi-stat.up{color:var(--accent)}
-  .fileitem .fi-x{cursor:pointer;color:var(--err);font-weight:700;padding:0 4px}
-  .fileitem.toobig{border-color:var(--err)}
-  .bar-wrap{display:none;margin-top:16px;background:var(--bg);border-radius:30px;overflow:hidden;height:10px;border:1px solid var(--border)}
-  .bar-wrap.show{display:block}
-  .bar{height:100%;width:0;background:var(--accent);transition:width .15s}
-  .up-row{display:flex;align-items:center;gap:12px;margin-top:16px;flex-wrap:wrap}
-  .btn{padding:11px 22px;background:var(--accent);color:#fff;border:none;border-radius:9px;font-size:14px;font-weight:600;cursor:pointer}
-  .btn:disabled{opacity:.5;cursor:not-allowed}
-  .btn.ghost{background:transparent;border:1px solid var(--border);color:var(--muted)}
-  .btn.ghost:hover{color:var(--text)}
-  .count-lbl{color:var(--muted);font-size:13px}
-  .toast-box{position:fixed;right:22px;bottom:22px;z-index:50;display:flex;flex-direction:column;gap:10px}
-  .toast{
-    padding:13px 18px;border-radius:10px;font-size:13px;color:#fff;box-shadow:0 10px 30px rgba(0,0,0,.5);
-    animation:slidein .25s ease;min-width:220px;
-  }
-  .toast.ok{background:#16321f;border:1px solid var(--ok);color:var(--ok)}
-  .toast.err{background:#321016;border:1px solid var(--err);color:var(--err)}
-  @keyframes slidein{from{transform:translateX(120%);opacity:0}to{transform:translateX(0);opacity:1}}
-</style>
-</head>
-<body>
-  <header>
-    <div class="brand"><span class="icon">&#128193;</span><h1>YEREL DOSYA PORTALI</h1></div>
-    <div class="stats">
-      <span class="stat">Dosya: <b>$count</b></span>
-      <span class="stat">Toplam: <b>$totalStr</b></span>
-      <a class="logout" href="/logout">&#128682; Cikis Yap</a>
-    </div>
-  </header>
-  <div class="wrap">
-    <div class="panel">
-      <h2>Dosyalar</h2>
-      <table>
-        <thead><tr><th></th><th>Dosya Adi</th><th>Boyut</th><th>Tarih</th><th></th></tr></thead>
-        <tbody>$rows</tbody>
-      </table>
-    </div>
-    <div class="panel">
-      <h2>Dosya Yukle</h2>
-      <div class="drop" id="drop">
-        <div class="big">&#128228;</div>
-        <div>Dosyalari buraya surukleyip birakin <br>veya tiklayarak <b>birden fazla</b> dosya secin</div>
-        <input type="file" id="file" multiple hidden>
-      </div>
-      <div class="filelist" id="fileList"></div>
-      <div class="bar-wrap" id="barWrap"><div class="bar" id="bar"></div></div>
-      <div class="up-row">
-        <button class="btn" id="upBtn" disabled>Tumunu Yukle</button>
-        <button class="btn ghost" id="clearBtn">Temizle</button>
-        <span class="count-lbl" id="countLbl"></span>
-      </div>
-    </div>
-  </div>
-  <div class="toast-box" id="toasts"></div>
-<script>
-  var drop=document.getElementById('drop'),fileInp=document.getElementById('file'),
-      fileList=document.getElementById('fileList'),barWrap=document.getElementById('barWrap'),
-      bar=document.getElementById('bar'),upBtn=document.getElementById('upBtn'),
-      clearBtn=document.getElementById('clearBtn'),countLbl=document.getElementById('countLbl'),
-      toasts=document.getElementById('toasts');
-  var queued=[];          // {file, id, status} biriken liste
-  var uploading=false;
-  var seq=0;
-
-  function toast(msg,type){
-    var t=document.createElement('div');t.className='toast '+(type||'ok');t.textContent=msg;
-    toasts.appendChild(t);
-    setTimeout(function(){t.style.transition='opacity .3s';t.style.opacity='0';setTimeout(function(){t.remove();},300);},3500);
-  }
-  function fmtSize(b){
-    if(b>=1073741824)return (b/1073741824).toFixed(2)+' GB';
-    if(b>=1048576)return (b/1048576).toFixed(2)+' MB';
-    if(b>=1024)return (b/1024).toFixed(2)+' KB';
-    return b+' B';
-  }
-  function addFiles(list){
-    if(uploading)return;
-    Array.prototype.forEach.call(list,function(f){
-      // ayni ad+boyut tekrar eklenmesin
-      var dup=queued.some(function(q){return q.file.name===f.name && q.file.size===f.size;});
-      if(!dup){queued.push({file:f,id:++seq,status:'wait'});}
-    });
-    render();
-  }
-  function removeItem(id){
-    queued=queued.filter(function(q){return q.id!==id;});
-    render();
-  }
-  function render(){
-    fileList.innerHTML='';
-    queued.forEach(function(q){
-      var row=document.createElement('div');
-      row.className='fileitem';
-      var stat='';
-      if(q.status==='ok'){stat='<span class="fi-stat ok">&#10003; yuklendi</span>';}
-      else if(q.status==='err'){stat='<span class="fi-stat err">&#10007; hata</span>';}
-      else if(q.status==='up'){stat='<span class="fi-stat up">yukleniyor...</span>';}
-      var rm=(uploading?'':'<span class="fi-x" data-id="'+q.id+'">&#10005;</span>');
-      row.innerHTML='<span class="fi-ic">&#128196;</span>'+
-        '<span class="fi-name">'+q.file.name.replace(/</g,'&lt;')+'</span>'+
-        '<span class="fi-size">'+fmtSize(q.file.size)+'</span>'+stat+rm;
-      fileList.appendChild(row);
-    });
-    upBtn.disabled=(queued.length===0||uploading);
-    clearBtn.style.display=(queued.length&&!uploading)?'inline-block':'none';
-    countLbl.textContent=queued.length?(queued.length+' dosya secildi'):'';
-  }
-  fileList.addEventListener('click',function(ev){
-    var x=ev.target.closest('.fi-x');
-    if(x){removeItem(parseInt(x.getAttribute('data-id'),10));}
-  });
-  drop.addEventListener('click',function(){if(!uploading)fileInp.click();});
-  fileInp.addEventListener('change',function(){addFiles(fileInp.files);fileInp.value='';});
-  ['dragenter','dragover'].forEach(function(e){drop.addEventListener(e,function(ev){ev.preventDefault();if(!uploading)drop.classList.add('over');});});
-  ['dragleave','drop'].forEach(function(e){drop.addEventListener(e,function(ev){ev.preventDefault();drop.classList.remove('over');});});
-  drop.addEventListener('drop',function(ev){addFiles(ev.dataTransfer.files);});
-  clearBtn.addEventListener('click',function(){if(!uploading){queued=[];render();}});
-
-  function uploadOne(item,done){
-    item.status='up';render();
-    var fd=new FormData();fd.append('file',item.file,item.file.name);
-    var xhr=new XMLHttpRequest();xhr.open('POST','/upload',true);
-    xhr.upload.onprogress=function(e){if(e.lengthComputable){bar.style.width=((e.loaded/e.total)*100)+'%';}};
-    xhr.onload=function(){
-      var ok=false,msg='';
-      try{var r=JSON.parse(xhr.responseText);ok=r.ok;msg=r.msg||'';}catch(_){}
-      if(ok){item.status='ok';toast(item.file.name+' yuklendi','ok');}
-      else{item.status='err';toast(item.file.name+' hata: '+(msg||xhr.status),'err');}
-      render();done();
-    };
-    xhr.onerror=function(){item.status='err';toast(item.file.name+' baglanti hatasi','err');render();done();};
-    xhr.send(fd);
-  }
-  upBtn.addEventListener('click',function(){
-    var todo=queued.filter(function(q){return q.status!=='ok';});
-    if(!todo.length||uploading)return;
-    uploading=true;render();
-    barWrap.classList.add('show');bar.style.width='0';
-    var i=0;
-    (function next(){
-      if(i>=todo.length){
-        bar.style.width='100%';
-        var okCount=queued.filter(function(q){return q.status==='ok';}).length;
-        toast(okCount+' dosya yuklendi','ok');
-        setTimeout(function(){location.reload();},900);return;
-      }
-      bar.style.width='0';
-      uploadOne(todo[i],function(){i++;next();});
-    })();
-  });
-  render();
-</script>
-</body>
-</html>
-"@
+    return $null
 }
 
-# ------------------------------------------------------------------------------
-#  MULTIPART PARSER (binary-safe, Latin1)
-# ------------------------------------------------------------------------------
+# ===================== MULTIPART STREAMING PARSER =============================
 function Save-UploadedFileStream {
-    # Streaming multipart parser: agi dogrudan diske akar, RAM'e tamamen yuklemez.
-    # Boyut limiti yok. 256KB chunk ile agi diske esit hizda yazar.
-    param([System.IO.Stream]$NetStream, [string]$ContentType)
+    # Agi 256KB chunk'larla dogrudan diske akar. C# FastScan ile bound. tarama.
+    # Tek ortak buffer (chunkSize + delimLen) ile allocation minimum.
+    param(
+        [System.IO.Stream]$NetStream, [string]$ContentType,
+        [string]$SenderSid, [string]$Target
+    )
 
     if ($ContentType -notmatch 'boundary=(.+)$') { return @{ ok=$false; status=400; msg='Boundary bulunamadi' } }
     $boundary = $Matches[1].Trim().Trim('"')
     $latin1   = [System.Text.Encoding]::GetEncoding(28591)
 
-    # --- Adim 1: multipart header blogu oku (sadece ufak metin, ram'e alinir) ---
+    # Multipart header oku
     $hdrBuf = New-Object System.Collections.Generic.List[byte]
     $b0=-1;$b1=-1;$b2=-1;$b3=-1
     while ($true) {
@@ -594,9 +385,12 @@ function Save-UploadedFileStream {
     $fileName = $null
     if ($hdrText -match 'filename="([^"]*)"') { $fileName = $Matches[1] }
     if ([string]::IsNullOrWhiteSpace($fileName)) { return @{ ok=$false; status=400; msg='Dosya adi yok' } }
+    # filename UTF-8 olabilir; latin1 ile gelen byte'lari UTF-8'e tekrar yorumla
+    $fnBytes = $latin1.GetBytes($fileName)
+    try { $fileName = [System.Text.Encoding]::UTF8.GetString($fnBytes) } catch {}
     $fileName = [System.IO.Path]::GetFileName($fileName)
 
-    # --- Adim 2: benzersiz dosya adi rezerve et (kisa kilit) ---
+    # Benzersiz dosya yolu rezerve et
     $target = $null
     [System.Threading.Monitor]::Enter($Global:UploadLock)
     try {
@@ -615,55 +409,44 @@ function Save-UploadedFileStream {
         [System.Threading.Monitor]::Exit($Global:UploadLock)
     }
 
-    # --- Adim 3: dosya icerigini ag'dan diske aktar ---
-    # Durdurma sinyali: \r\n--<boundary>  (sonraki boundary veya son boundary)
+    # Stream agi diske; bitis isareti \r\n--boundary
     $delimBytes = $latin1.GetBytes("`r`n--" + $boundary)
     $delimLen   = $delimBytes.Length
-    $chunkSize  = 262144  # 256 KB
-    $chunk      = New-Object byte[] $chunkSize
-    $overlap    = New-Object byte[] ($delimLen - 1)
-    $overlapLen = 0
+    $chunkSize  = 262144                 # 256 KB
+    $bufSize    = $chunkSize + $delimLen
+    $buf        = New-Object byte[] $bufSize
+    $bufLen     = 0
+    $bytesWrote = 0L
 
     $fs = $null
     try {
-        $fs = New-Object System.IO.FileStream($target,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None,262144,[System.IO.FileOptions]::SequentialScan)
+        $fs = New-Object System.IO.FileStream($target,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None,1048576,[System.IO.FileOptions]::SequentialScan)
         $found = $false
 
         while (-not $found) {
-            $read = $NetStream.Read($chunk, 0, $chunkSize)
+            $space = $bufSize - $bufLen
+            $toRead = [Math]::Min($chunkSize, $space)
+            if ($toRead -le 0) { $toRead = $chunkSize }
+            $read = $NetStream.Read($buf, $bufLen, $toRead)
             if ($read -le 0) { break }
+            $bufLen += $read
 
-            # overlap + yeni chunk birlestir
-            $sbLen = $overlapLen + $read
-            $sb    = New-Object byte[] $sbLen
-            if ($overlapLen -gt 0) { [System.Array]::Copy($overlap, 0, $sb, 0, $overlapLen) }
-            [System.Array]::Copy($chunk, 0, $sb, $overlapLen, $read)
-
-            # boundary ara (ilk byte eslesmesine gore hizli atla)
-            $d0  = $delimBytes[0]
-            $pos = -1
-            for ($i = 0; $i -le $sbLen - $delimLen; $i++) {
-                if ($sb[$i] -ne $d0) { continue }
-                $ok = $true
-                for ($j = 1; $j -lt $delimLen; $j++) {
-                    if ($sb[$i+$j] -ne $delimBytes[$j]) { $ok=$false; break }
-                }
-                if ($ok) { $pos = $i; break }
-            }
-
+            $pos = [LFP.FastScan]::IndexOf($buf, 0, $bufLen, $delimBytes)
             if ($pos -ge 0) {
-                if ($pos -gt 0) { $fs.Write($sb, 0, $pos) }
+                if ($pos -gt 0) { $fs.Write($buf, 0, $pos); $bytesWrote += $pos }
                 $found = $true
             } else {
-                $safe = $sbLen - ($delimLen - 1)
-                if ($safe -gt 0) { $fs.Write($sb, 0, $safe) }
-                $overlapLen = [Math]::Min($delimLen - 1, $sbLen)
-                if ($overlapLen -gt 0) { [System.Array]::Copy($sb, $sbLen - $overlapLen, $overlap, 0, $overlapLen) }
+                $safe = $bufLen - ($delimLen - 1)
+                if ($safe -gt 0) {
+                    $fs.Write($buf, 0, $safe); $bytesWrote += $safe
+                    $keep = $bufLen - $safe
+                    if ($keep -gt 0) { [System.Buffer]::BlockCopy($buf, $safe, $buf, 0, $keep) }
+                    $bufLen = $keep
+                }
             }
         }
 
         $fs.Flush()
-        return @{ ok=$true; status=200; msg=([System.IO.Path]::GetFileName($target)) }
     } catch {
         try { if ($fs) { $fs.Close() } } catch {}
         try { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue } catch {}
@@ -671,50 +454,55 @@ function Save-UploadedFileStream {
     } finally {
         try { if ($fs) { $fs.Close() } } catch {}
     }
+
+    $finalName  = [System.IO.Path]::GetFileName($target)
+    $size       = (Get-Item -LiteralPath $target).Length
+    $tid        = New-ShortId 8
+    $senderNick = if ($Global:Sessions.ContainsKey($SenderSid)) { $Global:Sessions[$SenderSid].Nick } else { 'Bilinmiyor' }
+    $t = @{
+        Id=$tid; Name=$finalName; Path=$target; Size=$size
+        Sender=$SenderSid; SenderNick=$senderNick; Target=$Target
+        Created=(Get-Date)
+    }
+    $Global:Transfers[$tid] = $t
+    try { Save-TransferMeta -T $t } catch {}
+
+    return @{ ok=$true; status=200; id=$tid; msg=$finalName }
 }
 
-# ------------------------------------------------------------------------------
-#  DOSYA INDIRME (path traversal korumali, stream)
-# ------------------------------------------------------------------------------
+# ============================== INDIRME =======================================
 function Send-FileDownload {
-    param($Req, [System.IO.Stream]$Stream)
-
+    param($Req, [System.IO.Stream]$Stream, [string]$Sid)
     $q = [System.Web.HttpUtility]::ParseQueryString($Req.Query)
-    $fileParam = $q['file']
-    if ([string]::IsNullOrWhiteSpace($fileParam)) {
-        Send-HtmlResponse -Stream $Stream -Html '<h1>400 - dosya parametresi yok</h1>' -Status 400
-        return
+    $id = $q['id']
+    if ([string]::IsNullOrWhiteSpace($id) -or -not $Global:Transfers.ContainsKey($id)) {
+        Send-HtmlResponse -Stream $Stream -Html '<h1>404 - dosya yok</h1>' -Status 404; return
+    }
+    $t = $Global:Transfers[$id]
+    if ($t.Target -ne 'public' -and $t.Target -ne $Sid -and $t.Sender -ne $Sid) {
+        Send-HtmlResponse -Stream $Stream -Html '<h1>403 - bu dosyaya erisim yok</h1>' -Status 403; return
+    }
+    if (-not (Test-Path -LiteralPath $t.Path -PathType Leaf)) {
+        Send-HtmlResponse -Stream $Stream -Html '<h1>404 - dosya kayboldu</h1>' -Status 404; return
     }
 
-    $rootFull = [System.IO.Path]::GetFullPath($Global:ShareFolder).TrimEnd('\') + '\'
-    $target   = [System.IO.Path]::GetFullPath((Join-Path $Global:ShareFolder $fileParam))
-
-    if (-not $target.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Send-HtmlResponse -Stream $Stream -Html '<h1>403 - erisim reddedildi</h1>' -Status 403
-        return
-    }
-    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
-        Send-HtmlResponse -Stream $Stream -Html '<h1>404 - dosya bulunamadi</h1>' -Status 404
-        return
-    }
-
-    $name    = [System.IO.Path]::GetFileName($target)
+    $name    = [System.IO.Path]::GetFileName($t.Path)
     $nameEnc = [System.Web.HttpUtility]::UrlEncode($name) -replace '\+', '%20'
-    $fi      = Get-Item -LiteralPath $target
+    $fi      = Get-Item -LiteralPath $t.Path
 
-    # Header'lari elle yaz, sonra dosyayi stream et
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append("HTTP/1.1 200 OK`r`n")
     [void]$sb.Append("Content-Type: application/octet-stream`r`n")
     [void]$sb.Append("Content-Disposition: attachment; filename*=UTF-8''$nameEnc`r`n")
     [void]$sb.Append("Content-Length: $($fi.Length)`r`n")
+    [void]$sb.Append("Cache-Control: no-store`r`n")
     [void]$sb.Append("Connection: close`r`n`r`n")
     $headBytes = [System.Text.Encoding]::GetEncoding(28591).GetBytes($sb.ToString())
     $Stream.Write($headBytes, 0, $headBytes.Length)
 
-    $fs = [System.IO.File]::OpenRead($target)
+    $fs = New-Object System.IO.FileStream($t.Path,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::Read,1048576,[System.IO.FileOptions]::SequentialScan)
     try {
-        $buf = New-Object byte[] 81920
+        $buf = New-Object byte[] 262144
         while (($read = $fs.Read($buf, 0, $buf.Length)) -gt 0) {
             $Stream.Write($buf, 0, $read)
         }
@@ -722,12 +510,577 @@ function Send-FileDownload {
     } finally { $fs.Dispose() }
 }
 
-# ------------------------------------------------------------------------------
-#  KONSOL BILGILENDIRME
-# ------------------------------------------------------------------------------
+# ============================== STATE JSON ===================================
+function Get-StateJson {
+    param([string]$Sid)
+    Invoke-PeriodicSweep
+    $me  = $Global:Sessions[$Sid]
+    $now = Get-Date
+
+    $devList = @()
+    foreach ($k in @($Global:Sessions.Keys)) {
+        $s = $Global:Sessions[$k]
+        if ($null -eq $s) { continue }
+        $ageSec = [int]([math]::Floor(($now - $s.LastSeen).TotalSeconds))
+        $online = ($now - $s.LastSeen) -lt $Global:DeviceTTL
+        $devList += [pscustomobject]@{
+            pubId  = $s.PubId
+            nick   = $s.Nick
+            ageSec = $ageSec
+            online = $online
+        }
+    }
+    $devList = @($devList | Sort-Object -Property @{Expression={[int]$_.online};Descending=$true}, ageSec)
+
+    $visible = @()
+    foreach ($k in @($Global:Transfers.Keys)) {
+        $t = $Global:Transfers[$k]
+        if ($null -eq $t) { continue }
+        if ($t.Target -eq 'public' -or $t.Target -eq $Sid -or $t.Sender -eq $Sid) { $visible += $t }
+    }
+    $visible = @($visible | Sort-Object { $_.Created } -Descending)
+
+    $tArr = @()
+    foreach ($t in $visible) {
+        $targetNick = 'Herkes'
+        $targetKind = 'public'
+        if ($t.Target -ne 'public') {
+            $targetKind = 'device'
+            if ($Global:Sessions.ContainsKey($t.Target)) { $targetNick = $Global:Sessions[$t.Target].Nick }
+            else { $targetNick = '(silinmis)' }
+        }
+        $tArr += [pscustomobject]@{
+            id         = $t.Id
+            name       = $t.Name
+            size       = $t.Size
+            senderNick = $t.SenderNick
+            targetNick = $targetNick
+            target     = $targetKind
+            byMe       = ($t.Sender -eq $Sid)
+            toMe       = ($t.Target -eq $Sid)
+            created    = $t.Created.ToString('o')
+            icon       = (Get-IconForFile $t.Name)
+        }
+    }
+
+    $payload = [pscustomobject]@{
+        me = [pscustomobject]@{ pubId = $me.PubId; nick = $me.Nick }
+        devices   = $devList
+        transfers = $tArr
+    }
+    return ($payload | ConvertTo-Json -Depth 6 -Compress)
+}
+
+# ============================== UI SAYFALAR ===================================
+function Get-LoginPage {
+    param([bool]$Error = $false)
+    $errBlock = if ($Error) { '<div class="error-msg">Hatali parola. Tekrar deneyin.</div>' } else { '' }
+    return @"
+<!DOCTYPE html><html lang="tr"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Yerel Dosya Portali - Giris</title>
+<style>
+  :root{--bg:#0d0f12;--card:#141720;--border:#1e2330;--accent:#4f8ef7;--text:#e8ecf5;--muted:#5a6480;--ok:#4ff78e;--err:#f74f6a}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;overflow:hidden}
+  .grid-bg{position:fixed;inset:0;z-index:0;background-image:linear-gradient(rgba(79,142,247,.07) 1px,transparent 1px),linear-gradient(90deg,rgba(79,142,247,.07) 1px,transparent 1px);background-size:42px 42px;animation:drift 22s linear infinite}
+  @keyframes drift{from{background-position:0 0}to{background-position:42px 42px}}
+  .card{position:relative;z-index:1;background:var(--card);border:1px solid var(--border);border-radius:18px;padding:42px 38px;width:380px;max-width:92vw;box-shadow:0 24px 60px rgba(0,0,0,.55)}
+  .logo{display:flex;align-items:center;gap:12px;margin-bottom:6px}.logo .icon{font-size:34px}.logo h1{font-size:20px;font-weight:700;letter-spacing:.5px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:26px}
+  label{display:block;font-size:12px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}
+  .pw-wrap{position:relative;margin-bottom:18px}
+  input{width:100%;padding:13px 46px 13px 14px;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:15px;outline:none;transition:border .2s}
+  input:focus{border-color:var(--accent)}
+  .toggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;padding:6px}
+  button.submit{width:100%;padding:13px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer}
+  button.submit:hover{filter:brightness(1.1)}
+  .error-msg{background:rgba(247,79,106,.12);border:1px solid var(--err);color:var(--err);padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:18px}
+  .status{display:flex;align-items:center;gap:8px;margin-top:22px;font-size:12px;color:var(--muted);justify-content:center}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);animation:blink 1.4s ease-in-out infinite}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+</style></head><body>
+  <div class="grid-bg"></div>
+  <div class="card">
+    <div class="logo"><span class="icon">&#128274;</span><h1>YEREL DOSYA PORTALI</h1></div>
+    <div class="sub">Cihaz adi sec (opsiyonel) ve parola ile gir.</div>
+    $errBlock
+    <form method="POST" action="/">
+      <label for="nick">Cihaz Adi</label>
+      <input id="nick" name="nick" type="text" placeholder="Ornek: Hakan Telefon" maxlength="32" style="margin-bottom:16px">
+      <label for="pw">Parola</label>
+      <div class="pw-wrap">
+        <input id="pw" name="password" type="password" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;" autofocus required>
+        <button type="button" class="toggle" id="tgl">&#128065;</button>
+      </div>
+      <button type="submit" class="submit">Giris Yap</button>
+    </form>
+    <div class="status"><span class="dot"></span> Sunucu aktif</div>
+  </div>
+<script>
+  var pw=document.getElementById('pw'),tgl=document.getElementById('tgl');
+  tgl.addEventListener('click',function(){if(pw.type==='password'){pw.type='text';tgl.style.color='#4f8ef7';}else{pw.type='password';tgl.style.color='';}});
+</script>
+</body></html>
+"@
+}
+
+function Get-DashboardPage {
+    return @"
+<!DOCTYPE html><html lang="tr"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Yerel Dosya Portali</title>
+<style>
+  :root{--bg:#0d0f12;--card:#141720;--border:#1e2330;--accent:#4f8ef7;--accent2:#8e6cf7;--text:#e8ecf5;--muted:#5a6480;--ok:#4ff78e;--err:#f74f6a;--warn:#f7c14f}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+  header{position:sticky;top:0;z-index:10;background:rgba(20,23,32,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  .brand{display:flex;align-items:center;gap:11px}.brand .icon{font-size:24px}.brand h1{font-size:16px;letter-spacing:.5px}
+  .hdr-right{display:flex;align-items:center;gap:14px;font-size:13px;flex-wrap:wrap}
+  .me-chip{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--border);padding:6px 12px;border-radius:20px}
+  .me-chip .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  .me-chip b{font-weight:600}
+  .me-chip .rename{background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:0 2px}
+  .me-chip .rename:hover{color:var(--accent)}
+  .logout{color:var(--err);text-decoration:none;font-size:13px;border:1px solid var(--border);padding:6px 12px;border-radius:8px}
+  .logout:hover{background:rgba(247,79,106,.1)}
+  main{max-width:1100px;margin:0 auto;padding:24px}
+  .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:22px}
+  .panel h2{font-size:13px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .target-chip{background:rgba(79,142,247,.15);color:var(--accent);padding:4px 10px;border-radius:14px;font-size:12px;text-transform:none;letter-spacing:0;font-weight:600}
+  .dev-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
+  .dev{background:var(--bg);border:1px solid var(--border);border-radius:11px;padding:14px;cursor:pointer;transition:all .15s;display:flex;flex-direction:column;gap:4px;position:relative;min-height:96px}
+  .dev:hover{border-color:var(--accent);transform:translateY(-1px)}
+  .dev.selected{border-color:var(--accent);background:rgba(79,142,247,.08);box-shadow:0 0 0 2px rgba(79,142,247,.25)}
+  .dev.public{background:linear-gradient(135deg,rgba(79,142,247,.08),rgba(142,108,247,.08));border-color:rgba(79,142,247,.3)}
+  .dev.offline{opacity:.45}
+  .dev.self{border-style:dashed;cursor:not-allowed;opacity:.55}
+  .dev-icon{font-size:22px}
+  .dev-name{font-size:14px;font-weight:600;word-break:break-all}
+  .dev-sub{font-size:11px;color:var(--muted)}
+  .dev-status{position:absolute;top:10px;right:10px;width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  .dev.offline .dev-status{background:var(--muted);box-shadow:none}
+  .drop{border:2px dashed var(--border);border-radius:12px;padding:34px;text-align:center;color:var(--muted);cursor:pointer;transition:all .2s}
+  .drop.over{border-color:var(--accent);background:rgba(79,142,247,.06);color:var(--text)}
+  .drop .big{font-size:36px;margin-bottom:8px}
+  .filelist{display:flex;flex-direction:column;gap:8px;margin:14px 0 0}
+  .fileitem{display:flex;align-items:center;gap:12px;padding:9px 13px;background:var(--bg);border:1px solid var(--border);border-radius:10px;font-size:13px}
+  .fileitem .fi-ic{font-size:18px}.fileitem .fi-name{flex:1;word-break:break-all}.fileitem .fi-size{color:var(--muted);font-size:12px;white-space:nowrap}
+  .fileitem .fi-stat{font-size:12px;white-space:nowrap}
+  .fileitem .fi-stat.ok{color:var(--ok)}.fileitem .fi-stat.err{color:var(--err)}.fileitem .fi-stat.up{color:var(--accent)}
+  .fileitem .fi-x{cursor:pointer;color:var(--err);font-weight:700;padding:0 4px}
+  .bar-wrap{display:none;margin-top:14px;background:var(--bg);border-radius:30px;overflow:hidden;height:8px;border:1px solid var(--border)}
+  .bar-wrap.show{display:block}.bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .12s}
+  .up-row{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}
+  .btn{padding:10px 20px;background:var(--accent);color:#fff;border:none;border-radius:9px;font-size:14px;font-weight:600;cursor:pointer}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .btn.ghost{background:transparent;border:1px solid var(--border);color:var(--muted)}.btn.ghost:hover{color:var(--text)}
+  .count-lbl{color:var(--muted);font-size:13px;margin-left:auto}
+  .tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+  .tab{padding:6px 14px;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:8px;font-size:13px;cursor:pointer}
+  .tab.on{background:rgba(79,142,247,.15);color:var(--accent);border-color:var(--accent)}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);padding:8px 10px;border-bottom:1px solid var(--border)}
+  td{padding:11px 10px;border-bottom:1px solid var(--border);font-size:13.5px;vertical-align:middle}
+  td.ic{font-size:18px;width:36px}.td-nm{word-break:break-all}
+  td.dt{color:var(--muted);font-size:12px;white-space:nowrap}
+  tr:last-child td{border-bottom:none}tr:hover td{background:rgba(79,142,247,.04)}
+  .pill{display:inline-block;padding:2px 8px;border-radius:11px;font-size:11px;background:rgba(79,142,247,.12);color:var(--accent);margin-right:4px;white-space:nowrap}
+  .pill.pub{background:rgba(142,108,247,.15);color:var(--accent2)}
+  .pill.me{background:rgba(79,247,142,.12);color:var(--ok)}
+  .dl{color:var(--accent);text-decoration:none;font-size:13px;white-space:nowrap}.dl:hover{text-decoration:underline}
+  .dl-x{background:none;border:1px solid var(--err);color:var(--err);padding:2px 8px;border-radius:6px;font-size:12px;cursor:pointer;margin-left:6px}
+  .dl-x:hover{background:rgba(247,79,106,.12)}
+  .empty{text-align:center;color:var(--muted);padding:28px;font-size:14px}
+  .toast-box{position:fixed;right:22px;bottom:22px;z-index:50;display:flex;flex-direction:column;gap:10px}
+  .toast{padding:12px 18px;border-radius:10px;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.5);animation:slidein .25s ease;min-width:220px;max-width:380px}
+  .toast.ok{background:#16321f;border:1px solid var(--ok);color:var(--ok)}
+  .toast.err{background:#321016;border:1px solid var(--err);color:var(--err)}
+  .toast.info{background:#15243a;border:1px solid var(--accent);color:var(--accent)}
+  @keyframes slidein{from{transform:translateX(120%);opacity:0}to{transform:translateX(0);opacity:1}}
+  @media(max-width:600px){header{padding:12px 14px}main{padding:14px}.panel{padding:16px}}
+</style></head><body>
+  <header>
+    <div class="brand"><span class="icon">&#128193;</span><h1>YEREL DOSYA PORTALI</h1></div>
+    <div class="hdr-right">
+      <div class="me-chip">
+        <span class="dot"></span><span>Ben:</span>
+        <b id="myNick">...</b>
+        <button class="rename" id="renameBtn" title="Cihaz adini degistir">&#9998;</button>
+      </div>
+      <span id="onlineCount" style="color:var(--muted)">...</span>
+      <a class="logout" href="/logout">&#128682; Cikis</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Bagli Cihazlar <span id="targetLabel" class="target-chip">Hedef: Herkes</span></h2>
+      <div id="devices" class="dev-grid"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Dosya Gonder</h2>
+      <div class="drop" id="drop">
+        <div class="big">&#128228;</div>
+        <div>Dosyalari surukleyip birakin <br>veya tiklayarak <b>birden fazla</b> dosya secin</div>
+        <input type="file" id="file" multiple hidden>
+      </div>
+      <div class="filelist" id="fileList"></div>
+      <div class="up-row">
+        <button class="btn" id="upBtn" disabled>Gonder</button>
+        <button class="btn ghost" id="clearBtn" style="display:none">Temizle</button>
+        <span class="count-lbl" id="countLbl"></span>
+      </div>
+      <div class="bar-wrap" id="barWrap"><div class="bar" id="bar"></div></div>
+    </section>
+
+    <section class="panel">
+      <h2>Transferler</h2>
+      <div class="tabs">
+        <button class="tab on" data-f="all">Tumu</button>
+        <button class="tab" data-f="inbox">Bana Gelen</button>
+        <button class="tab" data-f="public">Public</button>
+        <button class="tab" data-f="sent">Gonderdiklerim</button>
+      </div>
+      <table>
+        <thead><tr><th></th><th>Dosya</th><th>Boyut</th><th>Gonderen / Hedef</th><th>Tarih</th><th></th></tr></thead>
+        <tbody id="transferBody"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <div class="toast-box" id="toasts"></div>
+
+<script>
+  var state={me:{},devices:[],transfers:[]};
+  var target='public';
+  var queued=[];
+  var uploading=false;
+  var seq=0;
+  var filter='all';
+  var toasts=document.getElementById('toasts');
+  var lastTransferIds=new Set();
+
+  function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  function toast(msg,type){var t=document.createElement('div');t.className='toast '+(type||'ok');t.textContent=msg;toasts.appendChild(t);setTimeout(function(){t.style.transition='opacity .3s';t.style.opacity='0';setTimeout(function(){t.remove();},300);},3500);}
+  function fmtSize(b){if(b>=1073741824)return(b/1073741824).toFixed(2)+' GB';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(2)+' KB';return b+' B';}
+  function fmtSeen(sec){if(sec<60)return 'simdi';if(sec<3600)return Math.floor(sec/60)+'dk once';if(sec<86400)return Math.floor(sec/3600)+'sa once';return Math.floor(sec/86400)+'g once';}
+  function fmtDate(iso){var d=new Date(iso);if(isNaN(d.getTime()))return iso;var y=d.getFullYear(),m=('0'+(d.getMonth()+1)).slice(-2),da=('0'+d.getDate()).slice(-2);var h=('0'+d.getHours()).slice(-2),mi=('0'+d.getMinutes()).slice(-2);return da+'.'+m+'.'+y+' '+h+':'+mi;}
+  function devIcon(n){var s=(n||'').toLowerCase();if(s.indexOf('iphone')>=0||s.indexOf('ipad')>=0||s.indexOf('android')>=0)return '&#128241;';if(s.indexOf('mac')>=0||s.indexOf('windows')>=0)return '&#128187;';if(s.indexOf('linux')>=0)return '&#128421;';return '&#128242;';}
+
+  async function fetchState(){
+    if(uploading)return;
+    try{
+      var r=await fetch('/api/state',{cache:'no-store'});
+      if(r.status===401){location.href='/';return;}
+      if(!r.ok)return;
+      var prev=lastTransferIds;
+      state=await r.json();
+      lastTransferIds=new Set(state.transfers.map(function(t){return t.id;}));
+      // yeni gelen dosyalar icin bildirim (bana gelen ya da public, benden gelmeyen)
+      state.transfers.forEach(function(t){
+        if(!prev.has(t.id) && !t.byMe && (t.toMe || t.target==='public')){
+          toast(t.senderNick+' gonderdi: '+t.name,'info');
+        }
+      });
+      renderAll();
+    }catch(e){}
+  }
+  function renderAll(){
+    document.getElementById('myNick').textContent=state.me.nick||'...';
+    var others=state.devices.filter(function(d){return d.pubId!==state.me.pubId;});
+    var onN=others.filter(function(d){return d.online;}).length;
+    document.getElementById('onlineCount').textContent=onN+' baska cihaz online';
+    if(target!=='public' && !state.devices.some(function(d){return d.pubId===target;})){
+      target='public';
+    }
+    renderDevices();
+    renderTransfers();
+    refreshTargetLabel();
+  }
+  function devCard(pubId,icon,label,sub,offline,self,showStatus){
+    var c=document.createElement('div');
+    c.className='dev'+(pubId===target?' selected':'')+(offline?' offline':'')+(self?' self':'')+(pubId==='public'?' public':'');
+    var status=(showStatus && !self)?'<div class="dev-status"></div>':'';
+    c.innerHTML=status+'<div class="dev-icon">'+icon+'</div><div class="dev-name">'+esc(label)+(self?' (ben)':'')+'</div><div class="dev-sub">'+esc(sub)+'</div>';
+    c.addEventListener('click',function(){
+      if(self){toast('Kendine gonderemezsin','err');return;}
+      target=pubId; renderDevices(); refreshTargetLabel();
+    });
+    return c;
+  }
+  function renderDevices(){
+    var box=document.getElementById('devices');box.innerHTML='';
+    box.appendChild(devCard('public','&#127760;','Herkes (Public)','Tum cihazlar gorur',false,false,false));
+    state.devices.forEach(function(d){
+      var sub=d.online?'online':fmtSeen(d.ageSec);
+      box.appendChild(devCard(d.pubId,devIcon(d.nick),d.nick,sub,!d.online,d.pubId===state.me.pubId,true));
+    });
+  }
+  function refreshTargetLabel(){
+    var name='Herkes';
+    if(target!=='public'){var d=state.devices.find(function(x){return x.pubId===target;});name=d?d.nick:'(secili degil)';}
+    document.getElementById('targetLabel').textContent='Hedef: '+name;
+  }
+  function renderTransfers(){
+    var body=document.getElementById('transferBody');body.innerHTML='';
+    var rows=state.transfers.filter(function(t){
+      if(filter==='all')return true;
+      if(filter==='public')return t.target==='public';
+      if(filter==='inbox')return !t.byMe && (t.target==='public' || t.toMe);
+      if(filter==='sent')return t.byMe;
+      return true;
+    });
+    if(rows.length===0){body.innerHTML='<tr><td colspan="6" class="empty">&#128230; Henuz dosya yok.</td></tr>';return;}
+    rows.forEach(function(t){
+      var tr=document.createElement('tr');
+      var pill=t.target==='public'?'<span class="pill pub">&#127760; Public</span>':('<span class="pill">'+esc(t.targetNick)+'</span>');
+      var fromPill=t.byMe?'<span class="pill me">Ben</span>':('<span class="pill">'+esc(t.senderNick)+'</span>');
+      var del=t.byMe?'<button class="dl-x" data-id="'+t.id+'" title="Sil">&#10005;</button>':'';
+      tr.innerHTML='<td class="ic">'+t.icon+'</td>'+
+                   '<td class="td-nm">'+esc(t.name)+'</td>'+
+                   '<td>'+fmtSize(t.size)+'</td>'+
+                   '<td>'+fromPill+' &rarr; '+pill+'</td>'+
+                   '<td class="dt">'+fmtDate(t.created)+'</td>'+
+                   '<td><a class="dl" href="/download?id='+encodeURIComponent(t.id)+'">&#11015; Indir</a>'+del+'</td>';
+      body.appendChild(tr);
+    });
+  }
+
+  document.querySelectorAll('.tab').forEach(function(b){b.addEventListener('click',function(){
+    document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('on');});
+    b.classList.add('on');filter=b.dataset.f;renderTransfers();
+  });});
+  document.getElementById('transferBody').addEventListener('click',async function(e){
+    var x=e.target.closest('.dl-x'); if(!x)return;
+    if(!confirm('Dosyayi kalici sil?'))return;
+    var fd=new FormData();fd.append('id',x.dataset.id);
+    var r=await fetch('/api/delete',{method:'POST',body:fd});
+    if(r.ok){toast('Silindi','ok');fetchState();}else{toast('Silinemedi','err');}
+  });
+  document.getElementById('renameBtn').addEventListener('click',async function(){
+    var n=prompt('Yeni cihaz adi:',state.me.nick);if(!n)return;
+    n=n.trim().slice(0,32);if(!n)return;
+    var fd=new FormData();fd.append('nick',n);
+    var r=await fetch('/api/nick',{method:'POST',body:fd});
+    if(r.ok){toast('Ad guncellendi','ok');fetchState();}
+  });
+
+  var drop=document.getElementById('drop'),fileInp=document.getElementById('file'),
+      fileList=document.getElementById('fileList'),barWrap=document.getElementById('barWrap'),
+      bar=document.getElementById('bar'),upBtn=document.getElementById('upBtn'),
+      clearBtn=document.getElementById('clearBtn'),countLbl=document.getElementById('countLbl');
+
+  function addFiles(list){
+    if(uploading)return;
+    Array.prototype.forEach.call(list,function(f){
+      var dup=queued.some(function(q){return q.file.name===f.name && q.file.size===f.size;});
+      if(!dup){queued.push({file:f,id:++seq,status:'wait'});}
+    });
+    renderQueue();
+  }
+  function renderQueue(){
+    fileList.innerHTML='';
+    queued.forEach(function(q){
+      var row=document.createElement('div');row.className='fileitem';
+      var stat='';
+      if(q.status==='ok')stat='<span class="fi-stat ok">&#10003; gonderildi</span>';
+      else if(q.status==='err')stat='<span class="fi-stat err">&#10007; hata</span>';
+      else if(q.status==='up')stat='<span class="fi-stat up">gonderiliyor...</span>';
+      var rm=uploading?'':'<span class="fi-x" data-id="'+q.id+'">&#10005;</span>';
+      row.innerHTML='<span class="fi-ic">&#128196;</span><span class="fi-name">'+esc(q.file.name)+'</span><span class="fi-size">'+fmtSize(q.file.size)+'</span>'+stat+rm;
+      fileList.appendChild(row);
+    });
+    upBtn.disabled=(queued.length===0 || uploading);
+    clearBtn.style.display=(queued.length && !uploading)?'inline-block':'none';
+    countLbl.textContent=queued.length?(queued.length+' dosya '+(uploading?'gonderiliyor':'secildi')):'';
+  }
+  fileList.addEventListener('click',function(e){
+    var x=e.target.closest('.fi-x');if(!x)return;
+    var id=parseInt(x.dataset.id,10);
+    queued=queued.filter(function(q){return q.id!==id;});renderQueue();
+  });
+  drop.addEventListener('click',function(){if(!uploading)fileInp.click();});
+  fileInp.addEventListener('change',function(){addFiles(fileInp.files);fileInp.value='';});
+  ['dragenter','dragover'].forEach(function(e){drop.addEventListener(e,function(ev){ev.preventDefault();if(!uploading)drop.classList.add('over');});});
+  ['dragleave','drop'].forEach(function(e){drop.addEventListener(e,function(ev){ev.preventDefault();drop.classList.remove('over');});});
+  drop.addEventListener('drop',function(ev){addFiles(ev.dataTransfer.files);});
+  clearBtn.addEventListener('click',function(){if(!uploading){queued=[];renderQueue();}});
+
+  function uploadOne(item,done){
+    item.status='up';renderQueue();
+    var fd=new FormData();fd.append('file',item.file,item.file.name);
+    var xhr=new XMLHttpRequest();
+    xhr.open('POST','/upload?target='+encodeURIComponent(target),true);
+    xhr.upload.onprogress=function(e){if(e.lengthComputable){bar.style.width=((e.loaded/e.total)*100)+'%';}};
+    xhr.onload=function(){
+      var ok=false,msg='';try{var r=JSON.parse(xhr.responseText);ok=r.ok;msg=r.msg||'';}catch(_){}
+      if(ok){item.status='ok';toast(item.file.name+' gonderildi','ok');}
+      else{item.status='err';toast(item.file.name+' hata: '+(msg||xhr.status),'err');}
+      renderQueue();done();
+    };
+    xhr.onerror=function(){item.status='err';toast(item.file.name+' baglanti hatasi','err');renderQueue();done();};
+    xhr.send(fd);
+  }
+  upBtn.addEventListener('click',function(){
+    var todo=queued.filter(function(q){return q.status!=='ok';});
+    if(!todo.length || uploading)return;
+    uploading=true;renderQueue();barWrap.classList.add('show');bar.style.width='0';
+    var i=0;
+    (function next(){
+      if(i>=todo.length){
+        bar.style.width='100%';
+        var okN=queued.filter(function(q){return q.status==='ok';}).length;
+        toast(okN+' dosya gonderildi','ok');
+        setTimeout(function(){uploading=false;renderQueue();fetchState();bar.style.width='0';barWrap.classList.remove('show');},700);
+        return;
+      }
+      bar.style.width='0';
+      uploadOne(todo[i],function(){i++;next();});
+    })();
+  });
+
+  fetchState();
+  setInterval(fetchState,4000);
+  window.addEventListener('focus',fetchState);
+</script>
+</body></html>
+"@
+}
+
+# ============================== ROUTER ========================================
+function Invoke-RequestRouter {
+    param($Req, [System.IO.Stream]$Stream)
+    $path = $Req.Path; $method = $Req.Method
+
+    switch ($path) {
+
+        '/' {
+            if ($method -eq 'POST') {
+                $bodyText = [System.Text.Encoding]::UTF8.GetString($Req.Body)
+                $form = [System.Web.HttpUtility]::ParseQueryString($bodyText)
+                $pw = $form['password']
+                if ($pw -eq $Global:Password) {
+                    $sid = New-SessionId
+                    $pub = New-ShortId 4
+                    $providedNick = $form['nick']
+                    if ($providedNick) { $providedNick = $providedNick.Trim() }
+                    $nick = if ($providedNick) { $providedNick } else { Get-DeviceLabel -UA $Req.UserAgent -IP $Req.ClientIp }
+                    if ($nick.Length -gt 32) { $nick = $nick.Substring(0,32) }
+                    $now = Get-Date
+                    $Global:Sessions[$sid] = @{
+                        Sid=$sid; PubId=$pub; Nick=$nick
+                        IP=$Req.ClientIp; UA=$Req.UserAgent
+                        Created=$now; LastSeen=$now
+                    }
+                    $Global:PubIndex[$pub] = $sid
+                    $cookie = New-SessionCookieHeader -Sid $sid
+                    Send-RedirectResponse -Stream $Stream -Location '/dashboard' -ExtraHeaders @{ 'Set-Cookie' = $cookie }
+                } else {
+                    Send-HtmlResponse -Stream $Stream -Html (Get-LoginPage -Error $true) -Status 401
+                }
+            } else {
+                $sid = Test-ValidSession -Req $Req
+                if ($sid) { Send-RedirectResponse -Stream $Stream -Location '/dashboard' }
+                else { Send-HtmlResponse -Stream $Stream -Html (Get-LoginPage -Error $false) }
+            }
+        }
+
+        '/dashboard' {
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-RedirectResponse -Stream $Stream -Location '/'; return }
+            Send-HtmlResponse -Stream $Stream -Html (Get-DashboardPage)
+        }
+
+        '/api/state' {
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 401; return }
+            $json = Get-StateJson -Sid $sid
+            Send-JsonResponse -Stream $Stream -Json $json -Status 200
+        }
+
+        '/api/nick' {
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 401; return }
+            if ($method -ne 'POST') { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 405; return }
+            $nick = $null
+            if ($Req.ContentType -match 'multipart/form-data') {
+                $nick = Get-MultipartField -BodyBytes $Req.Body -ContentType $Req.ContentType -FieldName 'nick'
+            } else {
+                $bt = [System.Text.Encoding]::UTF8.GetString($Req.Body)
+                $form = [System.Web.HttpUtility]::ParseQueryString($bt)
+                $nick = $form['nick']
+            }
+            if ([string]::IsNullOrWhiteSpace($nick)) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"bos"}' -Status 400; return }
+            $nick = $nick.Trim(); if ($nick.Length -gt 32) { $nick = $nick.Substring(0,32) }
+            $Global:Sessions[$sid].Nick = $nick
+            Send-JsonResponse -Stream $Stream -Json '{"ok":true}' -Status 200
+        }
+
+        '/api/delete' {
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 401; return }
+            if ($method -ne 'POST') { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 405; return }
+            $id = $null
+            if ($Req.ContentType -match 'multipart/form-data') {
+                $id = Get-MultipartField -BodyBytes $Req.Body -ContentType $Req.ContentType -FieldName 'id'
+            } else {
+                $bt = [System.Text.Encoding]::UTF8.GetString($Req.Body)
+                $form = [System.Web.HttpUtility]::ParseQueryString($bt)
+                $id = $form['id']
+            }
+            if ([string]::IsNullOrWhiteSpace($id) -or -not $Global:Transfers.ContainsKey($id)) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"yok"}' -Status 404; return
+            }
+            $t = $Global:Transfers[$id]
+            if ($t.Sender -ne $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"yetki yok"}' -Status 403; return }
+            [void](Remove-Transfer -Id $id)
+            Send-JsonResponse -Stream $Stream -Json '{"ok":true}' -Status 200
+        }
+
+        '/download' {
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-RedirectResponse -Stream $Stream -Location '/'; return }
+            Send-FileDownload -Req $Req -Stream $Stream -Sid $sid
+        }
+
+        '/upload' {
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"oturum yok"}' -Status 401; return }
+            if ($method -ne 'POST') { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"POST gerekli"}' -Status 405; return }
+            $q = [System.Web.HttpUtility]::ParseQueryString($Req.Query)
+            $targetParam = $q['target']
+            $targetSid = Resolve-TargetSid -TargetParam $targetParam
+            if ($null -eq $targetSid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"hedef gecersiz"}' -Status 400; return }
+            $r = Save-UploadedFileStream -NetStream $Stream -ContentType $Req.ContentType -SenderSid $sid -Target $targetSid
+            if ($r.ok) {
+                Send-JsonResponse -Stream $Stream -Json (('{"ok":true,"id":"' + $r.id + '","msg":"' + ($r.msg -replace '"',"'") + '"}'))
+            } else {
+                $msg = ($r.msg -replace '"', "'")
+                Send-JsonResponse -Stream $Stream -Json ('{"ok":false,"msg":"' + $msg + '"}') -Status $r.status
+            }
+        }
+
+        '/logout' {
+            $sid = $Req.Cookies[$Global:CookieName]
+            if ($sid -and $Global:Sessions.ContainsKey($sid)) {
+                $pub = $Global:Sessions[$sid].PubId
+                if ($pub) { [void]$Global:PubIndex.Remove($pub) }
+                [void]$Global:Sessions.Remove($sid)
+            }
+            $cookie = New-SessionCookieHeader -Sid '' -Expire $true
+            Send-RedirectResponse -Stream $Stream -Location '/' -ExtraHeaders @{ 'Set-Cookie' = $cookie }
+        }
+
+        default {
+            Send-HtmlResponse -Stream $Stream -Html '<h1>404</h1>' -Status 404
+        }
+    }
+}
+
+# ============================== AG TESPITI ====================================
 function Get-WifiInterface {
-    # SADECE kablosuz (Wi-Fi / 802.11) arayuzleri dondur. Ethernet/LAN haric.
-    # Hotspot (192.168.137.*) varsa onceligi ona ver.
     try {
         $wifiAdapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
             $_.Status -eq 'Up' -and (
@@ -782,128 +1135,44 @@ function Show-StartupBanner {
  | |___ | |_| | |  __/ | |_| | |  _ <  | |     |  |
  |_____||____/  |_|     \___/  |_| \_\ |_|     |__|
 
-      L O C A L   F I L E   P O R T A L   v1.0
+      L O C A L   F I L E   P O R T A L   v2.0
+            Bidirectional Wi-Fi Transfer
 "@
     Write-Host $logo -ForegroundColor Cyan
 
     $url = "http://$($Wifi.IP):$($Global:Port)/"
     Write-Host ''
     Write-Host '  +--------------------------------------------------------+' -ForegroundColor DarkGray
-    Write-Host ('  |  Baglanti URL : {0,-38} |' -f $url)                      -ForegroundColor Green
-    Write-Host ('  |  Wi-Fi Adapter: {0,-38} |' -f $Wifi.Name)               -ForegroundColor Gray
-    Write-Host ('  |  Subnet       : {0,-38} |' -f ("$($Wifi.IP)/$($Wifi.Prefix)")) -ForegroundColor Gray
-    Write-Host ('  |  Oturum Suresi: {0,-38} |' -f '1 saat (TTL)')           -ForegroundColor Gray
-    Write-Host ('  |  Max Upload   : {0,-38} |' -f '512 MB')                 -ForegroundColor Gray
-    Write-Host ('  |  Klasor Yolu  : {0,-38} |' -f $Global:ShareFolder)      -ForegroundColor Gray
+    Write-Host ('  |  URL          : {0,-38} |' -f $url)                                  -ForegroundColor Green
+    Write-Host ('  |  Wi-Fi Adapter: {0,-38} |' -f $Wifi.Name)                            -ForegroundColor Gray
+    Write-Host ('  |  Subnet       : {0,-38} |' -f ("$($Wifi.IP)/$($Wifi.Prefix)"))       -ForegroundColor Gray
+    Write-Host ('  |  Sure Limiti  : {0,-38} |' -f 'YOK (1 yil)')                         -ForegroundColor Gray
+    Write-Host ('  |  Boyut Limiti : {0,-38} |' -f 'YOK')                                 -ForegroundColor Gray
+    Write-Host ('  |  Klasor       : {0,-38} |' -f $Global:ShareFolder)                   -ForegroundColor Gray
+    Write-Host ('  |  Es Zamanli   : {0,-38} |' -f ("$($Global:MaxThreads) thread"))      -ForegroundColor Gray
+    Write-Host ('  |  Parola       : {0,-38} |' -f $Global:Password)                      -ForegroundColor Magenta
     Write-Host '  +--------------------------------------------------------+' -ForegroundColor DarkGray
     Write-Host ''
-
-    Write-Host '  [SADECE Wi-Fi] Sunucu yalnizca Wi-Fi adapterinin IP adresine' -ForegroundColor Green
-    Write-Host '  bind edildi. Ethernet/LAN uzerinden gelen istekler reddedilir.' -ForegroundColor Green
-    if ($Wifi.Hotspot) {
-        Write-Host '  [OK] Mobile Hotspot agi kullaniliyor (192.168.137.x).' -ForegroundColor Green
-    }
-    Write-Host ''
-    Write-Host "  Parola: $Global:Password" -ForegroundColor Magenta
-    Write-Host '  [ADMIN GEREKMEZ] TcpListener ile dinleniyor.' -ForegroundColor Green
-    Write-Host '  Diger cihaz baglanamiyorsa: Windows Defender Firewall ilk' -ForegroundColor DarkGray
-    Write-Host "  istekte izin sorabilir -> 'Ozel aglarda izin ver' sec." -ForegroundColor DarkGray
-    Write-Host '  Durdurmak icin: Ctrl + C' -ForegroundColor DarkGray
+    Write-Host '  [Wi-Fi only] Sadece Wi-Fi IP suzulur, LAN reddedilir.' -ForegroundColor Green
+    if ($Wifi.Hotspot) { Write-Host '  [Hotspot] Mobile Hotspot (192.168.137.x).' -ForegroundColor Green }
+    Write-Host '  [Karsilikli] Cihaz-cihaz private + public broadcast.' -ForegroundColor Green
+    Write-Host '  [Admin gerekmez] TcpListener. Ctrl+C durdurur.' -ForegroundColor DarkGray
     Write-Host ''
 }
 
-# ------------------------------------------------------------------------------
-#  ISTEK YONLENDIRME
-# ------------------------------------------------------------------------------
-function Invoke-RequestRouter {
-    param($Req, [System.IO.Stream]$Stream)
-
-    $path   = $Req.Path
-    $method = $Req.Method
-
-    switch ($path) {
-
-        '/' {
-            if ($method -eq 'POST') {
-                $bodyText = [System.Text.Encoding]::UTF8.GetString($Req.Body)
-                $form = [System.Web.HttpUtility]::ParseQueryString($bodyText)
-                $pw = $form['password']
-                if ($pw -eq $Global:Password) {
-                    $sid = New-SessionId
-                    $now = Get-Date
-                    $Global:Sessions[$sid] = @{ Created = $now; LastSeen = $now }
-                    $cookie = New-SessionCookieHeader -Sid $sid
-                    Send-RedirectResponse -Stream $Stream -Location '/dashboard' -ExtraHeaders @{ 'Set-Cookie' = $cookie }
-                } else {
-                    Send-HtmlResponse -Stream $Stream -Html (Get-LoginPage -Error $true) -Status 401
-                }
-            } else {
-                if (Test-ValidSession -Req $Req) {
-                    Send-RedirectResponse -Stream $Stream -Location '/dashboard'
-                } else {
-                    Send-HtmlResponse -Stream $Stream -Html (Get-LoginPage -Error $false)
-                }
-            }
-        }
-
-        '/dashboard' {
-            if (Test-ValidSession -Req $Req) {
-                Send-HtmlResponse -Stream $Stream -Html (Get-DashboardPage)
-            } else {
-                Send-RedirectResponse -Stream $Stream -Location '/'
-            }
-        }
-
-        '/download' {
-            if (Test-ValidSession -Req $Req) {
-                Send-FileDownload -Req $Req -Stream $Stream
-            } else {
-                Send-RedirectResponse -Stream $Stream -Location '/'
-            }
-        }
-
-        '/upload' {
-            if (-not (Test-ValidSession -Req $Req)) {
-                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"Oturum gecersiz"}' -Status 401
-            } elseif ($method -ne 'POST') {
-                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"Yalnizca POST"}' -Status 405
-            } else {
-                $r = Save-UploadedFileStream -NetStream $Stream -ContentType $Req.ContentType
-                if ($r.ok) {
-                    Send-JsonResponse -Stream $Stream -Json '{"ok":true}' -Status 200
-                } else {
-                    $msg = ($r.msg -replace '"', "'")
-                    Send-JsonResponse -Stream $Stream -Json ('{"ok":false,"msg":"' + $msg + '"}') -Status $r.status
-                }
-            }
-        }
-
-        '/logout' {
-            $sid = $Req.Cookies[$Global:CookieName]
-            if ($sid -and $Global:Sessions.ContainsKey($sid)) { $Global:Sessions.Remove($sid) }
-            $cookie = New-SessionCookieHeader -Sid '' -Expire $true
-            Send-RedirectResponse -Stream $Stream -Location '/' -ExtraHeaders @{ 'Set-Cookie' = $cookie }
-        }
-
-        default {
-            Send-HtmlResponse -Stream $Stream -Html '<h1>404 - bulunamadi</h1>' -Status 404
-        }
-    }
-}
-
-# ------------------------------------------------------------------------------
-#  ANA DONGU (TcpListener)
-# ------------------------------------------------------------------------------
-# Wi-Fi adapter zorunlu: yoksa baslatma
+# ============================== ANA DONGU =====================================
 $wifi = Get-WifiInterface
 if ($null -eq $wifi) {
     Write-Host ''
     Write-Host '  [HATA] Aktif bir Wi-Fi (kablosuz) baglantisi bulunamadi.' -ForegroundColor Red
     Write-Host '  Bu portal yalnizca Wi-Fi uzerinden paylasima izin verir.' -ForegroundColor Yellow
-    Write-Host '  Once Wi-Fi agina baglanin (veya Mobile Hotspot acin), tekrar deneyin.' -ForegroundColor Yellow
+    Write-Host '  Once Wi-Fi agina baglanin veya Mobile Hotspot acin.' -ForegroundColor Yellow
     Write-Host ''
     return
 }
+
+# Restart-safe: disk uzerindeki transfer kayitlarini yukle
+Import-AllTransfers
 
 $bindAddr = [System.Net.IPAddress]::Parse($wifi.IP)
 $listener = New-Object System.Net.Sockets.TcpListener($bindAddr, $Global:Port)
@@ -921,22 +1190,21 @@ try {
 }
 
 Show-StartupBanner -Wifi $wifi
-Write-Host ("  Es zamanli isci (thread): {0}" -f $Global:MaxThreads) -ForegroundColor Green
+Write-Host ("  Es zamanli isci: {0} | Yuklu transfer: {1}" -f $Global:MaxThreads, $Global:Transfers.Count) -ForegroundColor Green
 Write-Host ''
 
-# ------------------------------------------------------------------------------
-#  RUNSPACE POOL  -  her baglanti ayri thread'de islenir, accept thread'i bloklanmaz
-# ------------------------------------------------------------------------------
-# Tum fonksiyonlari ve paylasilan degiskenleri worker runspace'lerine aktar (ISS)
+# ====================== RUNSPACE POOL ========================================
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 $iss.ApartmentState = 'MTA'
 
 $funcNames = @(
-    'Get-IconForFile','Format-Size','Remove-ExpiredSessions','New-SessionId',
+    'Get-IconForFile','Format-Size','New-SessionId','New-ShortId','Get-DeviceLabel',
+    'Invoke-PeriodicSweep','Save-TransferMeta','Remove-Transfer',
     'Read-HttpRequest','Read-RequestBody','Get-HttpStatusText','Send-Response',
     'Send-HtmlResponse','Send-JsonResponse','Send-RedirectResponse','New-SessionCookieHeader',
-    'Test-ValidSession','Get-LoginPage','Get-DashboardPage','Save-UploadedFileStream',
-    'Send-FileDownload','Invoke-RequestRouter'
+    'Test-ValidSession','Resolve-TargetSid','Get-MultipartField',
+    'Save-UploadedFileStream','Send-FileDownload','Get-StateJson',
+    'Get-LoginPage','Get-DashboardPage','Invoke-RequestRouter'
 )
 foreach ($fn in $funcNames) {
     $def = (Get-Command $fn -CommandType Function).Definition
@@ -947,10 +1215,16 @@ $sharedVars = @{
     Password    = $Global:Password
     Port        = $Global:Port
     ShareFolder = $Global:ShareFolder
+    MetaFolder  = $Global:MetaFolder
     CookieName  = $Global:CookieName
     SessionTTL  = $Global:SessionTTL
-    Sessions    = $Global:Sessions      # synchronized hashtable (paylasilan referans)
+    DeviceTTL   = $Global:DeviceTTL
+    SweepEvery  = $Global:SweepEvery
+    Sessions    = $Global:Sessions
+    PubIndex    = $Global:PubIndex
+    Transfers   = $Global:Transfers
     UploadLock  = $Global:UploadLock
+    SweepState  = $Global:SweepState
 }
 foreach ($k in $sharedVars.Keys) {
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($k, $sharedVars[$k], '')))
@@ -959,26 +1233,24 @@ foreach ($k in $sharedVars.Keys) {
 $pool = [runspacefactory]::CreateRunspacePool(1, $Global:MaxThreads, $iss, $Host)
 $pool.Open()
 
-# Her baglanti icin calisan worker
 $worker = {
-    param($client, $ts)
+    param($client, $ts, $remoteIp)
     Add-Type -AssemblyName System.Web
     $stream = $null
     try {
         $client.NoDelay = $true
-        $client.SendTimeout    = 300000
-        $client.ReceiveTimeout = 60000
+        $client.SendTimeout    = 600000
+        $client.ReceiveTimeout = 600000
         $stream = $client.GetStream()
-        $stream.ReadTimeout  = 60000
-        $stream.WriteTimeout = 300000
+        $stream.ReadTimeout  = 600000
+        $stream.WriteTimeout = 600000
 
         $req = Read-HttpRequest -Stream $stream
         if ($null -eq $req) { return }
+        $req.ClientIp = $remoteIp
 
-        Write-Host ("[{0}] {1,-5} {2}" -f $ts, $req.Method, $req.RawTarget) -ForegroundColor DarkGray
+        Write-Host ("[{0}] {1,-6} {2,-30} <- {3}" -f $ts, $req.Method, $req.RawTarget, $remoteIp) -ForegroundColor DarkGray
 
-        # Upload: body RAM'e yuklenmez, stream dogrudan diske akar (boyut limiti yok).
-        # Diger istekler (login form vs): kucuk body RAM'e alinir.
         $isUpload = ($req.Method -eq 'POST' -and $req.Path -eq '/upload')
         if (-not $isUpload) {
             if ($req.ContentLength -gt 0) {
@@ -990,7 +1262,7 @@ $worker = {
 
         Invoke-RequestRouter -Req $req -Stream $stream
     } catch {
-        try { if ($stream) { Send-HtmlResponse -Stream $stream -Html '<h1>500 - sunucu hatasi</h1>' -Status 500 } } catch {}
+        try { if ($stream) { Send-HtmlResponse -Stream $stream -Html '<h1>500</h1>' -Status 500 } } catch {}
     } finally {
         try { if ($stream) { $stream.Close() } } catch {}
         try { $client.Close() } catch {}
@@ -1004,7 +1276,6 @@ try {
         $client = $listener.AcceptTcpClient()
         $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 
-        # Ikinci kat: gelen baglanti Wi-Fi subnet'inde mi? Degilse reddet (thread harcamadan).
         $remoteIp = $null
         try { $remoteIp = $client.Client.RemoteEndPoint.Address.ToString() } catch {}
         if ($remoteIp -and $remoteIp -ne $wifi.IP -and -not (Test-SameSubnet -ClientIp $remoteIp -LocalIp $wifi.IP -Prefix $wifi.Prefix)) {
@@ -1013,14 +1284,12 @@ try {
             continue
         }
 
-        # Baglantiyi havuza ata (accept thread'i serbest kalir)
         $ps = [powershell]::Create()
         $ps.RunspacePool = $pool
-        [void]$ps.AddScript($worker).AddArgument($client).AddArgument($ts)
+        [void]$ps.AddScript($worker).AddArgument($client).AddArgument($ts).AddArgument($remoteIp)
         $handle = $ps.BeginInvoke()
         [void]$jobs.Add([pscustomobject]@{ PS = $ps; Handle = $handle })
 
-        # Tamamlanan worker'lari topla (memory leak onleme)
         for ($i = $jobs.Count - 1; $i -ge 0; $i--) {
             if ($jobs[$i].Handle.IsCompleted) {
                 try { $jobs[$i].PS.EndInvoke($jobs[$i].Handle) } catch {}
@@ -1041,23 +1310,24 @@ try {
 # CALISTIRMA (ADMIN GEREKMEZ):
 #   powershell.exe -ExecutionPolicy Bypass -File LocalFilePortal.ps1
 #
-# DOSYA PAYLASIMI (SADECE Wi-Fi):
-#   - Sunucu YALNIZCA Wi-Fi adapterinin IP'sine bind edilir. Cihazlar ayni anda
-#     Ethernet/LAN'a bagli olsa bile paylasim sadece Wi-Fi uzerinden calisir;
-#     LAN'dan gelen istekler reddedilir (bind + subnet kontrolu, iki kat).
-#   1. PC ve diger cihaz AYNI Wi-Fi agina bagli olsun.
-#   2. Script'i calistir; konsoldaki Wi-Fi URL'sini not al (orn http://192.168.1.42:8080/).
-#   3. Diger cihazin tarayicisina o URL'yi yaz, parola: hako123
-#   4. Yuklenen dosyalar PC'de C:\SharedTransfer klasorune duser.
-#   NOT: Aktif Wi-Fi yoksa script baslamaz (Wi-Fi zorunlu).
+# OZELLIKLER:
+#   - Wi-Fi only (LAN reddedilir, iki kat kontrol: bind + subnet)
+#   - Bagli cihazlar listelenir (login eden herkes); secip ozel gonderim
+#   - "Herkes (Public)" karti ile broadcast: tum cihazlar gorur
+#   - Boyut limiti YOK, oturum suresi YOK
+#   - Stream multipart parser + C# FastScan boundary (yuksek hiz)
+#   - 32 thread runspace pool, es zamanli yukleme/indirme
+#   - Restart sonrasi mevcut transferler korunur (.meta\<id>.json)
+#   - Cihaz adi giriste secilir, panel uzerinden duzenlenebilir
 #
-# ES ZAMANLI KULLANIM:
-#   - Her baglanti ayri thread'de islenir (Runspace Pool, varsayilan 16 isci).
-#     Birden fazla kisi ayni anda yukleyip indirebilir; biri buyuk dosya
-#     yuklerken digerleri bloklanmaz/kopmaz. Esik: $Global:MaxThreads.
+# DOSYA:
+#   - $Global:ShareFolder altinda fiziksel olarak saklanir (varsayilan C:\SharedTransfer)
+#   - Metadata: $ShareFolder\.meta\<id>.json (sender, target, vs.)
 #
-# BAGLANTI OLMUYORSA (admin GEREKMEZ, sadece firewall):
-#   - Ilk istekte Windows "izin ver" sorabilir -> 'Ozel aglar' isaretli birak.
-#   - Sormadiysa, firewall'da 8080 portuna gelen TCP'ye izin ver (Denetim
-#     Masasi > Windows Defender Guvenlik Duvari > Gelismis > Gelen Kurallar).
+# BAGLANTI:
+#   1. Diger cihaz PC ile AYNI Wi-Fi'da olmali (veya Mobile Hotspot'a baglansin)
+#   2. Tarayicida konsoldaki URL'yi ac, parola: hako123
+#   3. Cihaz panele dusunce: secip gonder, public yayinla, dosya indir
+#
+# FIREWALL: Ilk istekte Windows izin sorabilir -> 'Ozel aglar' isaretle
 # ==============================================================================
