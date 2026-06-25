@@ -1,23 +1,23 @@
 # ==============================================================================
 #  LocalFilePortal.ps1  v2.0
-#  Tek dosyalik PowerShell yerel dosya transfer portali
-#   - Sadece Wi-Fi uzerinden, admin yetkisi gerektirmez (TcpListener)
-#   - Bagli cihazlar gozukur, click ile secip dosya gonderme + public broadcast
-#   - Sure limiti YOK, boyut limiti YOK
-#   - Streaming multipart parser + C# FastScan boundary -> hizli yukleme
-#   - Native PowerShell 5.1+, harici bagimlilik YOK
+#  Single-file PowerShell local file transfer portal
+#   - Wi-Fi only, no admin required (TcpListener)
+#   - Connected devices visible, click-to-target + public broadcast
+#   - No time limit, no size limit
+#   - Streaming multipart parser + C# FastScan boundary -> fast upload
+#   - Native PowerShell 5.1+, no external dependencies
 # ==============================================================================
 
 Add-Type -AssemblyName System.Web
 
-# ============================== AYARLAR ======================================
+# ============================== SETTINGS ======================================
 $Global:Password    = 'hako123'
 $Global:Port        = 8080
 $Global:ShareFolder = 'C:\SharedTransfer'
 $Global:MetaFolder  = Join-Path $Global:ShareFolder '.meta'
 $Global:CookieName  = 'LDSID'
-$Global:SessionTTL  = [TimeSpan]::FromDays(365)     # pratikte oturum suresi yok
-$Global:DeviceTTL   = [TimeSpan]::FromMinutes(5)    # 'online' esigi
+$Global:SessionTTL  = [TimeSpan]::FromDays(365)     # effectively no expiry
+$Global:DeviceTTL   = [TimeSpan]::FromMinutes(5)    # 'online' threshold
 $Global:MaxThreads  = 32
 $Global:SweepEvery  = [TimeSpan]::FromMinutes(2)
 
@@ -31,8 +31,8 @@ foreach ($d in @($Global:ShareFolder, $Global:MetaFolder)) {
     if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
 
-# =================== HIZLI BOUNDARY TARAYICISI (C#) ===========================
-# PowerShell array indeks erisimi cok yavas. C# ile native scan -> ~100x hiz.
+# =================== FAST BOUNDARY SCANNER (C#) ===============================
+# PowerShell array index access is slow. C# native scan -> ~100x faster.
 if (-not ('LFP.FastScan' -as [type])) {
     Add-Type -TypeDefinition @'
 namespace LFP {
@@ -55,7 +55,7 @@ namespace LFP {
 '@
 }
 
-# ============================== YARDIMCILAR ===================================
+# ============================== HELPERS =======================================
 function Get-IconForFile {
     param([string]$Name)
     $ext = [System.IO.Path]::GetExtension($Name).ToLowerInvariant().TrimStart('.')
@@ -101,7 +101,7 @@ function New-ShortId {
 function Get-DeviceLabel {
     param([string]$UA, [string]$IP)
     $ua = if ($UA) { $UA.ToLowerInvariant() } else { '' }
-    $os = 'Cihaz'
+    $os = 'Device'
     if     ($ua -match 'windows nt')       { $os = 'Windows' }
     elseif ($ua -match 'iphone')           { $os = 'iPhone' }
     elseif ($ua -match 'ipad')             { $os = 'iPad' }
@@ -177,7 +177,7 @@ function Remove-Transfer {
     return $true
 }
 
-# ============================== HTTP KATMANI ==================================
+# ============================== HTTP LAYER ====================================
 function Read-HttpRequest {
     param([System.IO.Stream]$Stream)
     $headerBytes = New-Object System.Collections.Generic.List[byte]
@@ -335,7 +335,7 @@ function Resolve-TargetSid {
 }
 
 function Get-MultipartField {
-    # Kucuk multipart field okuyucu (nick/id gibi). Buyuk dosyalar Save-UploadedFileStream'de.
+    # Small multipart field reader (nick/id). Large files go through Save-UploadedFileStream.
     param([byte[]]$BodyBytes, [string]$ContentType, [string]$FieldName)
     if (-not $BodyBytes -or $BodyBytes.Length -eq 0) { return $null }
     if ($ContentType -notmatch 'boundary=(.+)$') { return $null }
@@ -359,57 +359,59 @@ function Get-MultipartField {
 
 # ===================== MULTIPART STREAMING PARSER =============================
 function Save-UploadedFileStream {
-    # Agi 256KB chunk'larla dogrudan diske akar. C# FastScan ile bound. tarama.
-    # Tek ortak buffer (chunkSize + delimLen) ile allocation minimum.
+    # Streams the network directly to disk in 256KB chunks. C# FastScan for boundary.
+    # Single shared buffer (chunkSize + delimLen) keeps allocations minimal.
     param(
         [System.IO.Stream]$NetStream, [string]$ContentType,
         [string]$SenderSid, [string]$Target
     )
 
-    if ($ContentType -notmatch 'boundary=(.+)$') { return @{ ok=$false; status=400; msg='Boundary bulunamadi' } }
+    if ($ContentType -notmatch 'boundary=(.+)$') { return @{ ok=$false; status=400; msg='Boundary not found' } }
     $boundary = $Matches[1].Trim().Trim('"')
     $latin1   = [System.Text.Encoding]::GetEncoding(28591)
 
-    # Multipart header oku
+    # Read multipart part headers
     $hdrBuf = New-Object System.Collections.Generic.List[byte]
     $b0=-1;$b1=-1;$b2=-1;$b3=-1
     while ($true) {
         $b = $NetStream.ReadByte()
-        if ($b -lt 0) { return @{ ok=$false; status=400; msg='Baglanti kesildi (header)' } }
+        if ($b -lt 0) { return @{ ok=$false; status=400; msg='Connection closed (header)' } }
         $hdrBuf.Add([byte]$b)
         $b0=$b1; $b1=$b2; $b2=$b3; $b3=$b
         if ($b0 -eq 13 -and $b1 -eq 10 -and $b2 -eq 13 -and $b3 -eq 10) { break }
-        if ($hdrBuf.Count -gt 8192) { return @{ ok=$false; status=400; msg='Multipart header cok buyuk' } }
+        if ($hdrBuf.Count -gt 8192) { return @{ ok=$false; status=400; msg='Multipart header too large' } }
     }
     $hdrText  = $latin1.GetString($hdrBuf.ToArray())
     $fileName = $null
     if ($hdrText -match 'filename="([^"]*)"') { $fileName = $Matches[1] }
-    if ([string]::IsNullOrWhiteSpace($fileName)) { return @{ ok=$false; status=400; msg='Dosya adi yok' } }
-    # filename UTF-8 olabilir; latin1 ile gelen byte'lari UTF-8'e tekrar yorumla
+    if ([string]::IsNullOrWhiteSpace($fileName)) { return @{ ok=$false; status=400; msg='No filename' } }
+    # Filename may be UTF-8; re-decode the latin1 bytes
     $fnBytes = $latin1.GetBytes($fileName)
     try { $fileName = [System.Text.Encoding]::UTF8.GetString($fnBytes) } catch {}
     $fileName = [System.IO.Path]::GetFileName($fileName)
 
-    # Benzersiz dosya yolu rezerve et
-    $target = $null
+    # Reserve unique file path
+    # NOTE: local variable is $targetPath - PowerShell is case-insensitive so using
+    # $target would collide with the $Target parameter (recipient sid).
+    $targetPath = $null
     [System.Threading.Monitor]::Enter($Global:UploadLock)
     try {
-        $target = Join-Path $ShareFolder $fileName
-        if (Test-Path -LiteralPath $target) {
+        $targetPath = Join-Path $ShareFolder $fileName
+        if (Test-Path -LiteralPath $targetPath) {
             $base = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
             $ext  = [System.IO.Path]::GetExtension($fileName)
             $n = 1
             do { $candidate = Join-Path $ShareFolder ("{0}_{1}{2}" -f $base,$n,$ext); $n++ } while (Test-Path -LiteralPath $candidate)
-            $target = $candidate
+            $targetPath = $candidate
         }
-        (New-Object System.IO.FileStream($target,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None)).Close()
+        (New-Object System.IO.FileStream($targetPath,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None)).Close()
     } catch {
         return @{ ok=$false; status=500; msg=$_.Exception.Message }
     } finally {
         [System.Threading.Monitor]::Exit($Global:UploadLock)
     }
 
-    # Stream agi diske; bitis isareti \r\n--boundary
+    # Stream network to disk; stop marker is \r\n--boundary
     $delimBytes = $latin1.GetBytes("`r`n--" + $boundary)
     $delimLen   = $delimBytes.Length
     $chunkSize  = 262144                 # 256 KB
@@ -420,7 +422,7 @@ function Save-UploadedFileStream {
 
     $fs = $null
     try {
-        $fs = New-Object System.IO.FileStream($target,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None,1048576,[System.IO.FileOptions]::SequentialScan)
+        $fs = New-Object System.IO.FileStream($targetPath,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None,1048576,[System.IO.FileOptions]::SequentialScan)
         $found = $false
 
         while (-not $found) {
@@ -449,18 +451,18 @@ function Save-UploadedFileStream {
         $fs.Flush()
     } catch {
         try { if ($fs) { $fs.Close() } } catch {}
-        try { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue } catch {}
+        try { Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue } catch {}
         return @{ ok=$false; status=500; msg=$_.Exception.Message }
     } finally {
         try { if ($fs) { $fs.Close() } } catch {}
     }
 
-    $finalName  = [System.IO.Path]::GetFileName($target)
-    $size       = (Get-Item -LiteralPath $target).Length
+    $finalName  = [System.IO.Path]::GetFileName($targetPath)
+    $size       = (Get-Item -LiteralPath $targetPath).Length
     $tid        = New-ShortId 8
-    $senderNick = if ($Global:Sessions.ContainsKey($SenderSid)) { $Global:Sessions[$SenderSid].Nick } else { 'Bilinmiyor' }
+    $senderNick = if ($Global:Sessions.ContainsKey($SenderSid)) { $Global:Sessions[$SenderSid].Nick } else { 'Unknown' }
     $t = @{
-        Id=$tid; Name=$finalName; Path=$target; Size=$size
+        Id=$tid; Name=$finalName; Path=$targetPath; Size=$size
         Sender=$SenderSid; SenderNick=$senderNick; Target=$Target
         Created=(Get-Date)
     }
@@ -470,20 +472,20 @@ function Save-UploadedFileStream {
     return @{ ok=$true; status=200; id=$tid; msg=$finalName }
 }
 
-# ============================== INDIRME =======================================
+# ============================== DOWNLOAD ======================================
 function Send-FileDownload {
     param($Req, [System.IO.Stream]$Stream, [string]$Sid)
     $q = [System.Web.HttpUtility]::ParseQueryString($Req.Query)
     $id = $q['id']
     if ([string]::IsNullOrWhiteSpace($id) -or -not $Global:Transfers.ContainsKey($id)) {
-        Send-HtmlResponse -Stream $Stream -Html '<h1>404 - dosya yok</h1>' -Status 404; return
+        Send-HtmlResponse -Stream $Stream -Html '<h1>404 - file not found</h1>' -Status 404; return
     }
     $t = $Global:Transfers[$id]
     if ($t.Target -ne 'public' -and $t.Target -ne $Sid -and $t.Sender -ne $Sid) {
-        Send-HtmlResponse -Stream $Stream -Html '<h1>403 - bu dosyaya erisim yok</h1>' -Status 403; return
+        Send-HtmlResponse -Stream $Stream -Html '<h1>403 - access denied</h1>' -Status 403; return
     }
     if (-not (Test-Path -LiteralPath $t.Path -PathType Leaf)) {
-        Send-HtmlResponse -Stream $Stream -Html '<h1>404 - dosya kayboldu</h1>' -Status 404; return
+        Send-HtmlResponse -Stream $Stream -Html '<h1>404 - file missing on disk</h1>' -Status 404; return
     }
 
     $name    = [System.IO.Path]::GetFileName($t.Path)
@@ -510,7 +512,7 @@ function Send-FileDownload {
     } finally { $fs.Dispose() }
 }
 
-# ============================== STATE JSON ===================================
+# ============================== STATE JSON ====================================
 function Get-StateJson {
     param([string]$Sid)
     Invoke-PeriodicSweep
@@ -542,12 +544,12 @@ function Get-StateJson {
 
     $tArr = @()
     foreach ($t in $visible) {
-        $targetNick = 'Herkes'
+        $targetNick = 'Everyone'
         $targetKind = 'public'
         if ($t.Target -ne 'public') {
             $targetKind = 'device'
             if ($Global:Sessions.ContainsKey($t.Target)) { $targetNick = $Global:Sessions[$t.Target].Nick }
-            else { $targetNick = '(silinmis)' }
+            else { $targetNick = '(deleted)' }
         }
         $tArr += [pscustomobject]@{
             id         = $t.Id
@@ -571,14 +573,14 @@ function Get-StateJson {
     return ($payload | ConvertTo-Json -Depth 6 -Compress)
 }
 
-# ============================== UI SAYFALAR ===================================
+# ============================== UI PAGES ======================================
 function Get-LoginPage {
     param([bool]$Error = $false)
-    $errBlock = if ($Error) { '<div class="error-msg">Hatali parola. Tekrar deneyin.</div>' } else { '' }
+    $errBlock = if ($Error) { '<div class="error-msg">Wrong password. Please try again.</div>' } else { '' }
     return @"
-<!DOCTYPE html><html lang="tr"><head>
+<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Yerel Dosya Portali - Giris</title>
+<title>Local File Portal - Sign In</title>
 <style>
   :root{--bg:#0d0f12;--card:#141720;--border:#1e2330;--accent:#4f8ef7;--text:#e8ecf5;--muted:#5a6480;--ok:#4ff78e;--err:#f74f6a}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -602,20 +604,20 @@ function Get-LoginPage {
 </style></head><body>
   <div class="grid-bg"></div>
   <div class="card">
-    <div class="logo"><span class="icon">&#128274;</span><h1>YEREL DOSYA PORTALI</h1></div>
-    <div class="sub">Cihaz adi sec (opsiyonel) ve parola ile gir.</div>
+    <div class="logo"><span class="icon">&#128274;</span><h1>LOCAL FILE PORTAL</h1></div>
+    <div class="sub">Pick a device name (optional) and sign in.</div>
     $errBlock
     <form method="POST" action="/">
-      <label for="nick">Cihaz Adi</label>
-      <input id="nick" name="nick" type="text" placeholder="Ornek: Hakan Telefon" maxlength="32" style="margin-bottom:16px">
-      <label for="pw">Parola</label>
+      <label for="nick">Device Name</label>
+      <input id="nick" name="nick" type="text" placeholder="e.g. Hakan's Phone" maxlength="32" style="margin-bottom:16px">
+      <label for="pw">Password</label>
       <div class="pw-wrap">
         <input id="pw" name="password" type="password" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;" autofocus required>
-        <button type="button" class="toggle" id="tgl">&#128065;</button>
+        <button type="button" class="toggle" id="tgl" title="Show/Hide">&#128065;</button>
       </div>
-      <button type="submit" class="submit">Giris Yap</button>
+      <button type="submit" class="submit">Sign In</button>
     </form>
-    <div class="status"><span class="dot"></span> Sunucu aktif</div>
+    <div class="status"><span class="dot"></span> Server online</div>
   </div>
 <script>
   var pw=document.getElementById('pw'),tgl=document.getElementById('tgl');
@@ -627,9 +629,9 @@ function Get-LoginPage {
 
 function Get-DashboardPage {
     return @"
-<!DOCTYPE html><html lang="tr"><head>
+<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Yerel Dosya Portali</title>
+<title>Local File Portal</title>
 <style>
   :root{--bg:#0d0f12;--card:#141720;--border:#1e2330;--accent:#4f8ef7;--accent2:#8e6cf7;--text:#e8ecf5;--muted:#5a6480;--ok:#4ff78e;--err:#f74f6a;--warn:#f7c14f}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -701,50 +703,50 @@ function Get-DashboardPage {
   @media(max-width:600px){header{padding:12px 14px}main{padding:14px}.panel{padding:16px}}
 </style></head><body>
   <header>
-    <div class="brand"><span class="icon">&#128193;</span><h1>YEREL DOSYA PORTALI</h1></div>
+    <div class="brand"><span class="icon">&#128193;</span><h1>LOCAL FILE PORTAL</h1></div>
     <div class="hdr-right">
       <div class="me-chip">
-        <span class="dot"></span><span>Ben:</span>
+        <span class="dot"></span><span>Me:</span>
         <b id="myNick">...</b>
-        <button class="rename" id="renameBtn" title="Cihaz adini degistir">&#9998;</button>
+        <button class="rename" id="renameBtn" title="Change device name">&#9998;</button>
       </div>
       <span id="onlineCount" style="color:var(--muted)">...</span>
-      <a class="logout" href="/logout">&#128682; Cikis</a>
+      <a class="logout" href="/logout">&#128682; Sign Out</a>
     </div>
   </header>
 
   <main>
     <section class="panel">
-      <h2>Bagli Cihazlar <span id="targetLabel" class="target-chip">Hedef: Herkes</span></h2>
+      <h2>Connected Devices <span id="targetLabel" class="target-chip">Target: Everyone</span></h2>
       <div id="devices" class="dev-grid"></div>
     </section>
 
     <section class="panel">
-      <h2>Dosya Gonder</h2>
+      <h2>Send Files</h2>
       <div class="drop" id="drop">
         <div class="big">&#128228;</div>
-        <div>Dosyalari surukleyip birakin <br>veya tiklayarak <b>birden fazla</b> dosya secin</div>
+        <div>Drag and drop files here <br>or click to select <b>multiple</b> files</div>
         <input type="file" id="file" multiple hidden>
       </div>
       <div class="filelist" id="fileList"></div>
       <div class="up-row">
-        <button class="btn" id="upBtn" disabled>Gonder</button>
-        <button class="btn ghost" id="clearBtn" style="display:none">Temizle</button>
+        <button class="btn" id="upBtn" disabled>Send</button>
+        <button class="btn ghost" id="clearBtn" style="display:none">Clear</button>
         <span class="count-lbl" id="countLbl"></span>
       </div>
       <div class="bar-wrap" id="barWrap"><div class="bar" id="bar"></div></div>
     </section>
 
     <section class="panel">
-      <h2>Transferler</h2>
+      <h2>Transfers</h2>
       <div class="tabs">
-        <button class="tab on" data-f="all">Tumu</button>
-        <button class="tab" data-f="inbox">Bana Gelen</button>
+        <button class="tab on" data-f="all">All</button>
+        <button class="tab" data-f="inbox">Inbox</button>
         <button class="tab" data-f="public">Public</button>
-        <button class="tab" data-f="sent">Gonderdiklerim</button>
+        <button class="tab" data-f="sent">Sent</button>
       </div>
       <table>
-        <thead><tr><th></th><th>Dosya</th><th>Boyut</th><th>Gonderen / Hedef</th><th>Tarih</th><th></th></tr></thead>
+        <thead><tr><th></th><th>File</th><th>Size</th><th>From / To</th><th>Date</th><th></th></tr></thead>
         <tbody id="transferBody"></tbody>
       </table>
     </section>
@@ -765,7 +767,7 @@ function Get-DashboardPage {
   function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
   function toast(msg,type){var t=document.createElement('div');t.className='toast '+(type||'ok');t.textContent=msg;toasts.appendChild(t);setTimeout(function(){t.style.transition='opacity .3s';t.style.opacity='0';setTimeout(function(){t.remove();},300);},3500);}
   function fmtSize(b){if(b>=1073741824)return(b/1073741824).toFixed(2)+' GB';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(2)+' KB';return b+' B';}
-  function fmtSeen(sec){if(sec<60)return 'simdi';if(sec<3600)return Math.floor(sec/60)+'dk once';if(sec<86400)return Math.floor(sec/3600)+'sa once';return Math.floor(sec/86400)+'g once';}
+  function fmtSeen(sec){if(sec<60)return 'just now';if(sec<3600)return Math.floor(sec/60)+'m ago';if(sec<86400)return Math.floor(sec/3600)+'h ago';return Math.floor(sec/86400)+'d ago';}
   function fmtDate(iso){var d=new Date(iso);if(isNaN(d.getTime()))return iso;var y=d.getFullYear(),m=('0'+(d.getMonth()+1)).slice(-2),da=('0'+d.getDate()).slice(-2);var h=('0'+d.getHours()).slice(-2),mi=('0'+d.getMinutes()).slice(-2);return da+'.'+m+'.'+y+' '+h+':'+mi;}
   function devIcon(n){var s=(n||'').toLowerCase();if(s.indexOf('iphone')>=0||s.indexOf('ipad')>=0||s.indexOf('android')>=0)return '&#128241;';if(s.indexOf('mac')>=0||s.indexOf('windows')>=0)return '&#128187;';if(s.indexOf('linux')>=0)return '&#128421;';return '&#128242;';}
 
@@ -778,10 +780,10 @@ function Get-DashboardPage {
       var prev=lastTransferIds;
       state=await r.json();
       lastTransferIds=new Set(state.transfers.map(function(t){return t.id;}));
-      // yeni gelen dosyalar icin bildirim (bana gelen ya da public, benden gelmeyen)
+      // notify on new files (inbound, not sent by me)
       state.transfers.forEach(function(t){
         if(!prev.has(t.id) && !t.byMe && (t.toMe || t.target==='public')){
-          toast(t.senderNick+' gonderdi: '+t.name,'info');
+          toast(t.senderNick+' sent you: '+t.name,'info');
         }
       });
       renderAll();
@@ -791,7 +793,7 @@ function Get-DashboardPage {
     document.getElementById('myNick').textContent=state.me.nick||'...';
     var others=state.devices.filter(function(d){return d.pubId!==state.me.pubId;});
     var onN=others.filter(function(d){return d.online;}).length;
-    document.getElementById('onlineCount').textContent=onN+' baska cihaz online';
+    document.getElementById('onlineCount').textContent=onN+' other device(s) online';
     if(target!=='public' && !state.devices.some(function(d){return d.pubId===target;})){
       target='public';
     }
@@ -803,25 +805,25 @@ function Get-DashboardPage {
     var c=document.createElement('div');
     c.className='dev'+(pubId===target?' selected':'')+(offline?' offline':'')+(self?' self':'')+(pubId==='public'?' public':'');
     var status=(showStatus && !self)?'<div class="dev-status"></div>':'';
-    c.innerHTML=status+'<div class="dev-icon">'+icon+'</div><div class="dev-name">'+esc(label)+(self?' (ben)':'')+'</div><div class="dev-sub">'+esc(sub)+'</div>';
+    c.innerHTML=status+'<div class="dev-icon">'+icon+'</div><div class="dev-name">'+esc(label)+(self?' (me)':'')+'</div><div class="dev-sub">'+esc(sub)+'</div>';
     c.addEventListener('click',function(){
-      if(self){toast('Kendine gonderemezsin','err');return;}
+      if(self){toast("Can't send to yourself",'err');return;}
       target=pubId; renderDevices(); refreshTargetLabel();
     });
     return c;
   }
   function renderDevices(){
     var box=document.getElementById('devices');box.innerHTML='';
-    box.appendChild(devCard('public','&#127760;','Herkes (Public)','Tum cihazlar gorur',false,false,false));
+    box.appendChild(devCard('public','&#127760;','Everyone (Public)','Visible to all devices',false,false,false));
     state.devices.forEach(function(d){
       var sub=d.online?'online':fmtSeen(d.ageSec);
       box.appendChild(devCard(d.pubId,devIcon(d.nick),d.nick,sub,!d.online,d.pubId===state.me.pubId,true));
     });
   }
   function refreshTargetLabel(){
-    var name='Herkes';
-    if(target!=='public'){var d=state.devices.find(function(x){return x.pubId===target;});name=d?d.nick:'(secili degil)';}
-    document.getElementById('targetLabel').textContent='Hedef: '+name;
+    var name='Everyone';
+    if(target!=='public'){var d=state.devices.find(function(x){return x.pubId===target;});name=d?d.nick:'(none)';}
+    document.getElementById('targetLabel').textContent='Target: '+name;
   }
   function renderTransfers(){
     var body=document.getElementById('transferBody');body.innerHTML='';
@@ -832,18 +834,18 @@ function Get-DashboardPage {
       if(filter==='sent')return t.byMe;
       return true;
     });
-    if(rows.length===0){body.innerHTML='<tr><td colspan="6" class="empty">&#128230; Henuz dosya yok.</td></tr>';return;}
+    if(rows.length===0){body.innerHTML='<tr><td colspan="6" class="empty">&#128230; No files yet.</td></tr>';return;}
     rows.forEach(function(t){
       var tr=document.createElement('tr');
       var pill=t.target==='public'?'<span class="pill pub">&#127760; Public</span>':('<span class="pill">'+esc(t.targetNick)+'</span>');
-      var fromPill=t.byMe?'<span class="pill me">Ben</span>':('<span class="pill">'+esc(t.senderNick)+'</span>');
-      var del=t.byMe?'<button class="dl-x" data-id="'+t.id+'" title="Sil">&#10005;</button>':'';
+      var fromPill=t.byMe?'<span class="pill me">Me</span>':('<span class="pill">'+esc(t.senderNick)+'</span>');
+      var del=t.byMe?'<button class="dl-x" data-id="'+t.id+'" title="Delete">&#10005;</button>':'';
       tr.innerHTML='<td class="ic">'+t.icon+'</td>'+
                    '<td class="td-nm">'+esc(t.name)+'</td>'+
                    '<td>'+fmtSize(t.size)+'</td>'+
                    '<td>'+fromPill+' &rarr; '+pill+'</td>'+
                    '<td class="dt">'+fmtDate(t.created)+'</td>'+
-                   '<td><a class="dl" href="/download?id='+encodeURIComponent(t.id)+'">&#11015; Indir</a>'+del+'</td>';
+                   '<td><a class="dl" href="/download?id='+encodeURIComponent(t.id)+'">&#11015; Download</a>'+del+'</td>';
       body.appendChild(tr);
     });
   }
@@ -854,17 +856,17 @@ function Get-DashboardPage {
   });});
   document.getElementById('transferBody').addEventListener('click',async function(e){
     var x=e.target.closest('.dl-x'); if(!x)return;
-    if(!confirm('Dosyayi kalici sil?'))return;
+    if(!confirm('Permanently delete this file?'))return;
     var fd=new FormData();fd.append('id',x.dataset.id);
     var r=await fetch('/api/delete',{method:'POST',body:fd});
-    if(r.ok){toast('Silindi','ok');fetchState();}else{toast('Silinemedi','err');}
+    if(r.ok){toast('Deleted','ok');fetchState();}else{toast('Failed to delete','err');}
   });
   document.getElementById('renameBtn').addEventListener('click',async function(){
-    var n=prompt('Yeni cihaz adi:',state.me.nick);if(!n)return;
+    var n=prompt('New device name:',state.me.nick);if(!n)return;
     n=n.trim().slice(0,32);if(!n)return;
     var fd=new FormData();fd.append('nick',n);
     var r=await fetch('/api/nick',{method:'POST',body:fd});
-    if(r.ok){toast('Ad guncellendi','ok');fetchState();}
+    if(r.ok){toast('Name updated','ok');fetchState();}
   });
 
   var drop=document.getElementById('drop'),fileInp=document.getElementById('file'),
@@ -885,16 +887,16 @@ function Get-DashboardPage {
     queued.forEach(function(q){
       var row=document.createElement('div');row.className='fileitem';
       var stat='';
-      if(q.status==='ok')stat='<span class="fi-stat ok">&#10003; gonderildi</span>';
-      else if(q.status==='err')stat='<span class="fi-stat err">&#10007; hata</span>';
-      else if(q.status==='up')stat='<span class="fi-stat up">gonderiliyor...</span>';
+      if(q.status==='ok')stat='<span class="fi-stat ok">&#10003; sent</span>';
+      else if(q.status==='err')stat='<span class="fi-stat err">&#10007; error</span>';
+      else if(q.status==='up')stat='<span class="fi-stat up">sending...</span>';
       var rm=uploading?'':'<span class="fi-x" data-id="'+q.id+'">&#10005;</span>';
       row.innerHTML='<span class="fi-ic">&#128196;</span><span class="fi-name">'+esc(q.file.name)+'</span><span class="fi-size">'+fmtSize(q.file.size)+'</span>'+stat+rm;
       fileList.appendChild(row);
     });
     upBtn.disabled=(queued.length===0 || uploading);
     clearBtn.style.display=(queued.length && !uploading)?'inline-block':'none';
-    countLbl.textContent=queued.length?(queued.length+' dosya '+(uploading?'gonderiliyor':'secildi')):'';
+    countLbl.textContent=queued.length?(queued.length+' file(s) '+(uploading?'sending':'selected')):'';
   }
   fileList.addEventListener('click',function(e){
     var x=e.target.closest('.fi-x');if(!x)return;
@@ -916,11 +918,11 @@ function Get-DashboardPage {
     xhr.upload.onprogress=function(e){if(e.lengthComputable){bar.style.width=((e.loaded/e.total)*100)+'%';}};
     xhr.onload=function(){
       var ok=false,msg='';try{var r=JSON.parse(xhr.responseText);ok=r.ok;msg=r.msg||'';}catch(_){}
-      if(ok){item.status='ok';toast(item.file.name+' gonderildi','ok');}
-      else{item.status='err';toast(item.file.name+' hata: '+(msg||xhr.status),'err');}
+      if(ok){item.status='ok';toast(item.file.name+' sent','ok');}
+      else{item.status='err';toast(item.file.name+' error: '+(msg||xhr.status),'err');}
       renderQueue();done();
     };
-    xhr.onerror=function(){item.status='err';toast(item.file.name+' baglanti hatasi','err');renderQueue();done();};
+    xhr.onerror=function(){item.status='err';toast(item.file.name+' connection error','err');renderQueue();done();};
     xhr.send(fd);
   }
   upBtn.addEventListener('click',function(){
@@ -932,7 +934,7 @@ function Get-DashboardPage {
       if(i>=todo.length){
         bar.style.width='100%';
         var okN=queued.filter(function(q){return q.status==='ok';}).length;
-        toast(okN+' dosya gonderildi','ok');
+        toast(okN+' file(s) sent','ok');
         setTimeout(function(){uploading=false;renderQueue();fetchState();bar.style.width='0';barWrap.classList.remove('show');},700);
         return;
       }
@@ -1012,7 +1014,7 @@ function Invoke-RequestRouter {
                 $form = [System.Web.HttpUtility]::ParseQueryString($bt)
                 $nick = $form['nick']
             }
-            if ([string]::IsNullOrWhiteSpace($nick)) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"bos"}' -Status 400; return }
+            if ([string]::IsNullOrWhiteSpace($nick)) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"empty"}' -Status 400; return }
             $nick = $nick.Trim(); if ($nick.Length -gt 32) { $nick = $nick.Substring(0,32) }
             $Global:Sessions[$sid].Nick = $nick
             Send-JsonResponse -Stream $Stream -Json '{"ok":true}' -Status 200
@@ -1031,10 +1033,10 @@ function Invoke-RequestRouter {
                 $id = $form['id']
             }
             if ([string]::IsNullOrWhiteSpace($id) -or -not $Global:Transfers.ContainsKey($id)) {
-                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"yok"}' -Status 404; return
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"not found"}' -Status 404; return
             }
             $t = $Global:Transfers[$id]
-            if ($t.Sender -ne $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"yetki yok"}' -Status 403; return }
+            if ($t.Sender -ne $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"forbidden"}' -Status 403; return }
             [void](Remove-Transfer -Id $id)
             Send-JsonResponse -Stream $Stream -Json '{"ok":true}' -Status 200
         }
@@ -1047,12 +1049,12 @@ function Invoke-RequestRouter {
 
         '/upload' {
             $sid = Test-ValidSession -Req $Req
-            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"oturum yok"}' -Status 401; return }
-            if ($method -ne 'POST') { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"POST gerekli"}' -Status 405; return }
+            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"no session"}' -Status 401; return }
+            if ($method -ne 'POST') { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"POST required"}' -Status 405; return }
             $q = [System.Web.HttpUtility]::ParseQueryString($Req.Query)
             $targetParam = $q['target']
             $targetSid = Resolve-TargetSid -TargetParam $targetParam
-            if ($null -eq $targetSid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"hedef gecersiz"}' -Status 400; return }
+            if ($null -eq $targetSid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"invalid target"}' -Status 400; return }
             $r = Save-UploadedFileStream -NetStream $Stream -ContentType $Req.ContentType -SenderSid $sid -Target $targetSid
             if ($r.ok) {
                 Send-JsonResponse -Stream $Stream -Json (('{"ok":true,"id":"' + $r.id + '","msg":"' + ($r.msg -replace '"',"'") + '"}'))
@@ -1079,7 +1081,7 @@ function Invoke-RequestRouter {
     }
 }
 
-# ============================== AG TESPITI ====================================
+# ============================== NETWORK SETUP ================================
 function Get-WifiInterface {
     try {
         $wifiAdapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
@@ -1146,32 +1148,32 @@ function Show-StartupBanner {
     Write-Host ('  |  URL          : {0,-38} |' -f $url)                                  -ForegroundColor Green
     Write-Host ('  |  Wi-Fi Adapter: {0,-38} |' -f $Wifi.Name)                            -ForegroundColor Gray
     Write-Host ('  |  Subnet       : {0,-38} |' -f ("$($Wifi.IP)/$($Wifi.Prefix)"))       -ForegroundColor Gray
-    Write-Host ('  |  Sure Limiti  : {0,-38} |' -f 'YOK (1 yil)')                         -ForegroundColor Gray
-    Write-Host ('  |  Boyut Limiti : {0,-38} |' -f 'YOK')                                 -ForegroundColor Gray
-    Write-Host ('  |  Klasor       : {0,-38} |' -f $Global:ShareFolder)                   -ForegroundColor Gray
-    Write-Host ('  |  Es Zamanli   : {0,-38} |' -f ("$($Global:MaxThreads) thread"))      -ForegroundColor Gray
-    Write-Host ('  |  Parola       : {0,-38} |' -f $Global:Password)                      -ForegroundColor Magenta
+    Write-Host ('  |  Time Limit   : {0,-38} |' -f 'NONE (1 year)')                       -ForegroundColor Gray
+    Write-Host ('  |  Size Limit   : {0,-38} |' -f 'NONE')                                -ForegroundColor Gray
+    Write-Host ('  |  Folder       : {0,-38} |' -f $Global:ShareFolder)                   -ForegroundColor Gray
+    Write-Host ('  |  Concurrency  : {0,-38} |' -f ("$($Global:MaxThreads) threads"))     -ForegroundColor Gray
+    Write-Host ('  |  Password     : {0,-38} |' -f $Global:Password)                      -ForegroundColor Magenta
     Write-Host '  +--------------------------------------------------------+' -ForegroundColor DarkGray
     Write-Host ''
-    Write-Host '  [Wi-Fi only] Sadece Wi-Fi IP suzulur, LAN reddedilir.' -ForegroundColor Green
-    if ($Wifi.Hotspot) { Write-Host '  [Hotspot] Mobile Hotspot (192.168.137.x).' -ForegroundColor Green }
-    Write-Host '  [Karsilikli] Cihaz-cihaz private + public broadcast.' -ForegroundColor Green
-    Write-Host '  [Admin gerekmez] TcpListener. Ctrl+C durdurur.' -ForegroundColor DarkGray
+    Write-Host '  [Wi-Fi only] Only Wi-Fi IP allowed, LAN clients rejected.' -ForegroundColor Green
+    if ($Wifi.Hotspot) { Write-Host '  [Hotspot] Mobile Hotspot network (192.168.137.x).' -ForegroundColor Green }
+    Write-Host '  [Bidirectional] Device-to-device private + public broadcast.' -ForegroundColor Green
+    Write-Host '  [No admin] TcpListener. Press Ctrl+C to stop.' -ForegroundColor DarkGray
     Write-Host ''
 }
 
-# ============================== ANA DONGU =====================================
+# ============================== MAIN LOOP ====================================
 $wifi = Get-WifiInterface
 if ($null -eq $wifi) {
     Write-Host ''
-    Write-Host '  [HATA] Aktif bir Wi-Fi (kablosuz) baglantisi bulunamadi.' -ForegroundColor Red
-    Write-Host '  Bu portal yalnizca Wi-Fi uzerinden paylasima izin verir.' -ForegroundColor Yellow
-    Write-Host '  Once Wi-Fi agina baglanin veya Mobile Hotspot acin.' -ForegroundColor Yellow
+    Write-Host '  [ERROR] No active Wi-Fi (wireless) connection found.' -ForegroundColor Red
+    Write-Host '  This portal only allows sharing over Wi-Fi.' -ForegroundColor Yellow
+    Write-Host '  Connect to a Wi-Fi network or enable Mobile Hotspot, then retry.' -ForegroundColor Yellow
     Write-Host ''
     return
 }
 
-# Restart-safe: disk uzerindeki transfer kayitlarini yukle
+# Restart-safe: load transfer records from disk
 Import-AllTransfers
 
 $bindAddr = [System.Net.IPAddress]::Parse($wifi.IP)
@@ -1181,16 +1183,16 @@ try {
     $listener.Start()
 } catch {
     Write-Host ''
-    Write-Host '  [HATA] Dinleyici baslatilamadi.' -ForegroundColor Red
-    Write-Host "  Mesaj: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "  Port $($Global:Port) baska bir uygulama tarafindan kullaniliyor olabilir." -ForegroundColor Yellow
-    Write-Host '  Kontrol: netstat -ano | findstr :8080' -ForegroundColor Cyan
+    Write-Host '  [ERROR] Failed to start listener.' -ForegroundColor Red
+    Write-Host "  Message: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "  Port $($Global:Port) may be in use by another application." -ForegroundColor Yellow
+    Write-Host '  Check: netstat -ano | findstr :8080' -ForegroundColor Cyan
     Write-Host ''
     return
 }
 
 Show-StartupBanner -Wifi $wifi
-Write-Host ("  Es zamanli isci: {0} | Yuklu transfer: {1}" -f $Global:MaxThreads, $Global:Transfers.Count) -ForegroundColor Green
+Write-Host ("  Worker threads: {0} | Loaded transfers: {1}" -f $Global:MaxThreads, $Global:Transfers.Count) -ForegroundColor Green
 Write-Host ''
 
 # ====================== RUNSPACE POOL ========================================
@@ -1279,7 +1281,7 @@ try {
         $remoteIp = $null
         try { $remoteIp = $client.Client.RemoteEndPoint.Address.ToString() } catch {}
         if ($remoteIp -and $remoteIp -ne $wifi.IP -and -not (Test-SameSubnet -ClientIp $remoteIp -LocalIp $wifi.IP -Prefix $wifi.Prefix)) {
-            Write-Host ("[{0}] RED   Wi-Fi disi istemci reddedildi: {1}" -f $ts, $remoteIp) -ForegroundColor Yellow
+            Write-Host ("[{0}] DENY  Non-Wi-Fi client rejected: {1}" -f $ts, $remoteIp) -ForegroundColor Yellow
             try { $client.Close() } catch {}
             continue
         }
@@ -1303,31 +1305,31 @@ try {
     foreach ($j in $jobs) { try { $j.PS.Dispose() } catch {} }
     try { $pool.Close(); $pool.Dispose() } catch {}
     Write-Host ''
-    Write-Host '  Sunucu durduruldu.' -ForegroundColor Yellow
+    Write-Host '  Server stopped.' -ForegroundColor Yellow
 }
 
 # ==============================================================================
-# CALISTIRMA (ADMIN GEREKMEZ):
+# RUN (NO ADMIN REQUIRED):
 #   powershell.exe -ExecutionPolicy Bypass -File LocalFilePortal.ps1
 #
-# OZELLIKLER:
-#   - Wi-Fi only (LAN reddedilir, iki kat kontrol: bind + subnet)
-#   - Bagli cihazlar listelenir (login eden herkes); secip ozel gonderim
-#   - "Herkes (Public)" karti ile broadcast: tum cihazlar gorur
-#   - Boyut limiti YOK, oturum suresi YOK
-#   - Stream multipart parser + C# FastScan boundary (yuksek hiz)
-#   - 32 thread runspace pool, es zamanli yukleme/indirme
-#   - Restart sonrasi mevcut transferler korunur (.meta\<id>.json)
-#   - Cihaz adi giriste secilir, panel uzerinden duzenlenebilir
+# FEATURES:
+#   - Wi-Fi only (LAN denied; two checks: bind + subnet)
+#   - Connected devices listed (all signed-in clients); click-to-target send
+#   - "Everyone (Public)" card broadcasts to every device
+#   - No size limit, no session expiry
+#   - Streaming multipart parser + C# FastScan boundary (fast)
+#   - 32-thread runspace pool, concurrent up/down
+#   - Restart-safe transfers (.meta\<id>.json)
+#   - Device name picked at login, editable from dashboard
 #
-# DOSYA:
-#   - $Global:ShareFolder altinda fiziksel olarak saklanir (varsayilan C:\SharedTransfer)
-#   - Metadata: $ShareFolder\.meta\<id>.json (sender, target, vs.)
+# STORAGE:
+#   - Files: $Global:ShareFolder (default C:\SharedTransfer)
+#   - Metadata sidecar: $ShareFolder\.meta\<id>.json (sender, target, ...)
 #
-# BAGLANTI:
-#   1. Diger cihaz PC ile AYNI Wi-Fi'da olmali (veya Mobile Hotspot'a baglansin)
-#   2. Tarayicida konsoldaki URL'yi ac, parola: hako123
-#   3. Cihaz panele dusunce: secip gonder, public yayinla, dosya indir
+# CONNECTING:
+#   1. Other device must be on the SAME Wi-Fi (or Mobile Hotspot)
+#   2. Open the URL from the console banner, password: hako123
+#   3. After login: click a device card to send, or use Public to broadcast
 #
-# FIREWALL: Ilk istekte Windows izin sorabilir -> 'Ozel aglar' isaretle
+# FIREWALL: On first request Windows may ask to allow -> tick "Private networks"
 # ==============================================================================
