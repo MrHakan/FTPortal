@@ -134,6 +134,26 @@ function Invoke-PeriodicSweep {
     }
 }
 
+function ConvertTo-SafeRelPath {
+    # Sanitize a client-supplied filename: keep slashes for folder structure,
+    # drop path traversal, drop invalid path chars per segment, strip leading /.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $p = $Path -replace '\\', '/'
+    $p = $p.TrimStart('/')
+    $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+    $segs = $p.Split('/')
+    $clean = New-Object System.Collections.Generic.List[string]
+    foreach ($s in $segs) {
+        $s = $s.Trim()
+        if ([string]::IsNullOrEmpty($s)) { continue }
+        if ($s -eq '.' -or $s -eq '..') { continue }
+        foreach ($ch in $invalid) { $s = $s.Replace($ch, '_') }
+        if ($s) { [void]$clean.Add($s) }
+    }
+    return ($clean -join '/')
+}
+
 function Save-TransferMeta {
     param($T)
     $obj = [ordered]@{
@@ -144,6 +164,7 @@ function Save-TransferMeta {
         sender     = $T.Sender
         senderNick = $T.SenderNick
         target     = $T.Target
+        bundle     = $T.BundleId
         created    = $T.Created.ToString('o')
     }
     $json = $obj | ConvertTo-Json -Compress
@@ -160,6 +181,7 @@ function Import-AllTransfers {
                 $Global:Transfers[$j.id] = @{
                     Id=$j.id; Name=$j.name; Path=$j.path; Size=[int64]$j.size
                     Sender=$j.sender; SenderNick=$j.senderNick; Target=$j.target
+                    BundleId=$j.bundle
                     Created=[DateTime]::Parse($j.created)
                 }
             } else {
@@ -365,7 +387,7 @@ function Save-UploadedFileStream {
     # Single shared buffer (chunkSize + delimLen) keeps allocations minimal.
     param(
         [System.IO.Stream]$NetStream, [string]$ContentType,
-        [string]$SenderSid, [string]$Target
+        [string]$SenderSid, [string]$Target, [string]$BundleId
     )
 
     if ($ContentType -notmatch 'boundary=(.+)$') { return @{ ok=$false; status=400; msg='Boundary not found' } }
@@ -384,13 +406,16 @@ function Save-UploadedFileStream {
         if ($hdrBuf.Count -gt 8192) { return @{ ok=$false; status=400; msg='Multipart header too large' } }
     }
     $hdrText  = $latin1.GetString($hdrBuf.ToArray())
-    $fileName = $null
-    if ($hdrText -match 'filename="([^"]*)"') { $fileName = $Matches[1] }
-    if ([string]::IsNullOrWhiteSpace($fileName)) { return @{ ok=$false; status=400; msg='No filename' } }
+    $rawName  = $null
+    if ($hdrText -match 'filename="([^"]*)"') { $rawName = $Matches[1] }
+    if ([string]::IsNullOrWhiteSpace($rawName)) { return @{ ok=$false; status=400; msg='No filename' } }
     # Filename may be UTF-8; re-decode the latin1 bytes
-    $fnBytes = $latin1.GetBytes($fileName)
-    try { $fileName = [System.Text.Encoding]::UTF8.GetString($fnBytes) } catch {}
-    $fileName = [System.IO.Path]::GetFileName($fileName)
+    $fnBytes = $latin1.GetBytes($rawName)
+    try { $rawName = [System.Text.Encoding]::UTF8.GetString($fnBytes) } catch {}
+    # Preserve relative path for display / ZIP folder tree; use basename for disk.
+    $relPath  = ConvertTo-SafeRelPath -Path $rawName
+    if ([string]::IsNullOrWhiteSpace($relPath)) { return @{ ok=$false; status=400; msg='Invalid filename' } }
+    $fileName = ($relPath.Split('/'))[-1]
 
     # Reserve unique file path
     # NOTE: local variable is $targetPath - PowerShell is case-insensitive so using
@@ -459,19 +484,24 @@ function Save-UploadedFileStream {
         try { if ($fs) { $fs.Close() } } catch {}
     }
 
-    $finalName  = [System.IO.Path]::GetFileName($targetPath)
+    $diskBase   = [System.IO.Path]::GetFileName($targetPath)
+    # Display name = original relative path but with the (possibly deduped) basename.
+    $displayName = if ($relPath -match '/') {
+        ($relPath -replace '[^/]+$', '') + $diskBase
+    } else { $diskBase }
     $size       = (Get-Item -LiteralPath $targetPath).Length
     $tid        = New-ShortId 8
     $senderNick = if ($Global:Sessions.ContainsKey($SenderSid)) { $Global:Sessions[$SenderSid].Nick } else { 'Unknown' }
     $t = @{
-        Id=$tid; Name=$finalName; Path=$targetPath; Size=$size
+        Id=$tid; Name=$displayName; Path=$targetPath; Size=$size
         Sender=$SenderSid; SenderNick=$senderNick; Target=$Target
+        BundleId=$BundleId
         Created=(Get-Date)
     }
     $Global:Transfers[$tid] = $t
     try { Save-TransferMeta -T $t } catch {}
 
-    return @{ ok=$true; status=200; id=$tid; msg=$finalName }
+    return @{ ok=$true; status=200; id=$tid; msg=$displayName }
 }
 
 # ============================== DOWNLOAD ======================================
@@ -613,24 +643,32 @@ function Get-StateJson {
     }
     $devList = @($devList | Sort-Object -Property @{Expression={[int]$_.online};Descending=$true}, ageSec)
 
-    $visible = @()
+    # Split visible transfers into standalone singles + bundle groups (by BundleId)
+    $singles = @()
+    $bundles = @{}
     foreach ($k in @($Global:Transfers.Keys)) {
         $t = $Global:Transfers[$k]
         if ($null -eq $t) { continue }
-        if ($t.Target -eq 'public' -or $t.Target -eq $Sid -or $t.Sender -eq $Sid) { $visible += $t }
+        if (-not ($t.Target -eq 'public' -or $t.Target -eq $Sid -or $t.Sender -eq $Sid)) { continue }
+        if ($t.BundleId) {
+            if (-not $bundles.ContainsKey($t.BundleId)) { $bundles[$t.BundleId] = New-Object System.Collections.Generic.List[object] }
+            [void]$bundles[$t.BundleId].Add($t)
+        } else {
+            $singles += $t
+        }
     }
-    $visible = @($visible | Sort-Object { $_.Created } -Descending)
 
-    $tArr = @()
-    foreach ($t in $visible) {
-        $targetNick = 'Everyone'
-        $targetKind = 'public'
+    $entries = @()
+
+    foreach ($t in $singles) {
+        $targetNick = 'Everyone'; $targetKind = 'public'
         if ($t.Target -ne 'public') {
             $targetKind = 'device'
             if ($Global:Sessions.ContainsKey($t.Target)) { $targetNick = $Global:Sessions[$t.Target].Nick }
             else { $targetNick = '(deleted)' }
         }
-        $tArr += [pscustomobject]@{
+        $entries += [pscustomobject]@{
+            kind       = 'single'
             id         = $t.Id
             name       = $t.Name
             size       = $t.Size
@@ -644,12 +682,52 @@ function Get-StateJson {
         }
     }
 
+    foreach ($bid in @($bundles.Keys)) {
+        $items = @($bundles[$bid] | Sort-Object { $_.Created })
+        if ($items.Count -eq 0) { continue }
+        $first = $items[0]
+        $totalSize = 0L; foreach ($ii in $items) { $totalSize += [int64]$ii.Size }
+        $minCreated = $first.Created
+        foreach ($ii in $items) { if ($ii.Created -lt $minCreated) { $minCreated = $ii.Created } }
+        $targetNick = 'Everyone'; $targetKind = 'public'
+        if ($first.Target -ne 'public') {
+            $targetKind = 'device'
+            if ($Global:Sessions.ContainsKey($first.Target)) { $targetNick = $Global:Sessions[$first.Target].Nick }
+            else { $targetNick = '(deleted)' }
+        }
+        $childArr = @()
+        foreach ($ii in $items) {
+            $childArr += [pscustomobject]@{
+                id   = $ii.Id
+                name = $ii.Name
+                size = $ii.Size
+                icon = (Get-IconForFile $ii.Name)
+            }
+        }
+        $entries += [pscustomobject]@{
+            kind       = 'bundle'
+            bundleId   = $bid
+            name       = ("Bundle - {0} files" -f $items.Count)
+            size       = $totalSize
+            senderNick = $first.SenderNick
+            targetNick = $targetNick
+            target     = $targetKind
+            byMe       = ($first.Sender -eq $Sid)
+            toMe       = ($first.Target -eq $Sid)
+            created    = $minCreated.ToString('o')
+            count      = $items.Count
+            items      = $childArr
+        }
+    }
+
+    $entries = @($entries | Sort-Object { $_.created } -Descending)
+
     $payload = [pscustomobject]@{
         me = [pscustomobject]@{ pubId = $me.PubId; nick = $me.Nick }
         devices   = $devList
-        transfers = $tArr
+        transfers = $entries
     }
-    return ($payload | ConvertTo-Json -Depth 6 -Compress)
+    return ($payload | ConvertTo-Json -Depth 8 -Compress)
 }
 
 # ============================== UI PAGES ======================================
@@ -761,6 +839,14 @@ function Get-DashboardPage {
   .tab{padding:6px 14px;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:8px;font-size:13px;cursor:pointer}
   .tab.on{background:rgba(79,142,247,.15);color:var(--accent);border-color:var(--accent)}
   input[type="checkbox"]{accent-color:var(--accent);cursor:pointer;width:15px;height:15px;margin:0;vertical-align:middle}
+  .bundle-row td{background:rgba(142,108,247,.05)}
+  .bundle-row:hover td{background:rgba(142,108,247,.09)}
+  .bundle-child td{background:rgba(79,142,247,.03);border-bottom:1px dashed var(--border);font-size:12.5px}
+  .bundle-child td.child-nm{color:var(--muted);padding-left:22px}
+  .expand-btn{background:none;border:1px solid var(--border);color:var(--muted);cursor:pointer;padding:1px 7px;border-radius:5px;font-size:11px;margin-right:6px;font-family:inherit}
+  .expand-btn:hover{color:var(--accent);border-color:var(--accent)}
+  .folder-crumb{color:var(--muted);font-size:11px}
+  .bundle-dl{background:rgba(142,108,247,.12);padding:3px 9px;border-radius:6px;color:var(--accent2)!important}
   table{width:100%;border-collapse:collapse}
   th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);padding:8px 10px;border-bottom:1px solid var(--border)}
   td{padding:11px 10px;border-bottom:1px solid var(--border);font-size:13.5px;vertical-align:middle}
@@ -843,8 +929,12 @@ function Get-DashboardPage {
   var seq=0;
   var filter='all';
   var toasts=document.getElementById('toasts');
-  var lastTransferIds=null;   // null = initial load; skip toasts until first fetch completes
-  var selectedIds=new Set();
+  var lastEntryKeys=null;      // null = initial load; skip toasts until first fetch completes
+  var selectedIds=new Set();   // individual transfer ids (children of bundles included)
+  var expandedBundles=new Set();
+
+  function randomHex(n){var s='',cs='0123456789abcdef';for(var i=0;i<n*2;i++)s+=cs[Math.floor(Math.random()*16)];return s;}
+  function entryKey(t){return t.kind==='bundle' ? ('b:'+t.bundleId) : ('s:'+t.id);}
 
   function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
   function toast(msg,type){var t=document.createElement('div');t.className='toast '+(type||'ok');t.textContent=msg;toasts.appendChild(t);setTimeout(function(){t.style.transition='opacity .3s';t.style.opacity='0';setTimeout(function(){t.remove();},300);},3500);}
@@ -859,13 +949,18 @@ function Get-DashboardPage {
       var r=await fetch('/api/state',{cache:'no-store'});
       if(r.status===401){location.href='/';return;}
       if(!r.ok)return;
-      var prev=lastTransferIds;
+      var prev=lastEntryKeys;
       state=await r.json();
-      lastTransferIds=new Set(state.transfers.map(function(t){return t.id;}));
+      lastEntryKeys=new Set(state.transfers.map(entryKey));
       // Only toast when we have a prior snapshot to diff against. Skips initial load.
       if(prev!==null){
         state.transfers.forEach(function(t){
-          if(!prev.has(t.id) && !t.byMe && (t.toMe || t.target==='public')){
+          if(prev.has(entryKey(t)))return;
+          if(t.byMe)return;
+          if(!(t.toMe || t.target==='public'))return;
+          if(t.kind==='bundle'){
+            toast(t.senderNick+' sent you a bundle ('+t.count+' files)','info');
+          } else {
             toast(t.senderNick+' sent you: '+t.name,'info');
           }
         });
@@ -918,27 +1013,86 @@ function Get-DashboardPage {
       if(filter==='sent')return t.byMe;
       return true;
     });
-    // Drop selected ids that are no longer visible/exist
-    var visibleIdSet=new Set(state.transfers.map(function(t){return t.id;}));
-    selectedIds.forEach(function(id){if(!visibleIdSet.has(id))selectedIds.delete(id);});
+    // Drop selected ids that no longer exist
+    var liveIds=new Set();
+    state.transfers.forEach(function(t){
+      if(t.kind==='bundle'){t.items.forEach(function(it){liveIds.add(it.id);});}
+      else{liveIds.add(t.id);}
+    });
+    selectedIds.forEach(function(id){if(!liveIds.has(id))selectedIds.delete(id);});
     if(rows.length===0){body.innerHTML='<tr><td colspan="7" class="empty">&#128230; No files yet.</td></tr>';syncSelAll();updateZipBtn();return;}
     rows.forEach(function(t){
-      var tr=document.createElement('tr');
-      var pill=t.target==='public'?'<span class="pill pub">&#127760; Public</span>':('<span class="pill">'+esc(t.targetNick)+'</span>');
-      var fromPill=t.byMe?'<span class="pill me">Me</span>':('<span class="pill">'+esc(t.senderNick)+'</span>');
-      var del=t.byMe?'<button class="dl-x" data-id="'+t.id+'" title="Delete">&#10005;</button>':'';
-      var chk=selectedIds.has(t.id)?' checked':'';
-      tr.innerHTML='<td class="ic"><input type="checkbox" class="rowChk" data-id="'+t.id+'"'+chk+'></td>'+
-                   '<td class="ic">'+t.icon+'</td>'+
-                   '<td class="td-nm">'+esc(t.name)+'</td>'+
-                   '<td>'+fmtSize(t.size)+'</td>'+
-                   '<td>'+fromPill+' &rarr; '+pill+'</td>'+
-                   '<td class="dt">'+fmtDate(t.created)+'</td>'+
-                   '<td><a class="dl" href="/download?id='+encodeURIComponent(t.id)+'">&#11015; Download</a>'+del+'</td>';
-      body.appendChild(tr);
+      if(t.kind==='bundle')renderBundleRow(body,t);
+      else renderSingleRow(body,t);
     });
     syncSelAll();
     updateZipBtn();
+  }
+  function renderSingleRow(body,t){
+    var tr=document.createElement('tr');
+    var pill=t.target==='public'?'<span class="pill pub">&#127760; Public</span>':('<span class="pill">'+esc(t.targetNick)+'</span>');
+    var fromPill=t.byMe?'<span class="pill me">Me</span>':('<span class="pill">'+esc(t.senderNick)+'</span>');
+    var del=t.byMe?'<button class="dl-x" data-id="'+t.id+'" title="Delete">&#10005;</button>':'';
+    var chk=selectedIds.has(t.id)?' checked':'';
+    tr.innerHTML='<td class="ic"><input type="checkbox" class="rowChk" data-id="'+t.id+'"'+chk+'></td>'+
+                 '<td class="ic">'+t.icon+'</td>'+
+                 '<td class="td-nm">'+esc(t.name)+'</td>'+
+                 '<td>'+fmtSize(t.size)+'</td>'+
+                 '<td>'+fromPill+' &rarr; '+pill+'</td>'+
+                 '<td class="dt">'+fmtDate(t.created)+'</td>'+
+                 '<td><a class="dl" href="/download?id='+encodeURIComponent(t.id)+'">&#11015; Download</a>'+del+'</td>';
+    body.appendChild(tr);
+  }
+  function renderBundleRow(body,t){
+    var expanded=expandedBundles.has(t.bundleId);
+    var arrow=expanded?'&#9662;':'&#9656;';   // filled tri down / right
+    var pill=t.target==='public'?'<span class="pill pub">&#127760; Public</span>':('<span class="pill">'+esc(t.targetNick)+'</span>');
+    var fromPill=t.byMe?'<span class="pill me">Me</span>':('<span class="pill">'+esc(t.senderNick)+'</span>');
+    var del=t.byMe?'<button class="dl-x" data-bundle="'+t.bundleId+'" title="Delete bundle">&#10005;</button>':'';
+    // Bundle checkbox reflects: all children currently selected?
+    var childIds=t.items.map(function(x){return x.id;});
+    var allSel=childIds.length>0 && childIds.every(function(id){return selectedIds.has(id);});
+    var anySel=childIds.some(function(id){return selectedIds.has(id);});
+    var chk=allSel?' checked':'';
+    var tr=document.createElement('tr');
+    tr.className='bundle-row';
+    tr.innerHTML='<td class="ic"><input type="checkbox" class="bundleChk" data-bundle="'+t.bundleId+'"'+chk+'></td>'+
+                 '<td class="ic">&#128230;</td>'+
+                 '<td class="td-nm"><button class="expand-btn" data-bundle="'+t.bundleId+'">'+arrow+'</button> Bundle &middot; '+t.count+' files</td>'+
+                 '<td>'+fmtSize(t.size)+'</td>'+
+                 '<td>'+fromPill+' &rarr; '+pill+'</td>'+
+                 '<td class="dt">'+fmtDate(t.created)+'</td>'+
+                 '<td><a class="dl bundle-dl" href="#" data-bundle="'+t.bundleId+'">&#128230; ZIP</a>'+del+'</td>';
+    body.appendChild(tr);
+    if(anySel && !allSel){
+      var bc=tr.querySelector('.bundleChk'); if(bc)bc.indeterminate=true;
+    }
+    if(expanded){
+      // Render nested folder tree from item.name (slash-delimited)
+      renderBundleTree(body,t);
+    }
+  }
+  function renderBundleTree(body,t){
+    // Group items by folder prefix; render sub-rows with indent.
+    t.items.forEach(function(item){
+      var parts=item.name.split('/');
+      var base=parts[parts.length-1];
+      var folder=parts.slice(0,-1).join('/');
+      var subTr=document.createElement('tr');
+      subTr.className='bundle-child';
+      var indent=parts.length>1 ? ('&nbsp;&nbsp;'.repeat(parts.length-1)) : '';
+      var prefix=folder ? ('<span class="folder-crumb">'+esc(folder)+'/</span>') : '';
+      var chk=selectedIds.has(item.id)?' checked':'';
+      var owned=t.byMe;
+      var del=owned?'<button class="dl-x" data-id="'+item.id+'" title="Delete file">&#10005;</button>':'';
+      subTr.innerHTML='<td class="ic"><input type="checkbox" class="rowChk" data-id="'+item.id+'" data-bundle="'+t.bundleId+'"'+chk+'></td>'+
+                      '<td class="ic">'+item.icon+'</td>'+
+                      '<td class="td-nm child-nm">'+indent+'&#8735; '+prefix+esc(base)+'</td>'+
+                      '<td>'+fmtSize(item.size)+'</td>'+
+                      '<td></td><td></td>'+
+                      '<td><a class="dl" href="/download?id='+encodeURIComponent(item.id)+'">&#11015;</a>'+del+'</td>';
+      body.appendChild(subTr);
+    });
   }
   function updateZipBtn(){
     var n=selectedIds.size;
@@ -960,38 +1114,98 @@ function Get-DashboardPage {
     document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('on');});
     b.classList.add('on');filter=b.dataset.f;renderTransfers();
   });});
+  function submitZipForm(spec){
+    var f=document.createElement('form');
+    f.method='POST'; f.action='/api/zip'; f.target='_blank';
+    (spec.ids||[]).forEach(function(id){var i=document.createElement('input');i.type='hidden';i.name='id';i.value=id;f.appendChild(i);});
+    (spec.bundles||[]).forEach(function(bid){var i=document.createElement('input');i.type='hidden';i.name='bundle';i.value=bid;f.appendChild(i);});
+    document.body.appendChild(f); f.submit();
+    setTimeout(function(){document.body.removeChild(f);},1000);
+  }
   document.getElementById('transferBody').addEventListener('click',async function(e){
-    var x=e.target.closest('.dl-x'); if(!x)return;
-    if(!confirm('Permanently delete this file?'))return;
-    var fd=new FormData();fd.append('id',x.dataset.id);
-    var r=await fetch('/api/delete',{method:'POST',body:fd});
-    if(r.ok){toast('Deleted','ok');fetchState();}else{toast('Failed to delete','err');}
+    // Expand/collapse a bundle
+    var eb=e.target.closest('.expand-btn');
+    if(eb){
+      var bid=eb.dataset.bundle;
+      if(expandedBundles.has(bid))expandedBundles.delete(bid);
+      else expandedBundles.add(bid);
+      renderTransfers();
+      return;
+    }
+    // Bundle ZIP download
+    var bd=e.target.closest('.bundle-dl');
+    if(bd){
+      e.preventDefault();
+      submitZipForm({bundles:[bd.dataset.bundle]});
+      toast('Preparing ZIP...','info');
+      return;
+    }
+    // Delete: single file OR whole bundle
+    var x=e.target.closest('.dl-x');
+    if(!x)return;
+    var bid=x.dataset.bundle;
+    var id=x.dataset.id;
+    if(bid){
+      if(!confirm('Delete this entire bundle from the server?'))return;
+      var fd=new FormData(); fd.append('bundle',bid);
+      var r=await fetch('/api/delete',{method:'POST',body:fd});
+      if(r.ok){toast('Bundle deleted','ok');fetchState();}else{toast('Delete failed','err');}
+    } else if(id){
+      if(!confirm('Permanently delete this file?'))return;
+      var fd=new FormData(); fd.append('id',id);
+      var r=await fetch('/api/delete',{method:'POST',body:fd});
+      if(r.ok){toast('Deleted','ok');fetchState();}else{toast('Delete failed','err');}
+    }
   });
   document.getElementById('transferBody').addEventListener('change',function(e){
-    var c=e.target.closest('.rowChk'); if(!c)return;
+    // Bundle master checkbox: toggles all children
+    var bc=e.target.closest('.bundleChk');
+    if(bc){
+      var bid=bc.dataset.bundle;
+      var bundle=state.transfers.find(function(x){return x.kind==='bundle' && x.bundleId===bid;});
+      if(bundle){
+        bundle.items.forEach(function(item){
+          if(bc.checked)selectedIds.add(item.id); else selectedIds.delete(item.id);
+        });
+        document.querySelectorAll('.rowChk[data-bundle="'+bid+'"]').forEach(function(c){c.checked=bc.checked;});
+      }
+      updateZipBtn(); syncSelAll();
+      return;
+    }
+    // Individual row checkbox (single OR bundle child)
+    var c=e.target.closest('.rowChk');
+    if(!c)return;
     var id=c.dataset.id;
     if(c.checked)selectedIds.add(id); else selectedIds.delete(id);
+    // If it's a bundle child, sync the parent bundleChk (checked/indeterminate)
+    var parentBid=c.dataset.bundle;
+    if(parentBid){
+      var parent=state.transfers.find(function(x){return x.kind==='bundle' && x.bundleId===parentBid;});
+      if(parent){
+        var childIds=parent.items.map(function(it){return it.id;});
+        var checkedN=childIds.filter(function(cid){return selectedIds.has(cid);}).length;
+        var bChk=document.querySelector('.bundleChk[data-bundle="'+parentBid+'"]');
+        if(bChk){
+          bChk.checked=(checkedN===childIds.length);
+          bChk.indeterminate=(checkedN>0 && checkedN<childIds.length);
+        }
+      }
+    }
     updateZipBtn(); syncSelAll();
   });
   document.getElementById('selAll').addEventListener('change',function(){
     var chk=document.getElementById('selAll').checked;
     document.querySelectorAll('.rowChk').forEach(function(c){
       c.checked=chk;
-      if(chk)selectedIds.add(c.dataset.id); else selectedIds.delete(c.dataset.id);
+      var id=c.dataset.id; if(!id)return;
+      if(chk)selectedIds.add(id); else selectedIds.delete(id);
     });
+    document.querySelectorAll('.bundleChk').forEach(function(bc){bc.checked=chk;bc.indeterminate=false;});
     updateZipBtn();
   });
   document.getElementById('zipBtn').addEventListener('click',function(){
     if(selectedIds.size===0)return;
-    var f=document.createElement('form');
-    f.method='POST'; f.action='/api/zip'; f.target='_blank';
-    selectedIds.forEach(function(id){
-      var i=document.createElement('input');
-      i.type='hidden'; i.name='id'; i.value=id;
-      f.appendChild(i);
-    });
-    document.body.appendChild(f); f.submit();
-    setTimeout(function(){document.body.removeChild(f);},1000);
+    submitZipForm({ids:Array.from(selectedIds)});
     toast('Preparing ZIP ('+selectedIds.size+' files)...','info');
   });
   document.getElementById('renameBtn').addEventListener('click',async function(){
@@ -1043,36 +1257,44 @@ function Get-DashboardPage {
   drop.addEventListener('drop',function(ev){addFiles(ev.dataTransfer.files);});
   clearBtn.addEventListener('click',function(){if(!uploading){queued=[];renderQueue();}});
 
-  function uploadOne(item,done){
+  function uploadOne(item,bundleId,done){
     item.status='up';renderQueue();
-    var fd=new FormData();fd.append('file',item.file,item.file.name);
+    var fd=new FormData();
+    var relName=item.file.webkitRelativePath || item.file.name;
+    fd.append('file',item.file,relName);
     var xhr=new XMLHttpRequest();
-    xhr.open('POST','/upload?target='+encodeURIComponent(target),true);
+    var url='/upload?target='+encodeURIComponent(target);
+    if(bundleId)url+='&bundle='+encodeURIComponent(bundleId);
+    xhr.open('POST',url,true);
     xhr.upload.onprogress=function(e){if(e.lengthComputable){bar.style.width=((e.loaded/e.total)*100)+'%';}};
     xhr.onload=function(){
       var ok=false,msg='';try{var r=JSON.parse(xhr.responseText);ok=r.ok;msg=r.msg||'';}catch(_){}
-      if(ok){item.status='ok';toast(item.file.name+' sent','ok');}
-      else{item.status='err';toast(item.file.name+' error: '+(msg||xhr.status),'err');}
+      if(ok){item.status='ok';}
+      else{item.status='err';toast(relName+' error: '+(msg||xhr.status),'err');}
       renderQueue();done();
     };
-    xhr.onerror=function(){item.status='err';toast(item.file.name+' connection error','err');renderQueue();done();};
+    xhr.onerror=function(){item.status='err';toast(relName+' connection error','err');renderQueue();done();};
     xhr.send(fd);
   }
   upBtn.addEventListener('click',function(){
     var todo=queued.filter(function(q){return q.status!=='ok';});
     if(!todo.length || uploading)return;
+    // >1 file: auto-bundle so the receiver sees one package instead of N rows
+    var bundleId=(todo.length>1) ? randomHex(8) : null;
     uploading=true;renderQueue();barWrap.classList.add('show');bar.style.width='0';
+    if(bundleId)toast('Sending '+todo.length+' files as one bundle...','info');
     var i=0;
     (function next(){
       if(i>=todo.length){
         bar.style.width='100%';
         var okN=queued.filter(function(q){return q.status==='ok';}).length;
-        toast(okN+' file(s) sent','ok');
+        if(bundleId)toast('Bundle sent ('+okN+' files)','ok');
+        else toast(okN+' file(s) sent','ok');
         setTimeout(function(){uploading=false;renderQueue();fetchState();bar.style.width='0';barWrap.classList.remove('show');},700);
         return;
       }
       bar.style.width='0';
-      uploadOne(todo[i],function(){i++;next();});
+      uploadOne(todo[i],bundleId,function(){i++;next();});
     })();
   });
 
@@ -1157,13 +1379,26 @@ function Invoke-RequestRouter {
             $sid = Test-ValidSession -Req $Req
             if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 401; return }
             if ($method -ne 'POST') { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 405; return }
-            $id = $null
+            $id = $null; $bundle = $null
             if ($Req.ContentType -match 'multipart/form-data') {
-                $id = Get-MultipartField -BodyBytes $Req.Body -ContentType $Req.ContentType -FieldName 'id'
+                $id     = Get-MultipartField -BodyBytes $Req.Body -ContentType $Req.ContentType -FieldName 'id'
+                $bundle = Get-MultipartField -BodyBytes $Req.Body -ContentType $Req.ContentType -FieldName 'bundle'
             } else {
                 $bt = [System.Text.Encoding]::UTF8.GetString($Req.Body)
                 $form = [System.Web.HttpUtility]::ParseQueryString($bt)
                 $id = $form['id']
+                $bundle = $form['bundle']
+            }
+            if (-not [string]::IsNullOrWhiteSpace($bundle)) {
+                $toDelete = @()
+                foreach ($k in @($Global:Transfers.Keys)) {
+                    $t = $Global:Transfers[$k]
+                    if ($t -and $t.BundleId -eq $bundle -and $t.Sender -eq $sid) { $toDelete += $k }
+                }
+                if ($toDelete.Count -eq 0) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"not found"}' -Status 404; return }
+                foreach ($tid in $toDelete) { [void](Remove-Transfer -Id $tid) }
+                Send-JsonResponse -Stream $Stream -Json ('{"ok":true,"deleted":' + $toDelete.Count + '}') -Status 200
+                return
             }
             if ([string]::IsNullOrWhiteSpace($id) -or -not $Global:Transfers.ContainsKey($id)) {
                 Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"not found"}' -Status 404; return
@@ -1186,8 +1421,21 @@ function Invoke-RequestRouter {
             if ($method -ne 'POST') { Send-HtmlResponse -Stream $Stream -Html '<h1>405</h1>' -Status 405; return }
             $bodyText = [System.Text.Encoding]::UTF8.GetString($Req.Body)
             $form = [System.Web.HttpUtility]::ParseQueryString($bodyText)
-            $ids = $form.GetValues('id')
-            if (-not $ids -or $ids.Count -eq 0) { Send-HtmlResponse -Stream $Stream -Html '<h1>400 - no ids</h1>' -Status 400; return }
+            $collected = New-Object System.Collections.Generic.List[string]
+            $rawIds = $form.GetValues('id')
+            if ($rawIds) { foreach ($x in $rawIds) { if ($x) { [void]$collected.Add($x) } } }
+            $rawBundles = $form.GetValues('bundle')
+            if ($rawBundles) {
+                foreach ($bid in $rawBundles) {
+                    if (-not $bid) { continue }
+                    foreach ($k in @($Global:Transfers.Keys)) {
+                        $t = $Global:Transfers[$k]
+                        if ($t -and $t.BundleId -eq $bid) { [void]$collected.Add($t.Id) }
+                    }
+                }
+            }
+            $ids = @($collected | Select-Object -Unique)
+            if ($ids.Count -eq 0) { Send-HtmlResponse -Stream $Stream -Html '<h1>400 - no ids</h1>' -Status 400; return }
             Send-ZipDownload -Ids $ids -Sid $sid -Stream $Stream
         }
 
@@ -1199,7 +1447,9 @@ function Invoke-RequestRouter {
             $targetParam = $q['target']
             $targetSid = Resolve-TargetSid -TargetParam $targetParam
             if ($null -eq $targetSid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"invalid target"}' -Status 400; return }
-            $r = Save-UploadedFileStream -NetStream $Stream -ContentType $Req.ContentType -SenderSid $sid -Target $targetSid
+            $bundleParam = $q['bundle']
+            if ($bundleParam) { $bundleParam = ($bundleParam -replace '[^a-zA-Z0-9]', '') }
+            $r = Save-UploadedFileStream -NetStream $Stream -ContentType $Req.ContentType -SenderSid $sid -Target $targetSid -BundleId $bundleParam
             if ($r.ok) {
                 Send-JsonResponse -Stream $Stream -Json (('{"ok":true,"id":"' + $r.id + '","msg":"' + ($r.msg -replace '"',"'") + '"}'))
             } else {
@@ -1356,7 +1606,7 @@ $iss.ApartmentState = 'MTA'
 
 $funcNames = @(
     'Get-IconForFile','Format-Size','New-SessionId','New-ShortId','Get-DeviceLabel',
-    'Invoke-PeriodicSweep','Save-TransferMeta','Remove-Transfer',
+    'Invoke-PeriodicSweep','Save-TransferMeta','Remove-Transfer','ConvertTo-SafeRelPath',
     'Read-HttpRequest','Read-RequestBody','Get-HttpStatusText','Send-Response',
     'Send-HtmlResponse','Send-JsonResponse','Send-RedirectResponse','New-SessionCookieHeader',
     'Test-ValidSession','Resolve-TargetSid','Get-MultipartField',
