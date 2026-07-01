@@ -9,6 +9,8 @@
 # ==============================================================================
 
 Add-Type -AssemblyName System.Web
+Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
 # ============================== SETTINGS ======================================
 $Global:Password    = 'hako123'
@@ -512,6 +514,83 @@ function Send-FileDownload {
     } finally { $fs.Dispose() }
 }
 
+# ============================== BULK ZIP DOWNLOAD =============================
+function Send-ZipDownload {
+    param([string[]]$Ids, [string]$Sid, [System.IO.Stream]$Stream)
+
+    # Filter to accessible + existing files
+    $selected = @()
+    foreach ($id in $Ids) {
+        if (-not $Global:Transfers.ContainsKey($id)) { continue }
+        $t = $Global:Transfers[$id]
+        if ($t.Target -ne 'public' -and $t.Target -ne $Sid -and $t.Sender -ne $Sid) { continue }
+        if (-not (Test-Path -LiteralPath $t.Path -PathType Leaf)) { continue }
+        $selected += $t
+    }
+    if ($selected.Count -eq 0) {
+        Send-HtmlResponse -Stream $Stream -Html '<h1>403 - no accessible files</h1>' -Status 403
+        return
+    }
+
+    # Build ZIP into a temp file (seekable). Central directory finalized on dispose.
+    $tmp = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ('lfp-' + (New-ShortId 6) + '.zip'))
+    try {
+        $zipFs = [System.IO.File]::Open($tmp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try {
+            $zip = New-Object System.IO.Compression.ZipArchive($zipFs, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+            try {
+                $usedNames = @{}
+                foreach ($t in $selected) {
+                    $name = $t.Name
+                    $key = $name.ToLowerInvariant()
+                    if ($usedNames.ContainsKey($key)) {
+                        $base = [System.IO.Path]::GetFileNameWithoutExtension($name)
+                        $ext  = [System.IO.Path]::GetExtension($name)
+                        $n = 1
+                        do {
+                            $name = "{0}_{1}{2}" -f $base, $n, $ext
+                            $key  = $name.ToLowerInvariant()
+                            $n++
+                        } while ($usedNames.ContainsKey($key))
+                    }
+                    $usedNames[$key] = $true
+                    $entry = $zip.CreateEntry($name, [System.IO.Compression.CompressionLevel]::Fastest)
+                    $entryStream = $entry.Open()
+                    try {
+                        $src = New-Object System.IO.FileStream($t.Path,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::Read,1048576,[System.IO.FileOptions]::SequentialScan)
+                        try { $src.CopyTo($entryStream, 262144) } finally { $src.Close() }
+                    } finally { $entryStream.Close() }
+                }
+            } finally { $zip.Dispose() }
+        } finally { $zipFs.Close() }
+
+        $zipSize = (Get-Item -LiteralPath $tmp).Length
+        $zipName = 'transfers-' + (Get-Date).ToString('yyyyMMdd-HHmmss') + '.zip'
+        $nameEnc = [System.Web.HttpUtility]::UrlEncode($zipName) -replace '\+', '%20'
+
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append("HTTP/1.1 200 OK`r`n")
+        [void]$sb.Append("Content-Type: application/zip`r`n")
+        [void]$sb.Append("Content-Disposition: attachment; filename*=UTF-8''$nameEnc`r`n")
+        [void]$sb.Append("Content-Length: $zipSize`r`n")
+        [void]$sb.Append("Cache-Control: no-store`r`n")
+        [void]$sb.Append("Connection: close`r`n`r`n")
+        $headBytes = [System.Text.Encoding]::GetEncoding(28591).GetBytes($sb.ToString())
+        $Stream.Write($headBytes, 0, $headBytes.Length)
+
+        $fs = New-Object System.IO.FileStream($tmp,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::Read,1048576,[System.IO.FileOptions]::SequentialScan)
+        try {
+            $buf = New-Object byte[] 262144
+            while (($read = $fs.Read($buf, 0, $buf.Length)) -gt 0) {
+                $Stream.Write($buf, 0, $read)
+            }
+            $Stream.Flush()
+        } finally { $fs.Dispose() }
+    } finally {
+        try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch {}
+    }
+}
+
 # ============================== STATE JSON ====================================
 function Get-StateJson {
     param([string]$Sid)
@@ -681,6 +760,7 @@ function Get-DashboardPage {
   .tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
   .tab{padding:6px 14px;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:8px;font-size:13px;cursor:pointer}
   .tab.on{background:rgba(79,142,247,.15);color:var(--accent);border-color:var(--accent)}
+  input[type="checkbox"]{accent-color:var(--accent);cursor:pointer;width:15px;height:15px;margin:0;vertical-align:middle}
   table{width:100%;border-collapse:collapse}
   th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);padding:8px 10px;border-bottom:1px solid var(--border)}
   td{padding:11px 10px;border-bottom:1px solid var(--border);font-size:13.5px;vertical-align:middle}
@@ -744,9 +824,10 @@ function Get-DashboardPage {
         <button class="tab" data-f="inbox">Inbox</button>
         <button class="tab" data-f="public">Public</button>
         <button class="tab" data-f="sent">Sent</button>
+        <button class="btn zip-btn" id="zipBtn" disabled style="margin-left:auto;padding:6px 14px;font-size:13px">&#128230; Download Selected (0)</button>
       </div>
       <table>
-        <thead><tr><th></th><th>File</th><th>Size</th><th>From / To</th><th>Date</th><th></th></tr></thead>
+        <thead><tr><th style="width:28px"><input type="checkbox" id="selAll" title="Select all"></th><th></th><th>File</th><th>Size</th><th>From / To</th><th>Date</th><th></th></tr></thead>
         <tbody id="transferBody"></tbody>
       </table>
     </section>
@@ -762,7 +843,8 @@ function Get-DashboardPage {
   var seq=0;
   var filter='all';
   var toasts=document.getElementById('toasts');
-  var lastTransferIds=new Set();
+  var lastTransferIds=null;   // null = initial load; skip toasts until first fetch completes
+  var selectedIds=new Set();
 
   function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
   function toast(msg,type){var t=document.createElement('div');t.className='toast '+(type||'ok');t.textContent=msg;toasts.appendChild(t);setTimeout(function(){t.style.transition='opacity .3s';t.style.opacity='0';setTimeout(function(){t.remove();},300);},3500);}
@@ -780,12 +862,14 @@ function Get-DashboardPage {
       var prev=lastTransferIds;
       state=await r.json();
       lastTransferIds=new Set(state.transfers.map(function(t){return t.id;}));
-      // notify on new files (inbound, not sent by me)
-      state.transfers.forEach(function(t){
-        if(!prev.has(t.id) && !t.byMe && (t.toMe || t.target==='public')){
-          toast(t.senderNick+' sent you: '+t.name,'info');
-        }
-      });
+      // Only toast when we have a prior snapshot to diff against. Skips initial load.
+      if(prev!==null){
+        state.transfers.forEach(function(t){
+          if(!prev.has(t.id) && !t.byMe && (t.toMe || t.target==='public')){
+            toast(t.senderNick+' sent you: '+t.name,'info');
+          }
+        });
+      }
       renderAll();
     }catch(e){}
   }
@@ -834,13 +918,18 @@ function Get-DashboardPage {
       if(filter==='sent')return t.byMe;
       return true;
     });
-    if(rows.length===0){body.innerHTML='<tr><td colspan="6" class="empty">&#128230; No files yet.</td></tr>';return;}
+    // Drop selected ids that are no longer visible/exist
+    var visibleIdSet=new Set(state.transfers.map(function(t){return t.id;}));
+    selectedIds.forEach(function(id){if(!visibleIdSet.has(id))selectedIds.delete(id);});
+    if(rows.length===0){body.innerHTML='<tr><td colspan="7" class="empty">&#128230; No files yet.</td></tr>';syncSelAll();updateZipBtn();return;}
     rows.forEach(function(t){
       var tr=document.createElement('tr');
       var pill=t.target==='public'?'<span class="pill pub">&#127760; Public</span>':('<span class="pill">'+esc(t.targetNick)+'</span>');
       var fromPill=t.byMe?'<span class="pill me">Me</span>':('<span class="pill">'+esc(t.senderNick)+'</span>');
       var del=t.byMe?'<button class="dl-x" data-id="'+t.id+'" title="Delete">&#10005;</button>':'';
-      tr.innerHTML='<td class="ic">'+t.icon+'</td>'+
+      var chk=selectedIds.has(t.id)?' checked':'';
+      tr.innerHTML='<td class="ic"><input type="checkbox" class="rowChk" data-id="'+t.id+'"'+chk+'></td>'+
+                   '<td class="ic">'+t.icon+'</td>'+
                    '<td class="td-nm">'+esc(t.name)+'</td>'+
                    '<td>'+fmtSize(t.size)+'</td>'+
                    '<td>'+fromPill+' &rarr; '+pill+'</td>'+
@@ -848,6 +937,23 @@ function Get-DashboardPage {
                    '<td><a class="dl" href="/download?id='+encodeURIComponent(t.id)+'">&#11015; Download</a>'+del+'</td>';
       body.appendChild(tr);
     });
+    syncSelAll();
+    updateZipBtn();
+  }
+  function updateZipBtn(){
+    var n=selectedIds.size;
+    var b=document.getElementById('zipBtn');
+    b.disabled=(n===0);
+    b.innerHTML='&#128230; Download Selected ('+n+')';
+  }
+  function syncSelAll(){
+    var chks=document.querySelectorAll('.rowChk');
+    var sa=document.getElementById('selAll');
+    if(chks.length===0){sa.checked=false;sa.indeterminate=false;return;}
+    var checkedN=0;
+    chks.forEach(function(c){if(c.checked)checkedN++;});
+    sa.checked=(checkedN===chks.length);
+    sa.indeterminate=(checkedN>0 && checkedN<chks.length);
   }
 
   document.querySelectorAll('.tab').forEach(function(b){b.addEventListener('click',function(){
@@ -860,6 +966,33 @@ function Get-DashboardPage {
     var fd=new FormData();fd.append('id',x.dataset.id);
     var r=await fetch('/api/delete',{method:'POST',body:fd});
     if(r.ok){toast('Deleted','ok');fetchState();}else{toast('Failed to delete','err');}
+  });
+  document.getElementById('transferBody').addEventListener('change',function(e){
+    var c=e.target.closest('.rowChk'); if(!c)return;
+    var id=c.dataset.id;
+    if(c.checked)selectedIds.add(id); else selectedIds.delete(id);
+    updateZipBtn(); syncSelAll();
+  });
+  document.getElementById('selAll').addEventListener('change',function(){
+    var chk=document.getElementById('selAll').checked;
+    document.querySelectorAll('.rowChk').forEach(function(c){
+      c.checked=chk;
+      if(chk)selectedIds.add(c.dataset.id); else selectedIds.delete(c.dataset.id);
+    });
+    updateZipBtn();
+  });
+  document.getElementById('zipBtn').addEventListener('click',function(){
+    if(selectedIds.size===0)return;
+    var f=document.createElement('form');
+    f.method='POST'; f.action='/api/zip'; f.target='_blank';
+    selectedIds.forEach(function(id){
+      var i=document.createElement('input');
+      i.type='hidden'; i.name='id'; i.value=id;
+      f.appendChild(i);
+    });
+    document.body.appendChild(f); f.submit();
+    setTimeout(function(){document.body.removeChild(f);},1000);
+    toast('Preparing ZIP ('+selectedIds.size+' files)...','info');
   });
   document.getElementById('renameBtn').addEventListener('click',async function(){
     var n=prompt('New device name:',state.me.nick);if(!n)return;
@@ -1047,6 +1180,17 @@ function Invoke-RequestRouter {
             Send-FileDownload -Req $Req -Stream $Stream -Sid $sid
         }
 
+        '/api/zip' {
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-HtmlResponse -Stream $Stream -Html '<h1>401 - sign in required</h1>' -Status 401; return }
+            if ($method -ne 'POST') { Send-HtmlResponse -Stream $Stream -Html '<h1>405</h1>' -Status 405; return }
+            $bodyText = [System.Text.Encoding]::UTF8.GetString($Req.Body)
+            $form = [System.Web.HttpUtility]::ParseQueryString($bodyText)
+            $ids = $form.GetValues('id')
+            if (-not $ids -or $ids.Count -eq 0) { Send-HtmlResponse -Stream $Stream -Html '<h1>400 - no ids</h1>' -Status 400; return }
+            Send-ZipDownload -Ids $ids -Sid $sid -Stream $Stream
+        }
+
         '/upload' {
             $sid = Test-ValidSession -Req $Req
             if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"no session"}' -Status 401; return }
@@ -1195,6 +1339,17 @@ Show-StartupBanner -Wifi $wifi
 Write-Host ("  Worker threads: {0} | Loaded transfers: {1}" -f $Global:MaxThreads, $Global:Transfers.Count) -ForegroundColor Green
 Write-Host ''
 
+# Auto-open the portal in the default browser
+try {
+    $startUrl = "http://$($wifi.IP):$($Global:Port)/"
+    Start-Process $startUrl -ErrorAction Stop | Out-Null
+    Write-Host ('  [Browser] Opened {0}' -f $startUrl) -ForegroundColor DarkGray
+    Write-Host ''
+} catch {
+    Write-Host '  [Browser] Auto-open failed; open the URL manually.' -ForegroundColor DarkYellow
+    Write-Host ''
+}
+
 # ====================== RUNSPACE POOL ========================================
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 $iss.ApartmentState = 'MTA'
@@ -1205,7 +1360,7 @@ $funcNames = @(
     'Read-HttpRequest','Read-RequestBody','Get-HttpStatusText','Send-Response',
     'Send-HtmlResponse','Send-JsonResponse','Send-RedirectResponse','New-SessionCookieHeader',
     'Test-ValidSession','Resolve-TargetSid','Get-MultipartField',
-    'Save-UploadedFileStream','Send-FileDownload','Get-StateJson',
+    'Save-UploadedFileStream','Send-FileDownload','Send-ZipDownload','Get-StateJson',
     'Get-LoginPage','Get-DashboardPage','Invoke-RequestRouter'
 )
 foreach ($fn in $funcNames) {
