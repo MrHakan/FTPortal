@@ -34,7 +34,9 @@ powershell.exe -ExecutionPolicy Bypass -File LocalFilePortal.ps1
 | **Invite QR** | Offline-embedded QR code (no CDN) so phones connect with one scan. |
 | **Quick text** | Send a note or link as text to any target — handy for URLs and one-liners. |
 | **Notifications** | Optional sound + browser notification when a file arrives (bell toggle in the header). |
-| **Restart-safe** | Transfer records live in `.meta/*.json` next to the files; restarting the server keeps history. |
+| **Text preview** | Small text files (`.txt`, `.md`, `.json`, ...) open in an inline viewer with one-click copy — no download needed for notes and links. |
+| **Restart-safe** | Transfers *and* sessions persist in `.meta/`; restarting the server keeps history and nobody gets logged out. |
+| **Stable identity** | Re-logging in from the same device adopts your previous identity — your inbox follows you, and stale device cards don't pile up. |
 | **Concurrent** | 32-worker runspace pool; several devices can upload/download simultaneously without blocking each other. |
 
 ## Security model
@@ -69,6 +71,7 @@ Edit the settings block at the top of `LocalFilePortal.ps1`:
 | `/api/zip` | POST | Bulk ZIP (`id=` repeated and/or `bundle=`) |
 | `/api/delete` | POST | Delete own transfer (`id=`) or bundle (`bundle=`) |
 | `/api/nick` | POST | Rename device |
+| `/api/peek?id=<transferId>` | GET | Inline text preview (small text files) |
 | `/qr.js` | GET | Embedded QR library |
 | `/logout` | GET | End session |
 

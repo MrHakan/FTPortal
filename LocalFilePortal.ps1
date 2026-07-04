@@ -23,11 +23,14 @@ $Global:DeviceTTL   = [TimeSpan]::FromMinutes(5)    # 'online' threshold
 $Global:MaxThreads  = 32
 $Global:SweepEvery  = [TimeSpan]::FromMinutes(2)
 
-$Global:Sessions   = [hashtable]::Synchronized(@{})   # sid -> @{Sid;PubId;Nick;IP;UA;Created;LastSeen}
-$Global:PubIndex   = [hashtable]::Synchronized(@{})   # pubId -> sid
-$Global:Transfers  = [hashtable]::Synchronized(@{})   # id -> @{Id;Name;Path;Size;Sender;SenderNick;Target;Created}
-$Global:UploadLock = New-Object object
-$Global:SweepState = [hashtable]::Synchronized(@{ Last = [datetime]::MinValue })
+$Global:Sessions    = [hashtable]::Synchronized(@{})   # sid -> @{Sid;PubId;Nick;IP;UA;Created;LastSeen}
+$Global:PubIndex    = [hashtable]::Synchronized(@{})   # pubId -> sid
+$Global:Transfers   = [hashtable]::Synchronized(@{})   # id -> @{Id;Name;Path;Size;Sender;SenderNick;Target;BundleId;Created}
+$Global:UploadLock  = New-Object object
+$Global:SessionLock = New-Object object
+$Global:SweepState  = [hashtable]::Synchronized(@{ Last = [datetime]::MinValue })
+# .dat extension on purpose: transfer import scans .meta\*.json and must skip this
+$Global:SessionFile = Join-Path $Global:MetaFolder 'sessions.dat'
 
 # Embedded qrcode.js (Kazuhiko Arase / davidshimjs, MIT) is injected below at
 # build time so the invite QR works fully offline. Empty string = no QR.
@@ -206,6 +209,42 @@ function Remove-Transfer {
     try { Remove-Item -LiteralPath (Join-Path $Global:MetaFolder ($Id + '.json')) -Force -ErrorAction SilentlyContinue } catch {}
     [void]$Global:Transfers.Remove($Id)
     return $true
+}
+
+function Save-Sessions {
+    # Persist sessions so a server restart doesn't log everyone out.
+    [System.Threading.Monitor]::Enter($Global:SessionLock)
+    try {
+        $arr = @()
+        foreach ($k in @($Global:Sessions.Keys)) {
+            $s = $Global:Sessions[$k]
+            if ($null -eq $s) { continue }
+            $arr += [ordered]@{
+                sid=$s.Sid; pubId=$s.PubId; nick=$s.Nick; ip=$s.IP; ua=$s.UA
+                created=$s.Created.ToString('o'); lastSeen=$s.LastSeen.ToString('o')
+            }
+        }
+        $json = ConvertTo-Json -InputObject $arr -Compress
+        [System.IO.File]::WriteAllText($Global:SessionFile, $json, [System.Text.Encoding]::UTF8)
+    } catch {} finally {
+        [System.Threading.Monitor]::Exit($Global:SessionLock)
+    }
+}
+
+function Import-Sessions {
+    if (-not (Test-Path -LiteralPath $Global:SessionFile)) { return }
+    try {
+        $raw = Get-Content -LiteralPath $Global:SessionFile -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return }
+        foreach ($s in @(ConvertFrom-Json $raw)) {
+            if (-not $s.sid) { continue }
+            $Global:Sessions[$s.sid] = @{
+                Sid=$s.sid; PubId=$s.pubId; Nick=$s.nick; IP=$s.ip; UA=$s.ua
+                Created=[DateTime]::Parse($s.created); LastSeen=[DateTime]::Parse($s.lastSeen)
+            }
+            if ($s.pubId) { $Global:PubIndex[$s.pubId] = $s.sid }
+        }
+    } catch {}
 }
 
 # ============================== HTTP LAYER ====================================
@@ -483,6 +522,10 @@ function Save-UploadedFileStream {
             }
         }
 
+        # Connection dropped before the closing boundary: reject the partial file
+        # instead of registering a silently-truncated transfer.
+        if (-not $found) { throw 'Upload interrupted - incomplete file discarded' }
+
         $fs.Flush()
     } catch {
         try { if ($fs) { $fs.Close() } } catch {}
@@ -646,8 +689,11 @@ function Get-StateJson {
     foreach ($k in @($Global:Sessions.Keys)) {
         $s = $Global:Sessions[$k]
         if ($null -eq $s) { continue }
-        $ageSec = [int]([math]::Floor(($now - $s.LastSeen).TotalSeconds))
-        $online = ($now - $s.LastSeen) -lt $Global:DeviceTTL
+        $age    = $now - $s.LastSeen
+        # Devices idle >24h stay signed in but drop off the picker to avoid clutter
+        if ($age -gt [TimeSpan]::FromHours(24) -and $k -ne $Sid) { continue }
+        $ageSec = [int]([math]::Floor($age.TotalSeconds))
+        $online = $age -lt $Global:DeviceTTL
         $devList += [pscustomobject]@{
             pubId  = $s.PubId
             nick   = $s.Nick
@@ -820,7 +866,7 @@ function Get-DashboardPage {
   .logout{color:var(--err);text-decoration:none;font-size:13px;border:1px solid var(--border);padding:6px 12px;border-radius:8px}
   .logout:hover{background:rgba(247,79,106,.1)}
   main{max-width:1100px;margin:0 auto;padding:24px}
-  .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:22px}
+  .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:22px;overflow-x:auto}
   .panel h2{font-size:13px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .target-chip{background:rgba(79,142,247,.15);color:var(--accent);padding:4px 10px;border-radius:14px;font-size:12px;text-transform:none;letter-spacing:0;font-weight:600}
   .dev-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
@@ -875,6 +921,13 @@ function Get-DashboardPage {
   .url-box{font-size:16px;font-weight:600;background:var(--bg);padding:11px 15px;border-radius:9px;border:1px solid var(--border);margin-bottom:12px;word-break:break-all;letter-spacing:.3px}
   #qrbox{background:#fff;padding:10px;border-radius:10px;line-height:0}
   .hint{color:var(--muted);font-size:12px;margin-top:10px}
+  .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:60;align-items:center;justify-content:center}
+  .modal-bg.show{display:flex}
+  .modal{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;width:520px;max-width:92vw;box-shadow:0 24px 60px rgba(0,0,0,.55)}
+  .modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:12px}
+  .modal-head b{word-break:break-all;font-size:14px}
+  .modal textarea{width:100%;height:200px;background:var(--bg);border:1px solid var(--border);border-radius:9px;color:var(--text);font-size:13px;padding:10px;resize:vertical;outline:none;font-family:Consolas,monospace}
+  .modal-actions{margin-top:12px;text-align:right}
   table{width:100%;border-collapse:collapse}
   th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);padding:8px 10px;border-bottom:1px solid var(--border)}
   td{padding:11px 10px;border-bottom:1px solid var(--border);font-size:13.5px;vertical-align:middle}
@@ -967,6 +1020,13 @@ function Get-DashboardPage {
     </section>
   </main>
 
+  <div class="modal-bg" id="modalBg">
+    <div class="modal">
+      <div class="modal-head"><b id="modalTitle">Note</b><button class="hbtn" id="modalClose">&#10005;</button></div>
+      <textarea id="modalText" readonly></textarea>
+      <div class="modal-actions"><button class="btn" id="modalCopy">&#128203; Copy</button></div>
+    </div>
+  </div>
   <div class="toast-box" id="toasts"></div>
 
 <script src="/qr.js"></script>
@@ -1079,11 +1139,13 @@ function Get-DashboardPage {
     syncSelAll();
     updateZipBtn();
   }
+  function isPreviewable(t){return /\.(txt|md|log|json|csv|ini|cfg)$/i.test(t.name) && t.size<=65536;}
   function renderSingleRow(body,t){
     var tr=document.createElement('tr');
     var pill=t.target==='public'?'<span class="pill pub">&#127760; Public</span>':('<span class="pill">'+esc(t.targetNick)+'</span>');
     var fromPill=t.byMe?'<span class="pill me">Me</span>':('<span class="pill">'+esc(t.senderNick)+'</span>');
     var del=t.byMe?'<button class="dl-x" data-id="'+t.id+'" title="Delete">&#10005;</button>':'';
+    var peek=isPreviewable(t)?'<a class="dl peek" href="#" data-id="'+t.id+'" data-name="'+esc(t.name)+'" title="View text">&#128065; View</a> ':'';
     var chk=selectedIds.has(t.id)?' checked':'';
     tr.innerHTML='<td class="ic"><input type="checkbox" class="rowChk" data-id="'+t.id+'"'+chk+'></td>'+
                  '<td class="ic">'+t.icon+'</td>'+
@@ -1091,7 +1153,7 @@ function Get-DashboardPage {
                  '<td>'+fmtSize(t.size)+'</td>'+
                  '<td>'+fromPill+' &rarr; '+pill+'</td>'+
                  '<td class="dt">'+fmtDate(t.created)+'</td>'+
-                 '<td><a class="dl" href="/download?id='+encodeURIComponent(t.id)+'">&#11015; Download</a>'+del+'</td>';
+                 '<td>'+peek+'<a class="dl" href="/download?id='+encodeURIComponent(t.id)+'">&#11015; Download</a>'+del+'</td>';
     body.appendChild(tr);
   }
   function renderBundleRow(body,t){
@@ -1173,7 +1235,29 @@ function Get-DashboardPage {
     document.body.appendChild(f); f.submit();
     setTimeout(function(){document.body.removeChild(f);},1000);
   }
+  function openPeek(id,name){
+    fetch('/api/peek?id='+encodeURIComponent(id)).then(function(r){return r.json();}).then(function(j){
+      if(!j.ok){toast('Cannot preview','err');return;}
+      document.getElementById('modalTitle').textContent=name;
+      document.getElementById('modalText').value=j.text;
+      document.getElementById('modalBg').classList.add('show');
+    }).catch(function(){toast('Cannot preview','err');});
+  }
+  document.getElementById('modalClose').addEventListener('click',function(){document.getElementById('modalBg').classList.remove('show');});
+  document.getElementById('modalBg').addEventListener('click',function(e){if(e.target===document.getElementById('modalBg'))document.getElementById('modalBg').classList.remove('show');});
+  document.getElementById('modalCopy').addEventListener('click',function(){
+    var ta=document.getElementById('modalText');
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(ta.value).then(function(){toast('Copied','ok');},function(){toast('Copy failed','err');});
+    } else {
+      ta.select();
+      try{document.execCommand('copy');toast('Copied','ok');}catch(e){toast('Copy failed','err');}
+    }
+  });
   document.getElementById('transferBody').addEventListener('click',async function(e){
+    // Text preview
+    var pk=e.target.closest('.peek');
+    if(pk){e.preventDefault();openPeek(pk.dataset.id,pk.dataset.name||'Note');return;}
     // Expand/collapse a bundle
     var eb=e.target.closest('.expand-btn');
     if(eb){
@@ -1509,9 +1593,20 @@ function Invoke-RequestRouter {
                 if ($pw -eq $Global:Password) {
                     $sid = New-SessionId
                     $pub = New-ShortId 4
+
+                    # Same device logging in again (matching IP + user agent):
+                    # adopt the old session instead of piling up ghost devices.
+                    $oldSids = @()
+                    foreach ($k in @($Global:Sessions.Keys)) {
+                        $s = $Global:Sessions[$k]
+                        if ($s -and $s.IP -eq $Req.ClientIp -and $s.UA -eq $Req.UserAgent) { $oldSids += $k }
+                    }
+
                     $providedNick = $form['nick']
                     if ($providedNick) { $providedNick = $providedNick.Trim() }
-                    $nick = if ($providedNick) { $providedNick } else { Get-DeviceLabel -UA $Req.UserAgent -IP $Req.ClientIp }
+                    $nick = if ($providedNick) { $providedNick }
+                            elseif ($oldSids.Count -gt 0 -and $Global:Sessions[$oldSids[0]].Nick) { $Global:Sessions[$oldSids[0]].Nick }
+                            else { Get-DeviceLabel -UA $Req.UserAgent -IP $Req.ClientIp }
                     if ($nick.Length -gt 32) { $nick = $nick.Substring(0,32) }
                     $now = Get-Date
                     $Global:Sessions[$sid] = @{
@@ -1520,6 +1615,23 @@ function Invoke-RequestRouter {
                         Created=$now; LastSeen=$now
                     }
                     $Global:PubIndex[$pub] = $sid
+
+                    # Re-point old transfers at the new identity, then drop old sessions
+                    foreach ($old in $oldSids) {
+                        foreach ($tk in @($Global:Transfers.Keys)) {
+                            $t = $Global:Transfers[$tk]
+                            if ($null -eq $t) { continue }
+                            $changed = $false
+                            if ($t.Target -eq $old) { $t.Target = $sid; $changed = $true }
+                            if ($t.Sender -eq $old) { $t.Sender = $sid; $changed = $true }
+                            if ($changed) { try { Save-TransferMeta -T $t } catch {} }
+                        }
+                        $os = $Global:Sessions[$old]
+                        if ($os -and $os.PubId) { [void]$Global:PubIndex.Remove($os.PubId) }
+                        [void]$Global:Sessions.Remove($old)
+                    }
+                    Save-Sessions
+
                     $cookie = New-SessionCookieHeader -Sid $sid
                     Send-RedirectResponse -Stream $Stream -Location '/dashboard' -ExtraHeaders @{ 'Set-Cookie' = $cookie }
                 } else {
@@ -1541,6 +1653,30 @@ function Invoke-RequestRouter {
         '/qr.js' {
             $js = if ([string]::IsNullOrEmpty($Global:QrJs)) { '/* qr lib unavailable */' } else { $Global:QrJs }
             Send-Response -Stream $Stream -Status 200 -ContentType 'application/javascript; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($js))
+        }
+
+        '/api/peek' {
+            # Inline preview for small text files (notes, links) - no download needed
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 401; return }
+            $q = [System.Web.HttpUtility]::ParseQueryString($Req.Query)
+            $id = $q['id']
+            if ([string]::IsNullOrWhiteSpace($id) -or -not $Global:Transfers.ContainsKey($id)) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"not found"}' -Status 404; return
+            }
+            $t = $Global:Transfers[$id]
+            if ($t.Target -ne 'public' -and $t.Target -ne $sid -and $t.Sender -ne $sid) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"forbidden"}' -Status 403; return
+            }
+            if ($t.Size -gt 65536 -or $t.Name -notmatch '\.(txt|md|log|json|csv|ini|cfg)$') {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"not previewable"}' -Status 415; return
+            }
+            if (-not (Test-Path -LiteralPath $t.Path -PathType Leaf)) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"missing"}' -Status 404; return
+            }
+            $text = [System.IO.File]::ReadAllText($t.Path, [System.Text.Encoding]::UTF8)
+            $payload = [pscustomobject]@{ ok = $true; text = $text }
+            Send-JsonResponse -Stream $Stream -Json ($payload | ConvertTo-Json -Compress -Depth 3) -Status 200
         }
 
         '/api/state' {
@@ -1565,6 +1701,7 @@ function Invoke-RequestRouter {
             if ([string]::IsNullOrWhiteSpace($nick)) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"empty"}' -Status 400; return }
             $nick = $nick.Trim(); if ($nick.Length -gt 32) { $nick = $nick.Substring(0,32) }
             $Global:Sessions[$sid].Nick = $nick
+            Save-Sessions
             Send-JsonResponse -Stream $Stream -Json '{"ok":true}' -Status 200
         }
 
@@ -1644,9 +1781,12 @@ function Invoke-RequestRouter {
             if ($bundleParam) { $bundleParam = ($bundleParam -replace '[^a-zA-Z0-9]', '') }
             $r = Save-UploadedFileStream -NetStream $Stream -ContentType $Req.ContentType -SenderSid $sid -Target $targetSid -BundleId $bundleParam
             if ($r.ok) {
-                Send-JsonResponse -Stream $Stream -Json (('{"ok":true,"id":"' + $r.id + '","msg":"' + ($r.msg -replace '"',"'") + '"}'))
+                $msg = ($r.msg -replace '\\','/' -replace '"',"'")
+                Send-JsonResponse -Stream $Stream -Json ('{"ok":true,"id":"' + $r.id + '","msg":"' + $msg + '"}')
             } else {
-                $msg = ($r.msg -replace '"', "'")
+                # Escape backslashes too - exception messages can contain paths,
+                # and a lone \ makes the JSON unparseable on the client.
+                $msg = ($r.msg -replace '\\','/' -replace '"',"'")
                 Send-JsonResponse -Stream $Stream -Json ('{"ok":false,"msg":"' + $msg + '"}') -Status $r.status
             }
         }
@@ -1657,6 +1797,7 @@ function Invoke-RequestRouter {
                 $pub = $Global:Sessions[$sid].PubId
                 if ($pub) { [void]$Global:PubIndex.Remove($pub) }
                 [void]$Global:Sessions.Remove($sid)
+                Save-Sessions
             }
             $cookie = New-SessionCookieHeader -Sid '' -Expire $true
             Send-RedirectResponse -Stream $Stream -Location '/' -ExtraHeaders @{ 'Set-Cookie' = $cookie }
@@ -1761,8 +1902,9 @@ if ($null -eq $wifi) {
     return
 }
 
-# Restart-safe: load transfer records from disk
+# Restart-safe: load transfer records and sessions from disk
 Import-AllTransfers
+Import-Sessions
 
 $bindAddr = [System.Net.IPAddress]::Parse($wifi.IP)
 $listener = New-Object System.Net.Sockets.TcpListener($bindAddr, $Global:Port)
@@ -1803,7 +1945,7 @@ $funcNames = @(
     'Invoke-PeriodicSweep','Save-TransferMeta','Remove-Transfer','ConvertTo-SafeRelPath',
     'Read-HttpRequest','Read-RequestBody','Get-HttpStatusText','Send-Response',
     'Send-HtmlResponse','Send-JsonResponse','Send-RedirectResponse','New-SessionCookieHeader',
-    'Test-ValidSession','Resolve-TargetSid','Get-MultipartField',
+    'Test-ValidSession','Resolve-TargetSid','Get-MultipartField','Save-Sessions',
     'Save-UploadedFileStream','Send-FileDownload','Send-ZipDownload','Get-StateJson',
     'Get-LoginPage','Get-DashboardPage','Invoke-RequestRouter'
 )
@@ -1825,6 +1967,8 @@ $sharedVars = @{
     PubIndex    = $Global:PubIndex
     Transfers   = $Global:Transfers
     UploadLock  = $Global:UploadLock
+    SessionLock = $Global:SessionLock
+    SessionFile = $Global:SessionFile
     SweepState  = $Global:SweepState
     QrJs        = $Global:QrJs
 }
@@ -1925,7 +2069,12 @@ try {
 #   - Quick text/link share (sent as .txt to the current target)
 #   - Sound + browser notifications for inbound files (bell toggle)
 #   - Live upload stats: overall progress, MB/s, ETA
-#   - Restart-safe transfers (.meta\<id>.json)
+#   - Inline preview for small text files (View button, copy from modal)
+#   - Restart-safe transfers (.meta\<id>.json) AND sessions (.meta\sessions.dat):
+#     server restart does not log anyone out
+#   - Re-login from the same device (IP+UA) adopts the previous identity -
+#     old transfers are re-pointed, no ghost device cards pile up
+#   - Interrupted uploads are discarded, never saved as silent partial files
 #   - Device name picked at login, editable from dashboard
 #
 # STORAGE:
