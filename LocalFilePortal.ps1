@@ -1925,16 +1925,36 @@ Show-StartupBanner -Wifi $wifi
 Write-Host ("  Worker threads: {0} | Loaded transfers: {1}" -f $Global:MaxThreads, $Global:Transfers.Count) -ForegroundColor Green
 Write-Host ''
 
-# Auto-open the portal in the default browser
+# Auto-open the portal in the default browser.
+# NOTE: when this script itself runs with a hidden window (e.g. launched via
+# StartPortalHidden.vbs -> powershell -WindowStyle Hidden), the spawned
+# browser can inherit that hidden show-window hint and never become visible.
+# -WindowStyle Normal on Start-Process overrides that. cmd's "start" and
+# rundll32's URL handler are kept as fallbacks for odd shell-association setups.
+$startUrl = "http://$($wifi.IP):$($Global:Port)/"
+$opened = $false
 try {
-    $startUrl = "http://$($wifi.IP):$($Global:Port)/"
-    Start-Process $startUrl -ErrorAction Stop | Out-Null
-    Write-Host ('  [Browser] Opened {0}' -f $startUrl) -ForegroundColor DarkGray
-    Write-Host ''
-} catch {
-    Write-Host '  [Browser] Auto-open failed; open the URL manually.' -ForegroundColor DarkYellow
-    Write-Host ''
+    Start-Process $startUrl -WindowStyle Normal -ErrorAction Stop | Out-Null
+    $opened = $true
+} catch {}
+if (-not $opened) {
+    try {
+        Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c','start','""',$startUrl) -WindowStyle Hidden -ErrorAction Stop | Out-Null
+        $opened = $true
+    } catch {}
 }
+if (-not $opened) {
+    try {
+        Start-Process -FilePath 'rundll32.exe' -ArgumentList @('url.dll,FileProtocolHandler',$startUrl) -WindowStyle Normal -ErrorAction Stop | Out-Null
+        $opened = $true
+    } catch {}
+}
+if ($opened) {
+    Write-Host ('  [Browser] Opened {0}' -f $startUrl) -ForegroundColor DarkGray
+} else {
+    Write-Host ('  [Browser] Auto-open failed; open manually: {0}' -f $startUrl) -ForegroundColor DarkYellow
+}
+Write-Host ''
 
 # ====================== RUNSPACE POOL ========================================
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
