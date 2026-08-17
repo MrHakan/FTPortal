@@ -224,16 +224,41 @@ davranışa döner.
 
 ---
 
-## 8. Saha testi sırası (yazmadan önce doğrulanacaklar)
+## 8. Saha testi sonuçları
 
-Tasarımın üç yerinde dürüst belirsizlik var. Kod yazmadan önce sırayla test edilmeli:
+Tasarımın belirsiz noktaları uygulama sırasında ölçüldü. Sonuçlar:
 
-1. **Hotspot admin gerektiriyor mu?** `StartTetheringAsync()`'i yükseltilmemiş PowerShell'den çağır. Gerekiyorsa ya UAC prompt'u ya B yoluna kayış.
-2. **Ethernet çıkınca ne oluyor?** Kabloyu çek, `GetInternetConnectionProfile()` null mı? Null ise A düşer, B'nin gerçekten çalıştığı doğrulanmalı — gemi senaryosunun tamamı buna bağlı.
-3. **İki telefon birbirini görüyor mu?** AP'ye iki cihaz bağla, birinden diğerinin `192.168.137.x` adresine istek at. Görmüyorsa client isolation var, P2P istemci↔istemci yolu tasarımdan çıkar.
+| # | Soru | Sonuç |
+|---|---|---|
+| 1 | Hotspot admin gerektiriyor mu? | **Hayır.** Yükseltilmemiş PowerShell'den `StartTethering -> Success` |
+| 2 | SoftAP adaptörünü mevcut filtre yakalıyor mu? | **Evet.** `PhysicalMediaType = "Native 802.11"` → `Get-WifiInterface` `192.168.137.1/24` döndü, `Hotspot=True`. Alt katmanlara hiç dokunulmadı |
+| 3 | B yolu (Wi-Fi Direct) çalışıyor mu? | **Evet.** `publisher status: Started`, aynı `192.168.137.1`. İnternet profiline hiç bakmıyor |
+| 4 | Sinyalleşme uçtan uca çalışıyor mu? | **Evet.** İki oturum arası offer taşındı, posta kutusu tek okumada boşaldı, yetkisiz/bozuk istekler 401/400/404 ile reddedildi |
 
-Ek doğrulamalar: ICS'in UDP/53'ü tutup tutmadığı (captive portal), iOS Safari'de düz HTTP
-üzerinden `RTCPeerConnection` davranışı.
+### Uygulama sırasında çıkan, tasarımda öngörülmemiş iki sorun
+
+**a) Adres ~4 sn `Tentative` kalıyor.** `StartTetheringAsync` `Success` döndükten sonra
+`192.168.137.1` hemen `Get-NetIPAddress`'te görünüyor ama IPv4 duplicate-address-detection
+bitene kadar bind edilemiyor — `"The requested address is not valid in its context"`.
+Ölçüm: t=1.1 sn'de `Tentative`, t=4.3 sn'de `Preferred` ve bindable.
+Çözüm: `Get-WifiInterface` artık `AddressState -eq 'Preferred'` filtreliyor, başlangıç
+15 sn'ye kadar bekliyor.
+
+**b) Hotspot 5 dakikada kendini kapatıyor.** İstemci bağlanmazsa Windows AP'yi düşürüyor.
+Ölçüm: 20:37:42'de kalktı, **20:42:41'de düştü** — tam 5 dakika. Portalı açıp diğer cihaza
+yürürken bu süre rahat aşılır, yani tasarımın tamamını sessizce çökertiyordu.
+Kalıcı kapatması `HKLM\...\icssvc\Settings\PeerlessTimeoutEnabled` yazmayı, o da admin
+gerektiriyor — aracın "admin yok" ilkesine aykırı.
+Çözüm: watchdog runspace'i 10 sn'de bir `TetheringOperationalState`'i yokluyor ve `Off`
+görürse yeniden kaldırıyor. Ölçüm: 20:42:47'de geri geldi (6 sn).
+Ayrıca test edildi — **bağlı `TcpListener` bu boşluktan sağ çıkıyor**, yeniden bind gerekmiyor.
+
+### Hâlâ açık kalanlar
+
+- **İki telefon birbirini görüyor mu (client isolation)?** İki gerçek cihaz gerektiriyor, test edilmedi. İzolasyon varsa P2P istemci↔istemci yolu düşer, relay çalışmaya devam eder.
+- **DataChannel üzerinden gerçek dosya akışı.** Sinyalleşme doğrulandı, veri düzlemi iki gerçek tarayıcıyla denenmedi.
+- **iOS Safari'de düz HTTP üzerinden `RTCPeerConnection`.**
+- **ICS'in UDP/53'ü tutup tutmadığı** (Faz 1 captive portal için).
 
 ---
 
@@ -241,10 +266,14 @@ Ek doğrulamalar: ICS'in UDP/53'ü tutup tutmadığı (captive portal), iOS Safa
 
 | Faz | İçerik | Kazanç | Risk |
 |---|---|---|---|
-| **0** | Self-AP (A→B) + `/lobby` çift QR | **"Wi-Fi gerektirmez" şartı burada tamamen karşılanır.** Transfer mevcut relay ile çalışır. | Düşük — üst katmanlara dokunulmaz |
-| **1** | Captive portal: otomatik açılış + `204` ile Android'i ağda tutma | Tek QR; Android'in AP'yi bırakması engellenir | Orta — ICS DNS çakışması |
-| **2** | WebRTC P2P veri düzlemi + relay'e düşme | Sunucu diski yazılmaz, çift atlama yok | Orta — mDNS / izolasyon |
-| **3** | BT-PAN acil taşıyıcı, USB tether dokümantasyonu | Wi-Fi radyosu tamamen kapalıyken çalışır | Düşük — manuel |
+| **0** ✅ | Self-AP (A→B) + `/lobby` çift QR | **"Wi-Fi gerektirmez" şartı burada tamamen karşılanır.** Transfer mevcut relay ile çalışır. | Düşük — üst katmanlara dokunulmaz |
+| **1** ⬜ | Captive portal: otomatik açılış + `204` ile Android'i ağda tutma | Tek QR; Android'in AP'yi bırakması engellenir | Orta — ICS DNS çakışması |
+| **2** ✅ | WebRTC P2P veri düzlemi + relay'e düşme | Sunucu diski yazılmaz, çift atlama yok | Orta — mDNS / izolasyon |
+| **3** ⬜ | BT-PAN acil taşıyıcı, USB tether dokümantasyonu | Wi-Fi radyosu tamamen kapalıyken çalışır | Düşük — manuel |
+
+Faz 0 ve 2 uygulandı. Faz 1 bilinçli olarak ertelendi: kazancının çoğu (Android'i internetsiz
+AP'de tutmak) ICS'in UDP/53'ü bırakmasına bağlı ve bu doğrulanmadı; bağımlılık hâline
+getirilmesi çalışan bir sistemi kırılgan yapardı.
 
 **Faz 0 tek başına talebi karşılar.** P2P (Faz 2) bir optimizasyondur, ön şart değil — bu ayrım
 bilinçli: "router'sız çalışsın" ile "baytlar doğrudan aksın" bağımsız iki hedeftir ve

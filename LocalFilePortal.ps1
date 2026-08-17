@@ -23,12 +23,24 @@ $Global:DeviceTTL   = [TimeSpan]::FromMinutes(5)    # 'online' threshold
 $Global:MaxThreads  = 32
 $Global:SweepEvery  = [TimeSpan]::FromMinutes(2)
 
+# --- Self-AP: the host becomes the network, no router/Wi-Fi needed ------------
+$Global:SelfAp      = $true          # raise our own access point at startup
+$Global:ApSsid      = 'FTPHAKAN'     # a 4-hex suffix is appended at runtime
+$Global:ApPassphrase= ''             # generated per run; never hard-coded
+# --- P2P: browser-to-browser DataChannel, server only brokers the handshake ---
+$Global:P2P         = $true
+$Global:SignalTTL   = [TimeSpan]::FromSeconds(60)
+
 $Global:Sessions    = [hashtable]::Synchronized(@{})   # sid -> @{Sid;PubId;Nick;IP;UA;Created;LastSeen}
 $Global:PubIndex    = [hashtable]::Synchronized(@{})   # pubId -> sid
 $Global:Transfers   = [hashtable]::Synchronized(@{})   # id -> @{Id;Name;Path;Size;Sender;SenderNick;Target;BundleId;Created}
 $Global:UploadLock  = New-Object object
 $Global:SessionLock = New-Object object
 $Global:SweepState  = [hashtable]::Synchronized(@{ Last = [datetime]::MinValue })
+$Global:Signals     = [hashtable]::Synchronized(@{})   # pubId -> ArrayList of pending WebRTC signals
+$Global:SignalLock  = New-Object object
+$Global:Bearer      = [hashtable]::Synchronized(@{ Mode='none'; Ssid=''; Pass='' })
+$Global:ApWatch     = [hashtable]::Synchronized(@{ Stop=$false; Restarts=0 })
 # .dat extension on purpose: transfer import scans .meta\*.json and must skip this
 $Global:SessionFile = Join-Path $Global:MetaFolder 'sessions.dat'
 
@@ -245,6 +257,46 @@ function Import-Sessions {
             if ($s.pubId) { $Global:PubIndex[$s.pubId] = $s.sid }
         }
     } catch {}
+}
+
+# ============================== WEBRTC SIGNALLING =============================
+# A mailbox per device, drained by the normal /api/state poll. Offers, answers
+# and ICE candidates pass through; file bytes never do.
+
+function Add-Signal {
+    param([string]$ToPub, [string]$FromPub, [string]$Kind, [string]$Data)
+    [System.Threading.Monitor]::Enter($Global:SignalLock)
+    try {
+        if (-not $Global:Signals.ContainsKey($ToPub)) {
+            $Global:Signals[$ToPub] = New-Object System.Collections.ArrayList
+        }
+        $box = $Global:Signals[$ToPub]
+        $cut = (Get-Date).Subtract($Global:SignalTTL)
+        for ($i = $box.Count - 1; $i -ge 0; $i--) {
+            if ($box[$i].At -lt $cut) { $box.RemoveAt($i) }
+        }
+        # A peer that never polls must not grow the box without bound.
+        while ($box.Count -ge 200) { $box.RemoveAt(0) }
+        [void]$box.Add([pscustomobject]@{ From = $FromPub; Kind = $Kind; Data = $Data; At = (Get-Date) })
+    } finally { [System.Threading.Monitor]::Exit($Global:SignalLock) }
+}
+
+function Get-SignalsFor {
+    param([string]$Pub)
+    $out = @()
+    if ([string]::IsNullOrEmpty($Pub)) { return $out }
+    [System.Threading.Monitor]::Enter($Global:SignalLock)
+    try {
+        if ($Global:Signals.ContainsKey($Pub)) {
+            $box = $Global:Signals[$Pub]
+            $cut = (Get-Date).Subtract($Global:SignalTTL)
+            foreach ($s in $box) {
+                if ($s.At -ge $cut) { $out += [pscustomobject]@{ from = $s.From; kind = $s.Kind; data = $s.Data } }
+            }
+            $box.Clear()
+        }
+    } finally { [System.Threading.Monitor]::Exit($Global:SignalLock) }
+    return $out
 }
 
 # ============================== HTTP LAYER ====================================
@@ -786,6 +838,8 @@ function Get-StateJson {
         me = [pscustomobject]@{ pubId = $me.PubId; nick = $me.Nick }
         devices   = $devList
         transfers = $entries
+        p2p       = [bool]$Global:P2P
+        signals   = @(Get-SignalsFor -Pub $me.PubId)
     }
     return ($payload | ConvertTo-Json -Depth 8 -Compress)
 }
@@ -1004,6 +1058,15 @@ function Get-DashboardPage {
       </div>
     </section>
 
+    <section class="panel" id="p2pPanel" style="display:none">
+      <h2>Direct Inbox <span class="target-chip" title="Received peer-to-peer, never stored on the server">&#9889; P2P</span></h2>
+      <table>
+        <thead><tr><th></th><th>File</th><th>Size</th><th>From</th><th></th></tr></thead>
+        <tbody id="p2pBody"></tbody>
+      </table>
+      <div class="hint" style="margin-top:10px">These arrived straight from the other device and live in this tab only. Save them before closing the page.</div>
+    </section>
+
     <section class="panel">
       <h2>Transfers</h2>
       <div class="tabs">
@@ -1053,13 +1116,17 @@ function Get-DashboardPage {
   function devIcon(n){var s=(n||'').toLowerCase();if(s.indexOf('iphone')>=0||s.indexOf('ipad')>=0||s.indexOf('android')>=0)return '&#128241;';if(s.indexOf('mac')>=0||s.indexOf('windows')>=0)return '&#128187;';if(s.indexOf('linux')>=0)return '&#128421;';return '&#128242;';}
 
   async function fetchState(){
-    if(uploading)return;
     try{
       var r=await fetch('/api/state',{cache:'no-store'});
       if(r.status===401){location.href='/';return;}
       if(!r.ok)return;
+      var st=await r.json();
+      // Signals must drain even mid-upload: a P2P sender is "uploading" while it
+      // waits for the peer's answer, and bailing out here would deadlock it.
+      if(st.signals&&st.signals.length)handleSignals([].concat(st.signals));
+      if(uploading)return;
       var prev=lastEntryKeys;
-      state=await r.json();
+      state=st;
       lastEntryKeys=new Set(state.transfers.map(entryKey));
       // Only toast when we have a prior snapshot to diff against. Skips initial load.
       if(prev!==null){
@@ -1467,32 +1534,67 @@ function Get-DashboardPage {
     xhr.onerror=function(){item.status='err';toast(relName+' connection error','err');renderQueue();done();};
     xhr.send(fd);
   }
-  upBtn.addEventListener('click',function(){
+  function finishRun(msg,type){
+    bar.style.width='100%';
+    toast(msg,type||'ok');
+    currentRun=null;
+    setTimeout(function(){uploading=false;renderQueue();fetchState();bar.style.width='0';barWrap.classList.remove('show');document.getElementById('upStats').textContent='';},900);
+  }
+  function runRelay(list){
+    // >1 file: auto-bundle so the receiver sees one package instead of N rows
+    var bundleId=(list.length>1) ? randomHex(8) : null;
+    if(bundleId)toast('Sending '+list.length+' files as one bundle...','info');
+    var CONC=3,idx=0,active=0,finished=0;
+    function pump(){
+      while(active<CONC && idx<list.length){
+        active++;
+        uploadOne(list[idx++],bundleId,function(){active--;finished++;pump();});
+      }
+      if(finished===list.length && active===0){
+        var okN=list.filter(function(q){return q.status==='ok';}).length;
+        finishRun(bundleId?('Bundle sent ('+okN+' files)'):(okN+' file(s) sent'),'ok');
+      }
+    }
+    pump();
+  }
+  async function runP2p(list){
+    setPoll(800);                       // negotiation needs a tighter poll than 4s
+    var p=null;
+    try{p=await ensurePeer(target,8000);}catch(e){p=null;}
+    setPoll(4000);
+    if(!p||!p.ready)return false;
+    for(var i=0;i<list.length;i++){
+      var it=list[i];
+      it.status='up';it.loaded=0;renderQueue();
+      try{
+        await p2pSendOne(p,it);
+        it.status='ok';it.loaded=it.file.size;renderQueue();updateOverall();
+      }catch(e){
+        it.status='';renderQueue();     // hand whatever is left to the relay
+        return false;
+      }
+    }
+    return true;
+  }
+  upBtn.addEventListener('click',async function(){
     var todo=queued.filter(function(q){return q.status!=='ok';});
     if(!todo.length || uploading)return;
-    // >1 file: auto-bundle so the receiver sees one package instead of N rows
-    var bundleId=(todo.length>1) ? randomHex(8) : null;
     uploading=true;renderQueue();
     barWrap.classList.add('show');bar.style.width='0';
     document.getElementById('upStats').textContent='';
     currentRun={items:todo,start:Date.now()};
-    if(bundleId)toast('Sending '+todo.length+' files as one bundle...','info');
-    var CONC=3,idx=0,active=0,finished=0;
-    function pump(){
-      while(active<CONC && idx<todo.length){
-        active++;
-        uploadOne(todo[idx++],bundleId,function(){active--;finished++;pump();});
-      }
-      if(finished===todo.length && active===0){
-        bar.style.width='100%';
-        var okN=todo.filter(function(q){return q.status==='ok';}).length;
-        if(bundleId)toast('Bundle sent ('+okN+' files)','ok');
-        else toast(okN+' file(s) sent','ok');
-        currentRun=null;
-        setTimeout(function(){uploading=false;renderQueue();fetchState();bar.style.width='0';barWrap.classList.remove('show');document.getElementById('upStats').textContent='';},900);
-      }
+
+    // Direct path only for a single named target. Broadcasting would need N
+    // connections and the relay already handles that case well.
+    var direct=false;
+    if(p2pEnabled() && target!=='public'){
+      toast('Connecting directly...','info');
+      direct=await runP2p(todo);
+      if(!direct)toast('No direct link, sending via server','info');
     }
-    pump();
+    var left=todo.filter(function(q){return q.status!=='ok';});
+    if(left.length)runRelay(left);
+    else finishRun(todo.length+' file(s) sent directly \u26A1','ok');
   });
 
   // ---- Quick text share ----
@@ -1543,6 +1645,185 @@ function Get-DashboardPage {
     }
   }
 
+  // ---- P2P: WebRTC DataChannel, server only brokers the handshake ----------
+  // No STUN/TURN: one L2 segment, no internet. Host candidates are all we need.
+  // Everything here is best-effort - any failure falls back to the HTTP relay.
+  var RTC_OK=(typeof RTCPeerConnection!=='undefined');
+  var peers={};            // pubId -> {pc,dc,ready,waiters,rx}
+  var p2pInbox=[];         // files received directly, held in this tab only
+  var pollMs=4000,pollTimer=null;
+
+  function setPoll(ms){
+    if(pollMs===ms&&pollTimer)return;
+    pollMs=ms; if(pollTimer)clearInterval(pollTimer);
+    pollTimer=setInterval(fetchState,ms);
+  }
+  function nickOf(pub){
+    var d=(state.devices||[]).filter(function(x){return x.pubId===pub;})[0];
+    return d?d.nick:pub;
+  }
+  function p2pEnabled(){return RTC_OK && state && state.p2p;}
+
+  function rtcSignal(to,kind,data){
+    var b='to='+encodeURIComponent(to)+'&kind='+encodeURIComponent(kind)+'&data='+encodeURIComponent(data||'');
+    return fetch('/rtc/signal',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});
+  }
+  function dropPeer(pub){
+    var p=peers[pub]; if(!p)return;
+    try{if(p.dc)p.dc.close();}catch(e){}
+    try{p.pc.close();}catch(e){}
+    delete peers[pub];
+  }
+  // Gather fully before signalling. Trickling would race the offer through the
+  // same mailbox and candidates could land before the description they belong to.
+  function waitIce(pc,ms){
+    return new Promise(function(res){
+      if(pc.iceGatheringState==='complete'){res();return;}
+      var done=false;
+      var t=setTimeout(function(){if(!done){done=true;res();}},ms);
+      pc.addEventListener('icegatheringstatechange',function(){
+        if(pc.iceGatheringState==='complete'&&!done){done=true;clearTimeout(t);res();}
+      });
+    });
+  }
+  function wireChannel(p,dc){
+    p.dc=dc; dc.binaryType='arraybuffer';
+    dc.onopen=function(){
+      p.ready=true;
+      var w=p.waiters; p.waiters=[];
+      w.forEach(function(fn){fn(p);});
+    };
+    dc.onclose=function(){p.ready=false;};
+    dc.onmessage=function(e){
+      if(typeof e.data==='string'){
+        var m=null; try{m=JSON.parse(e.data);}catch(_){return;}
+        if(m.t==='head'){p.rx={name:m.name,size:m.size,parts:[]};}
+        else if(m.t==='end'&&p.rx){
+          var blob=new Blob(p.rx.parts);
+          var nm=p.rx.name;
+          p2pInbox.unshift({key:'p'+(seq++),name:nm,size:blob.size,from:nickOf(p.pub),blob:blob});
+          p.rx=null; renderP2pInbox();
+          toast(nickOf(p.pub)+' sent you: '+nm+' (direct)','info');
+          notifyInbound('Direct file from '+nickOf(p.pub),nm+' ('+fmtSize(blob.size)+')');
+        }
+      } else if(p.rx){
+        p.rx.parts.push(e.data);
+      }
+    };
+  }
+  function newPeer(pub,initiator){
+    var pc=new RTCPeerConnection({iceServers:[]});
+    var p={pc:pc,dc:null,pub:pub,ready:false,waiters:[],rx:null};
+    peers[pub]=p;
+    pc.onconnectionstatechange=function(){
+      var s=pc.connectionState;
+      if(s==='failed'||s==='closed'||s==='disconnected'){
+        var w=p.waiters; p.waiters=[];
+        w.forEach(function(fn){fn(null);});
+        if(s!=='disconnected')dropPeer(pub);
+      }
+    };
+    if(initiator){wireChannel(p,pc.createDataChannel('lfp',{ordered:true}));}
+    else{pc.ondatachannel=function(e){wireChannel(p,e.channel);};}
+    return p;
+  }
+  function ensurePeer(pub,timeoutMs){
+    return new Promise(function(resolve){
+      var p=peers[pub];
+      if(p&&p.ready){resolve(p);return;}
+      if(!p){
+        p=newPeer(pub,true);
+        p.pc.createOffer()
+          .then(function(o){return p.pc.setLocalDescription(o);})
+          .then(function(){return waitIce(p.pc,2500);})
+          .then(function(){return rtcSignal(pub,'offer',JSON.stringify(p.pc.localDescription));})
+          .catch(function(){});
+      }
+      var done=false;
+      var t=setTimeout(function(){if(!done){done=true;resolve(null);}},timeoutMs);
+      p.waiters.push(function(res){if(!done){done=true;clearTimeout(t);resolve(res);}});
+    });
+  }
+  function handleSignals(list){
+    if(!p2pEnabled()&&!RTC_OK)return;
+    list.forEach(function(s){
+      var data=null; if(s.data){try{data=JSON.parse(s.data);}catch(_){return;}}
+      if(s.kind==='bye'){dropPeer(s.from);return;}
+      var p=peers[s.from];
+      if(s.kind==='offer'){
+        if(p)dropPeer(s.from);
+        p=newPeer(s.from,false);
+        p.pc.setRemoteDescription(data)
+          .then(function(){return p.pc.createAnswer();})
+          .then(function(a){return p.pc.setLocalDescription(a);})
+          .then(function(){return waitIce(p.pc,2500);})
+          .then(function(){return rtcSignal(s.from,'answer',JSON.stringify(p.pc.localDescription));})
+          .catch(function(){dropPeer(s.from);});
+      } else if(s.kind==='answer'){
+        if(p)p.pc.setRemoteDescription(data).catch(function(){});
+      } else if(s.kind==='ice'){
+        if(p&&data)p.pc.addIceCandidate(data).catch(function(){});
+      }
+    });
+  }
+  function p2pSendOne(p,item){
+    return new Promise(function(resolve,reject){
+      var dc=p.dc,CH=16384,file=item.file,off=0;
+      var HIGH=4194304;
+      try{dc.send(JSON.stringify({t:'head',name:(item.rel||file.name),size:file.size}));}
+      catch(e){reject(e);return;}
+      var reader=new FileReader();
+      reader.onerror=function(){reject(reader.error);};
+      reader.onload=function(ev){
+        try{dc.send(ev.target.result);}catch(e){reject(e);return;}
+        off+=ev.target.result.byteLength;
+        item.loaded=off; updateOverall();
+        step();
+      };
+      function step(){
+        if(dc.readyState!=='open'){reject(new Error('channel closed'));return;}
+        if(off>=file.size){
+          try{dc.send(JSON.stringify({t:'end'}));}catch(e){reject(e);return;}
+          resolve(); return;
+        }
+        if(dc.bufferedAmount>HIGH){setTimeout(step,25);return;}
+        reader.readAsArrayBuffer(file.slice(off,off+CH));
+      }
+      step();
+    });
+  }
+  function renderP2pInbox(){
+    var panel=document.getElementById('p2pPanel'),body=document.getElementById('p2pBody');
+    if(!p2pInbox.length){panel.style.display='none';return;}
+    panel.style.display='block';
+    body.innerHTML='';
+    p2pInbox.forEach(function(f){
+      var tr=document.createElement('tr');
+      tr.innerHTML='<td>'+esc(iconFor(f.name))+'</td><td>'+esc(f.name)+'</td><td>'+fmtSize(f.size)+
+                   '</td><td>'+esc(f.from)+'</td><td style="text-align:right"></td>';
+      var b=document.createElement('button');
+      b.className='btn'; b.style.padding='5px 12px'; b.style.fontSize='13px'; b.textContent='Save';
+      b.addEventListener('click',function(){
+        var u=URL.createObjectURL(f.blob);
+        var a=document.createElement('a'); a.href=u; a.download=f.name;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(function(){URL.revokeObjectURL(u);},4000);
+      });
+      tr.lastChild.appendChild(b);
+      body.appendChild(tr);
+    });
+  }
+  // \u escapes on purpose: this .ps1 has no BOM, so PS 5.1 parses it as ANSI and
+  // literal emoji would arrive at the browser mangled.
+  function iconFor(n){
+    var e=(n||'').split('.').pop().toLowerCase();
+    if(['jpg','jpeg','png','gif','bmp','webp'].indexOf(e)>=0)return '\uD83D\uDDBC';
+    if(['mp4','mkv','avi','mov','webm'].indexOf(e)>=0)return '\uD83C\uDFAC';
+    if(e==='pdf')return '\uD83D\uDCC4';
+    if(['zip','rar','7z'].indexOf(e)>=0)return '\uD83D\uDDDC';
+    return '\uD83D\uDCC1';
+  }
+
   // ---- Invite panel (link + QR) ----
   document.getElementById('inviteBtn').addEventListener('click',function(){
     var p=document.getElementById('connectPanel');
@@ -1571,8 +1852,114 @@ function Get-DashboardPage {
   });
 
   fetchState();
-  setInterval(fetchState,4000);
+  setPoll(4000);
+  renderP2pInbox();
   window.addEventListener('focus',fetchState);
+</script>
+</body></html>
+"@
+}
+
+# ============================== LOBBY PAGE ====================================
+# Shown on the HOST screen. The joining phone is not on the network yet, so the
+# dashboard's invite QR is unreachable by definition - this page carries the
+# join QR instead. Step 1 joins our AP, step 2 opens the portal.
+function Get-LobbyPage {
+    param([string]$Url)
+    $mode = $Global:Bearer.Mode
+    $ssid = $Global:Bearer.Ssid
+    $pass = $Global:Bearer.Pass
+    $hasAp = ($mode -ne 'none' -and $ssid)
+    # WIFI: payload is understood natively by iOS 11+ and Android 10+ cameras.
+    # Escape the separators WPA passphrases are allowed to contain.
+    $esc = { param($s) ($s -replace '([\\;:,"])', '\$1') }
+    $wifiPayload = if ($hasAp) { 'WIFI:T:WPA;S:{0};P:{1};H:false;;' -f (& $esc $ssid), (& $esc $pass) } else { '' }
+    $modeLabel = switch ($mode) {
+        'hotspot'    { 'Mobile Hotspot' }
+        'wifidirect' { 'Wi-Fi Direct group' }
+        default      { 'Existing Wi-Fi (no self-AP)' }
+    }
+    # Pre-build the JS string literal; nesting quotes inside the here-string is brittle.
+    $wifiJs = if ($wifiPayload) {
+        "'" + ($wifiPayload -replace '\\', '\\' -replace "'", "\'") + "'"
+    } else { 'null' }
+
+    $step1 = if ($hasAp) { @"
+      <div class="card">
+        <div class="step">Step 1</div>
+        <h2>Join this device</h2>
+        <div id="qrWifi" class="qr"></div>
+        <div class="kv"><span>Network</span><b>$([System.Web.HttpUtility]::HtmlEncode($ssid))</b></div>
+        <div class="kv"><span>Password</span><b class="mono">$([System.Web.HttpUtility]::HtmlEncode($pass))</b></div>
+        <p class="hint">Point the phone camera at the code and tap <i>Join network</i>. No internet is needed.</p>
+      </div>
+"@ } else { @"
+      <div class="card warn">
+        <div class="step">Step 1</div>
+        <h2>No self-AP running</h2>
+        <p class="hint">The portal is using a Wi-Fi network this machine was already connected to.
+        Other devices must join that same network themselves.</p>
+      </div>
+"@ }
+
+    return @"
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Local File Portal - Lobby</title>
+<style>
+:root{--bg:#0e1116;--panel:#171b22;--ink:#e6edf3;--muted:#8b949e;--acc:#2f81f7;--ok:#3fb950;--warn:#d29922}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;padding:28px}
+h1{margin:0 0 4px;font-size:26px}
+h2{margin:0 0 14px;font-size:19px}
+.sub{color:var(--muted);margin:0 0 26px}
+.grid{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start}
+.card{background:var(--panel);border:1px solid #232a34;border-radius:14px;padding:22px;flex:1 1 320px;max-width:420px}
+.card.warn{border-color:var(--warn)}
+.step{display:inline-block;font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--acc);margin-bottom:6px}
+.qr{background:#fff;padding:12px;border-radius:10px;width:212px;height:212px;display:flex;align-items:center;justify-content:center;margin-bottom:16px}
+.qr img,.qr canvas{display:block}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid #232a34}
+.kv span{color:var(--muted)}
+.mono{font-family:ui-monospace,Consolas,monospace;letter-spacing:.06em}
+.hint{color:var(--muted);font-size:14px;margin:14px 0 0}
+.url{font-family:ui-monospace,Consolas,monospace;font-size:17px;color:var(--ok);word-break:break-all;margin-bottom:14px}
+.status{margin-top:26px;color:var(--muted);font-size:14px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--ok);margin-right:7px;vertical-align:middle}
+</style></head><body>
+<h1>Local File Portal</h1>
+<p class="sub">$modeLabel &middot; this machine is the network</p>
+<div class="grid">
+$step1
+  <div class="card">
+    <div class="step">Step 2</div>
+    <h2>Open the portal</h2>
+    <div id="qrUrl" class="qr"></div>
+    <div class="url">$([System.Web.HttpUtility]::HtmlEncode($Url))</div>
+    <p class="hint">Once joined, scan this or type the address. Then enter the portal password.</p>
+  </div>
+</div>
+<div class="status"><span class="dot"></span><span id="cnt">no devices signed in yet</span></div>
+<script src="/qr.js"></script>
+<script>
+(function(){
+  function draw(id,text){
+    var el=document.getElementById(id);
+    if(!el||!text||!window.QRCode){if(el)el.style.display='none';return;}
+    try{new QRCode(el,{text:text,width:188,height:188,colorDark:'#000',colorLight:'#fff',correctLevel:QRCode.CorrectLevel.M});}
+    catch(e){el.style.display='none';}
+  }
+  draw('qrWifi',$wifiJs);
+  draw('qrUrl','$Url');
+  function tick(){
+    fetch('/api/lobby',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){
+      var n=j.online||0;
+      document.getElementById('cnt').textContent = n===0 ? 'no devices signed in yet'
+        : (n+' device'+(n===1?'':'s')+' signed in');
+    }).catch(function(){});
+  }
+  tick(); setInterval(tick,3000);
+})();
 </script>
 </body></html>
 "@
@@ -1653,6 +2040,50 @@ function Invoke-RequestRouter {
         '/qr.js' {
             $js = if ([string]::IsNullOrEmpty($Global:QrJs)) { '/* qr lib unavailable */' } else { $Global:QrJs }
             Send-Response -Stream $Stream -Status 200 -ContentType 'application/javascript; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($js))
+        }
+
+        '/lobby' {
+            # Host screen only: this page shows the Wi-Fi passphrase in clear text.
+            # The listener binds to the bearer IP, so the host browser arrives from it.
+            if ($Req.ClientIp -ne $Global:Bearer.IP) { Send-HtmlResponse -Stream $Stream -Html '<h1>404</h1>' -Status 404; return }
+            Send-HtmlResponse -Stream $Stream -Html (Get-LobbyPage -Url ("http://{0}:{1}/" -f $Global:Bearer.IP, $Global:Port))
+        }
+
+        '/api/lobby' {
+            if ($Req.ClientIp -ne $Global:Bearer.IP) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 404; return }
+            $n = 0
+            $now = Get-Date
+            foreach ($k in @($Global:Sessions.Keys)) {
+                $s = $Global:Sessions[$k]
+                if ($s -and (($now - $s.LastSeen) -lt $Global:DeviceTTL)) { $n++ }
+            }
+            Send-JsonResponse -Stream $Stream -Json ('{"ok":true,"online":' + $n + '}') -Status 200
+        }
+
+        '/rtc/signal' {
+            # WebRTC handshake relay: offer / answer / ICE only, never file bytes.
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 401; return }
+            if ($method -ne 'POST') { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 405; return }
+            if (-not $Global:P2P) { Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"p2p disabled"}' -Status 403; return }
+            $bt = [System.Text.Encoding]::UTF8.GetString($Req.Body)
+            $form = [System.Web.HttpUtility]::ParseQueryString($bt)
+            $to = $form['to']; $kind = $form['kind']; $data = $form['data']
+            if ([string]::IsNullOrWhiteSpace($to) -or [string]::IsNullOrWhiteSpace($kind)) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"bad request"}' -Status 400; return
+            }
+            if ($kind -notin @('offer','answer','ice','bye')) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"bad kind"}' -Status 400; return
+            }
+            if ($data -and $data.Length -gt 65536) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"payload too large"}' -Status 413; return
+            }
+            # Only signal between two signed-in devices.
+            if (-not $Global:PubIndex.ContainsKey($to)) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"unknown peer"}' -Status 404; return
+            }
+            Add-Signal -ToPub $to -FromPub $Global:Sessions[$sid].PubId -Kind $kind -Data $data
+            Send-JsonResponse -Stream $Stream -Json '{"ok":true}' -Status 200
         }
 
         '/api/peek' {
@@ -1809,6 +2240,193 @@ function Invoke-RequestRouter {
     }
 }
 
+# ============================== SELF-AP BEARER ===============================
+# Turns this machine into the network so clients need no router and no existing
+# Wi-Fi. Two paths, tried in order:
+#   A. Mobile Hotspot (NetworkOperatorTetheringManager) - needs a ConnectionProfile
+#   B. Wi-Fi Direct autonomous GO  - needs nothing, works with zero internet
+# Both land on 192.168.137.1/24 over "Microsoft Wi-Fi Direct Virtual Adapter",
+# whose PhysicalMediaType is "Native 802.11" - so Get-WifiInterface below finds
+# it unchanged. Verified on this hardware; neither path requires elevation.
+
+function Invoke-WinRtOp {
+    param($Op, [Type]$ResultType)
+    $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+    $t = $m.MakeGenericMethod($ResultType).Invoke($null, @($Op))
+    if (-not $t.Wait(30000)) { throw 'WinRT operation timed out' }
+    return $t.Result
+}
+
+function Invoke-WinRtAction {
+    param($Action)
+    $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and -not $_.IsGenericMethod -and
+        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+    $t = $m.Invoke($null, @($Action))
+    if (-not $t.Wait(30000)) { throw 'WinRT action timed out' }
+}
+
+function New-ApPassphrase {
+    # 10 chars, ambiguous glyphs removed so it can be read off a screen and typed
+    $cs = '23456789abcdefghjkmnpqrstuvwxyz'
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    $bytes = New-Object byte[] 10
+    $rng.GetBytes($bytes)
+    $s = ''
+    foreach ($b in $bytes) { $s += $cs[$b % $cs.Length] }
+    $rng.Dispose()
+    return $s
+}
+
+function Start-ApHotspot {
+    param([string]$Ssid, [string]$Pass)
+    $ni = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
+    $prof = $ni::GetInternetConnectionProfile()
+    if (-not $prof) {
+        # No internet (the ship case). Any profile that still owns an adapter may
+        # work; if none does, the caller falls through to Wi-Fi Direct.
+        foreach ($p in $ni::GetConnectionProfiles()) {
+            if ($p.NetworkAdapter -and $p.GetNetworkConnectivityLevel() -ne 'None') { $prof = $p; break }
+        }
+    }
+    if (-not $prof) { throw 'no usable ConnectionProfile' }
+
+    $tm  = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
+    $mgr = $tm::CreateFromConnectionProfile($prof)
+    $cfg = $mgr.GetCurrentAccessPointConfiguration()
+    $cfg.Ssid = $Ssid
+    $cfg.Passphrase = $Pass
+    Invoke-WinRtAction $mgr.ConfigureAccessPointAsync($cfg)
+    $res = Invoke-WinRtOp $mgr.StartTetheringAsync() ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+    if ("$($res.Status)" -ne 'Success') { throw ("tethering: {0} {1}" -f $res.Status, $res.AdditionalErrorMessage) }
+    $Global:ApHotspotMgr = $mgr
+    return $true
+}
+
+function Start-ApWatchdog {
+    param([string]$Ssid, [string]$Pass)
+    # Windows powers the Mobile Hotspot down after ~5 minutes with no client
+    # attached. Measured here: AP raised at T, gone by T+6min. That kills the
+    # whole point - you start the portal, walk to the other device, and the
+    # network has vanished. Disabling it permanently means writing
+    # HKLM\SYSTEM\CurrentControlSet\Services\icssvc\Settings (admin), so instead
+    # we watch and re-raise it. A bound TcpListener survives the gap, verified,
+    # so nothing needs rebinding.
+    $rs = [runspacefactory]::CreateRunspace($Host)
+    $rs.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript({
+        param($ssid, $pass, $flag)
+        [void][System.Reflection.Assembly]::LoadWithPartialName('System.Runtime.WindowsRuntime')
+        function Await2($op, [Type]$rt) {
+            $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+                $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+                $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+            $t = $m.MakeGenericMethod($rt).Invoke($null, @($op)); [void]$t.Wait(30000); $t.Result
+        }
+        function AwaitAction2($a) {
+            $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+                $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and -not $_.IsGenericMethod -and
+                $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+            $t = $m.Invoke($null, @($a)); [void]$t.Wait(30000)
+        }
+        $ni = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
+        $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
+        while (-not $flag.Stop) {
+            for ($i = 0; $i -lt 20 -and -not $flag.Stop; $i++) { Start-Sleep -Milliseconds 500 }
+            if ($flag.Stop) { break }
+            try {
+                $prof = $ni::GetInternetConnectionProfile()
+                if (-not $prof) { continue }
+                $mgr = $tm::CreateFromConnectionProfile($prof)
+                if ("$($mgr.TetheringOperationalState)" -eq 'Off') {
+                    $cfg = $mgr.GetCurrentAccessPointConfiguration()
+                    $cfg.Ssid = $ssid; $cfg.Passphrase = $pass
+                    AwaitAction2 $mgr.ConfigureAccessPointAsync($cfg)
+                    [void](Await2 $mgr.StartTetheringAsync() ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]))
+                    $flag.Restarts = [int]$flag.Restarts + 1
+                    Write-Host ("  [AP] Idle timeout hit - access point re-raised (x{0})." -f $flag.Restarts) -ForegroundColor DarkYellow
+                }
+            } catch {}
+        }
+    }).AddArgument($Ssid).AddArgument($Pass).AddArgument($Global:ApWatch)
+    [void]$ps.BeginInvoke()
+    $Global:ApWatchPs = $ps
+    $Global:ApWatchRs = $rs
+}
+
+function Start-ApWifiDirect {
+    param([string]$Ssid, [string]$Pass)
+    # Short type names only resolve once the full WinRT name has been touched.
+    $pubType  = [Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher, Windows.Devices.WiFiDirect, ContentType=WindowsRuntime]
+    $credType = [Windows.Security.Credentials.PasswordCredential, Windows.Security.Credentials, ContentType=WindowsRuntime]
+    $pub = [Activator]::CreateInstance($pubType)
+    $pub.Advertisement.IsAutonomousGroupOwnerEnabled = $true
+    $ls = $pub.Advertisement.LegacySettings
+    $ls.IsEnabled = $true
+    $ls.Ssid = $Ssid
+    $cred = [Activator]::CreateInstance($credType)
+    $cred.Password = $Pass
+    $ls.Passphrase = $cred
+    $pub.Start()
+    for ($i = 0; $i -lt 40 -and "$($pub.Status)" -eq 'Created'; $i++) { Start-Sleep -Milliseconds 250 }
+    if ("$($pub.Status)" -ne 'Started') { throw ("publisher status: {0}" -f $pub.Status) }
+    # The publisher must stay referenced or the AP drops when it is collected.
+    $Global:ApPublisher = $pub
+    return $true
+}
+
+function Start-SelfAp {
+    $ssid = '{0}-{1}' -f $Global:ApSsid, ((New-ShortId 2).ToUpperInvariant())
+    $pass = New-ApPassphrase
+    [void][System.Reflection.Assembly]::LoadWithPartialName('System.Runtime.WindowsRuntime')
+
+    Write-Host '  Raising self access point...' -ForegroundColor Cyan
+    try {
+        [void](Start-ApHotspot -Ssid $ssid -Pass $pass)
+        $Global:Bearer.Mode = 'hotspot'; $Global:Bearer.Ssid = $ssid; $Global:Bearer.Pass = $pass
+        Write-Host ('  [AP] Mobile Hotspot up: {0}' -f $ssid) -ForegroundColor Green
+        Start-ApWatchdog -Ssid $ssid -Pass $pass
+        return $true
+    } catch {
+        Write-Host ('  [AP] Hotspot path failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+    }
+    try {
+        [void](Start-ApWifiDirect -Ssid $ssid -Pass $pass)
+        $Global:Bearer.Mode = 'wifidirect'; $Global:Bearer.Ssid = $ssid; $Global:Bearer.Pass = $pass
+        Write-Host ('  [AP] Wi-Fi Direct group up: {0}' -f $ssid) -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host ('  [AP] Wi-Fi Direct path failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+    }
+    Write-Host '  [AP] No self-AP; falling back to whatever Wi-Fi is already connected.' -ForegroundColor Yellow
+    return $false
+}
+
+function Stop-SelfAp {
+    $Global:ApWatch.Stop = $true
+    if ($Global:ApWatchPs) {
+        try { $Global:ApWatchPs.Dispose() } catch {}
+        try { $Global:ApWatchRs.Close(); $Global:ApWatchRs.Dispose() } catch {}
+        $Global:ApWatchPs = $null; $Global:ApWatchRs = $null
+    }
+    if ($Global:ApHotspotMgr) {
+        try {
+            [void](Invoke-WinRtOp $Global:ApHotspotMgr.StopTetheringAsync() ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]))
+            Write-Host '  [AP] Mobile Hotspot stopped.' -ForegroundColor DarkGray
+        } catch {}
+        $Global:ApHotspotMgr = $null
+    }
+    if ($Global:ApPublisher) {
+        try { $Global:ApPublisher.Stop(); Write-Host '  [AP] Wi-Fi Direct group stopped.' -ForegroundColor DarkGray } catch {}
+        $Global:ApPublisher = $null
+    }
+    $Global:Bearer.Mode = 'none'
+}
+
 # ============================== NETWORK SETUP ================================
 function Get-WifiInterface {
     try {
@@ -1822,8 +2440,12 @@ function Get-WifiInterface {
         }
         $candidates = @()
         foreach ($a in $wifiAdapters) {
+            # AddressState matters: a freshly raised SoftAP address stays 'Tentative'
+            # for ~4s while duplicate-address detection runs, and binding a Tentative
+            # address throws "requested address is not valid in its context".
             $ips = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue |
-                   Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' }
+                   Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' -and
+                                  ($null -eq $_.AddressState -or "$($_.AddressState)" -eq 'Preferred') }
             foreach ($ip in $ips) {
                 $candidates += @{ IP = $ip.IPAddress; Prefix = $ip.PrefixLength; Name = $a.Name; Hotspot = ($ip.IPAddress -like '192.168.137.*') }
             }
@@ -1884,7 +2506,15 @@ function Show-StartupBanner {
     Write-Host '  +--------------------------------------------------------+' -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '  [Wi-Fi only] Only Wi-Fi IP allowed, LAN clients rejected.' -ForegroundColor Green
-    if ($Wifi.Hotspot) { Write-Host '  [Hotspot] Mobile Hotspot network (192.168.137.x).' -ForegroundColor Green }
+    if ($Global:Bearer.Mode -ne 'none') {
+        $label = if ($Global:Bearer.Mode -eq 'hotspot') { 'Mobile Hotspot' } else { 'Wi-Fi Direct group' }
+        Write-Host ('  [Self-AP] {0} - this machine IS the network, no router needed.' -f $label) -ForegroundColor Green
+        Write-Host ('            SSID: {0}   Password: {1}' -f $Global:Bearer.Ssid, $Global:Bearer.Pass) -ForegroundColor Magenta
+        Write-Host ('  [Lobby]   Join QR on the host screen: {0}lobby' -f $url) -ForegroundColor Green
+    } elseif ($Wifi.Hotspot) {
+        Write-Host '  [Hotspot] Mobile Hotspot network (192.168.137.x).' -ForegroundColor Green
+    }
+    if ($Global:P2P) { Write-Host '  [P2P] Direct device-to-device transfer, server relay as fallback.' -ForegroundColor Green }
     Write-Host '  [Bidirectional] Device-to-device private + public broadcast.' -ForegroundColor Green
     Write-Host '  [Invite] Dashboard "Invite" button shows link + QR code.' -ForegroundColor Green
     Write-Host '  [No admin] TcpListener. Press Ctrl+C to stop.' -ForegroundColor DarkGray
@@ -1892,15 +2522,31 @@ function Show-StartupBanner {
 }
 
 # ============================== MAIN LOOP ====================================
-$wifi = Get-WifiInterface
+# Become the network first, then look for the interface. The SoftAP surfaces as
+# "Microsoft Wi-Fi Direct Virtual Adapter" with PhysicalMediaType "Native 802.11",
+# so Get-WifiInterface picks it up and prefers its 192.168.137.1 address.
+if ($Global:SelfAp) { [void](Start-SelfAp) }
+
+# Measured on this hardware: the AP address is bindable ~4.3s after StartTethering.
+# Poll up to 15s so a slower adapter still makes it.
+$wifi = $null
+for ($try = 0; $try -lt 30; $try++) {
+    $wifi = Get-WifiInterface
+    if ($null -ne $wifi) { break }
+    if ($try -eq 0) { Write-Host '  Waiting for the AP address to settle...' -ForegroundColor DarkGray }
+    Start-Sleep -Milliseconds 500
+}
 if ($null -eq $wifi) {
+    Stop-SelfAp
     Write-Host ''
-    Write-Host '  [ERROR] No active Wi-Fi (wireless) connection found.' -ForegroundColor Red
-    Write-Host '  This portal only allows sharing over Wi-Fi.' -ForegroundColor Yellow
+    Write-Host '  [ERROR] No usable wireless interface found.' -ForegroundColor Red
+    Write-Host '  The self-AP could not start and no Wi-Fi is connected.' -ForegroundColor Yellow
     Write-Host '  Connect to a Wi-Fi network or enable Mobile Hotspot, then retry.' -ForegroundColor Yellow
     Write-Host ''
     return
 }
+$Global:Bearer.IP = $wifi.IP
+$Global:Bearer.Prefix = $wifi.Prefix
 
 # Restart-safe: load transfer records and sessions from disk
 Import-AllTransfers
@@ -1912,6 +2558,7 @@ $listener = New-Object System.Net.Sockets.TcpListener($bindAddr, $Global:Port)
 try {
     $listener.Start()
 } catch {
+    Stop-SelfAp
     Write-Host ''
     Write-Host '  [ERROR] Failed to start listener.' -ForegroundColor Red
     Write-Host "  Message: $($_.Exception.Message)" -ForegroundColor Red
@@ -1931,7 +2578,10 @@ Write-Host ''
 # browser can inherit that hidden show-window hint and never become visible.
 # -WindowStyle Normal on Start-Process overrides that. cmd's "start" and
 # rundll32's URL handler are kept as fallbacks for odd shell-association setups.
-$startUrl = "http://$($wifi.IP):$($Global:Port)/"
+# With a self-AP up, open the lobby: it carries the join QR the phone needs
+# before it can reach anything else on this machine.
+$startUrl = if ($Global:Bearer.Mode -ne 'none') { "http://$($wifi.IP):$($Global:Port)/lobby" }
+            else { "http://$($wifi.IP):$($Global:Port)/" }
 $opened = $false
 try {
     Start-Process $startUrl -WindowStyle Normal -ErrorAction Stop | Out-Null
@@ -1967,7 +2617,8 @@ $funcNames = @(
     'Send-HtmlResponse','Send-JsonResponse','Send-RedirectResponse','New-SessionCookieHeader',
     'Test-ValidSession','Resolve-TargetSid','Get-MultipartField','Save-Sessions',
     'Save-UploadedFileStream','Send-FileDownload','Send-ZipDownload','Get-StateJson',
-    'Get-LoginPage','Get-DashboardPage','Invoke-RequestRouter'
+    'Get-LoginPage','Get-DashboardPage','Get-LobbyPage','Invoke-RequestRouter',
+    'Add-Signal','Get-SignalsFor'
 )
 foreach ($fn in $funcNames) {
     $def = (Get-Command $fn -CommandType Function).Definition
@@ -1991,6 +2642,11 @@ $sharedVars = @{
     SessionFile = $Global:SessionFile
     SweepState  = $Global:SweepState
     QrJs        = $Global:QrJs
+    Signals     = $Global:Signals
+    SignalLock  = $Global:SignalLock
+    SignalTTL   = $Global:SignalTTL
+    Bearer      = $Global:Bearer
+    P2P         = $Global:P2P
 }
 foreach ($k in $sharedVars.Keys) {
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($k, $sharedVars[$k], '')))
@@ -2068,6 +2724,7 @@ try {
     try { $listener.Stop() } catch {}
     foreach ($j in $jobs) { try { $j.PS.Dispose() } catch {} }
     try { $pool.Close(); $pool.Dispose() } catch {}
+    Stop-SelfAp
     Write-Host ''
     Write-Host '  Server stopped.' -ForegroundColor Yellow
 }
@@ -2077,6 +2734,14 @@ try {
 #   powershell.exe -ExecutionPolicy Bypass -File LocalFilePortal.ps1
 #
 # FEATURES:
+#   - Self-AP: raises its own network (Mobile Hotspot, falling back to Wi-Fi
+#     Direct when there is no internet at all). No router, no admin rights.
+#     A watchdog re-raises it after Windows' ~5 min idle shutdown.
+#   - /lobby on the host screen: join QR + portal QR, because a phone that is
+#     not on the network yet cannot reach the dashboard's invite QR
+#   - P2P: files to a single target go browser-to-browser over a WebRTC
+#     DataChannel (no STUN/TURN, DTLS encrypted); the server only brokers the
+#     handshake and falls back to the HTTP relay after 8 s
 #   - Wi-Fi only (LAN denied; two checks: bind + subnet)
 #   - Connected devices listed (all signed-in clients); click-to-target send
 #   - "Everyone (Public)" card broadcasts to every device
@@ -2102,9 +2767,10 @@ try {
 #   - Metadata sidecar: $ShareFolder\.meta\<id>.json (sender, target, ...)
 #
 # CONNECTING:
-#   1. Other device must be on the SAME Wi-Fi (or Mobile Hotspot)
-#   2. Open the URL from the console banner, password: hako123
+#   1. The lobby opens on this screen: scan QR 1 to join the network we raise
+#   2. Scan QR 2 (or open the URL from the banner), password: hako123
 #   3. After login: click a device card to send, or use Public to broadcast
+#   Set $Global:SelfAp = $false to use an already-connected Wi-Fi instead.
 #
 # FIREWALL: On first request Windows may ask to allow -> tick "Private networks"
 # ==============================================================================
