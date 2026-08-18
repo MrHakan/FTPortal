@@ -27,6 +27,16 @@ $Global:SweepEvery  = [TimeSpan]::FromMinutes(2)
 $Global:SelfAp      = $true          # raise our own access point at startup
 $Global:ApSsid      = 'FTPHAKAN'     # a 4-hex suffix is appended at runtime
 $Global:ApPassphrase= ''             # generated per run; never hard-coded
+# 'wifidirect' is the default on purpose: it is a closed island (no internet is
+# shared with clients) and it never touches the machine's saved Mobile Hotspot
+# settings. 'hotspot' shares the host's internet connection by definition.
+$Global:ApPrefer    = 'wifidirect'   # 'wifidirect' | 'hotspot'
+# Own DNS + redirect unknown hosts, so the phone pops the portal by itself right
+# after joining and one QR is enough. Costs the "internet available" indicator.
+$Global:CaptivePortal = $true
+$Global:DnsPort     = 53
+# Where the machine's own hotspot SSID/passphrase is parked while we borrow it.
+$Global:ApRestoreFile = Join-Path $PSScriptRoot 'ap-restore.json'
 # --- P2P: browser-to-browser DataChannel, server only brokers the handshake ---
 $Global:P2P         = $true
 $Global:SignalTTL   = [TimeSpan]::FromSeconds(60)
@@ -39,7 +49,7 @@ $Global:SessionLock = New-Object object
 $Global:SweepState  = [hashtable]::Synchronized(@{ Last = [datetime]::MinValue })
 $Global:Signals     = [hashtable]::Synchronized(@{})   # pubId -> ArrayList of pending WebRTC signals
 $Global:SignalLock  = New-Object object
-$Global:Bearer      = [hashtable]::Synchronized(@{ Mode='none'; Ssid=''; Pass='' })
+$Global:Bearer      = [hashtable]::Synchronized(@{ Mode='none'; Ssid=''; Pass=''; Dns=$false })
 $Global:ApWatch     = [hashtable]::Synchronized(@{ Stop=$false; Restarts=0 })
 # .dat extension on purpose: transfer import scans .meta\*.json and must skip this
 $Global:SessionFile = Join-Path $Global:MetaFolder 'sessions.dat'
@@ -1884,23 +1894,40 @@ function Get-LobbyPage {
         "'" + ($wifiPayload -replace '\\', '\\' -replace "'", "\'") + "'"
     } else { 'null' }
 
+    # Only promise one QR if DNS really bound. On the hotspot path ICS holds
+    # UDP/53, so there the page must keep telling people to scan the second code.
+    $oneQr = ($hasAp -and $Global:CaptivePortal -and $Global:Bearer.Dns)
+    $stepLabel = if ($oneQr) { 'Scan this' } else { 'Step 1' }
+
     $step1 = if ($hasAp) { @"
       <div class="card">
-        <div class="step">Step 1</div>
+        <div class="step">$stepLabel</div>
         <h2>Join this device</h2>
         <div id="qrWifi" class="qr"></div>
         <div class="kv"><span>Network</span><b>$([System.Web.HttpUtility]::HtmlEncode($ssid))</b></div>
         <div class="kv"><span>Password</span><b class="mono">$([System.Web.HttpUtility]::HtmlEncode($pass))</b></div>
-        <p class="hint">Point the phone camera at the code and tap <i>Join network</i>. No internet is needed.</p>
+        <p class="hint">Point the phone camera at the code and tap <i>Join network</i>.
+        $(if ($oneQr) { 'The portal opens by itself a second later - nothing else to scan.' } else { 'No internet is needed.' })</p>
       </div>
 "@ } else { @"
       <div class="card warn">
-        <div class="step">Step 1</div>
+        <div class="step">Heads up</div>
         <h2>No self-AP running</h2>
         <p class="hint">The portal is using a Wi-Fi network this machine was already connected to.
         Other devices must join that same network themselves.</p>
       </div>
 "@ }
+
+    # Kept as a fallback card: some Android builds suppress the sign-in sheet.
+    $step2 = @"
+  <div class="card$(if ($oneQr) { ' muted' })">
+    <div class="step">$(if ($oneQr) { 'If it does not' } else { 'Step 2' })</div>
+    <h2>Open the portal</h2>
+    <div id="qrUrl" class="qr"></div>
+    <div class="url">$([System.Web.HttpUtility]::HtmlEncode($Url))</div>
+    <p class="hint">$(if ($oneQr) { 'Only needed if the portal did not pop up on its own.' } else { 'Once joined, scan this or type the address.' }) Then enter the portal password.</p>
+  </div>
+"@
 
     return @"
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -1916,6 +1943,8 @@ h2{margin:0 0 14px;font-size:19px}
 .grid{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start}
 .card{background:var(--panel);border:1px solid #232a34;border-radius:14px;padding:22px;flex:1 1 320px;max-width:420px}
 .card.warn{border-color:var(--warn)}
+.card.muted{opacity:.45;transform:scale(.94);transform-origin:top left}
+.card.muted:hover{opacity:1}
 .step{display:inline-block;font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--acc);margin-bottom:6px}
 .qr{background:#fff;padding:12px;border-radius:10px;width:212px;height:212px;display:flex;align-items:center;justify-content:center;margin-bottom:16px}
 .qr img,.qr canvas{display:block}
@@ -1931,13 +1960,7 @@ h2{margin:0 0 14px;font-size:19px}
 <p class="sub">$modeLabel &middot; this machine is the network</p>
 <div class="grid">
 $step1
-  <div class="card">
-    <div class="step">Step 2</div>
-    <h2>Open the portal</h2>
-    <div id="qrUrl" class="qr"></div>
-    <div class="url">$([System.Web.HttpUtility]::HtmlEncode($Url))</div>
-    <p class="hint">Once joined, scan this or type the address. Then enter the portal password.</p>
-  </div>
+$step2
 </div>
 <div class="status"><span class="dot"></span><span id="cnt">no devices signed in yet</span></div>
 <script src="/qr.js"></script>
@@ -1969,6 +1992,25 @@ $step1
 function Invoke-RequestRouter {
     param($Req, [System.IO.Stream]$Stream)
     $path = $Req.Path; $method = $Req.Method
+
+    # Captive-portal interception. Our DNS points every name here, so anything
+    # arriving with a Host that is not ours is an OS connectivity probe (or a
+    # stray request for some other site). Redirecting makes the phone show its
+    # "sign in to network" sheet and open the portal on its own - one QR.
+    if ($Global:CaptivePortal -and $Global:Bearer.Mode -ne 'none') {
+        $hostHdr = ''
+        if ($Req.Headers -and $Req.Headers.ContainsKey('host')) { $hostHdr = $Req.Headers['host'] }
+        $mine = @(
+            ('{0}:{1}' -f $Global:Bearer.IP, $Global:Port),
+            $Global:Bearer.IP
+        )
+        if ($hostHdr -and ($mine -notcontains $hostHdr.ToLowerInvariant())) {
+            $portal = 'http://{0}:{1}/' -f $Global:Bearer.IP, $Global:Port
+            Write-Host ("[captive] {0} -> portal" -f $hostHdr) -ForegroundColor DarkCyan
+            Send-RedirectResponse -Stream $Stream -Location $portal
+            return
+        }
+    }
 
     switch ($path) {
 
@@ -2296,6 +2338,17 @@ function Start-ApHotspot {
     $tm  = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
     $mgr = $tm::CreateFromConnectionProfile($prof)
     $cfg = $mgr.GetCurrentAccessPointConfiguration()
+
+    # ConfigureAccessPointAsync overwrites the machine's saved hotspot settings
+    # permanently - they are not scoped to our process. Park the originals on
+    # disk first so both the clean exit path and StopAccessPoint.ps1 (after a
+    # taskkill) can put them back.
+    try {
+        $orig = [pscustomobject]@{ Ssid = $cfg.Ssid; Passphrase = $cfg.Passphrase; Saved = (Get-Date).ToString('o') }
+        $orig | ConvertTo-Json | Set-Content -LiteralPath $Global:ApRestoreFile -Encoding UTF8 -Force
+        $Global:ApOriginal = $orig
+    } catch {}
+
     $cfg.Ssid = $Ssid
     $cfg.Passphrase = $Pass
     Invoke-WinRtAction $mgr.ConfigureAccessPointAsync($cfg)
@@ -2379,28 +2432,68 @@ function Start-ApWifiDirect {
     return $true
 }
 
+function Restore-ApConfig {
+    # Puts the machine's own hotspot SSID/passphrase back. Safe to call twice:
+    # the parked copy is deleted once it has been applied.
+    if (-not (Test-Path -LiteralPath $Global:ApRestoreFile)) { return $false }
+    try {
+        $orig = Get-Content -LiteralPath $Global:ApRestoreFile -Raw | ConvertFrom-Json
+        if (-not $orig -or [string]::IsNullOrEmpty($orig.Ssid)) { Remove-Item -LiteralPath $Global:ApRestoreFile -Force -ErrorAction SilentlyContinue; return $false }
+        $ni = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
+        $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
+        $prof = $ni::GetInternetConnectionProfile()
+        if (-not $prof) {
+            foreach ($p in $ni::GetConnectionProfiles()) {
+                if ($p.NetworkAdapter -and $p.GetNetworkConnectivityLevel() -ne 'None') { $prof = $p; break }
+            }
+        }
+        if (-not $prof) { return $false }
+        $mgr = $tm::CreateFromConnectionProfile($prof)
+        $cfg = $mgr.GetCurrentAccessPointConfiguration()
+        $cfg.Ssid = $orig.Ssid
+        if ($orig.Passphrase) { $cfg.Passphrase = $orig.Passphrase }
+        Invoke-WinRtAction $mgr.ConfigureAccessPointAsync($cfg)
+        Remove-Item -LiteralPath $Global:ApRestoreFile -Force -ErrorAction SilentlyContinue
+        Write-Host ('  [AP] Hotspot settings restored (SSID {0}).' -f $orig.Ssid) -ForegroundColor DarkGray
+        return $true
+    } catch {
+        Write-Host ('  [AP] Could not restore hotspot settings: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+        return $false
+    }
+}
+
 function Start-SelfAp {
     $ssid = '{0}-{1}' -f $Global:ApSsid, ((New-ShortId 2).ToUpperInvariant())
     $pass = New-ApPassphrase
     [void][System.Reflection.Assembly]::LoadWithPartialName('System.Runtime.WindowsRuntime')
 
+    # A previous run may have been killed before it could put things back.
+    [void](Restore-ApConfig)
+
+    # Wi-Fi Direct first by default: it is an island (nothing of the host's
+    # internet reaches the clients) and it leaves the saved hotspot config alone.
+    # Mobile Hotspot is the fallback because tethering *is* internet sharing.
+    $order = if ($Global:ApPrefer -eq 'hotspot') { @('hotspot','wifidirect') } else { @('wifidirect','hotspot') }
+
     Write-Host '  Raising self access point...' -ForegroundColor Cyan
-    try {
-        [void](Start-ApHotspot -Ssid $ssid -Pass $pass)
-        $Global:Bearer.Mode = 'hotspot'; $Global:Bearer.Ssid = $ssid; $Global:Bearer.Pass = $pass
-        Write-Host ('  [AP] Mobile Hotspot up: {0}' -f $ssid) -ForegroundColor Green
-        Start-ApWatchdog -Ssid $ssid -Pass $pass
-        return $true
-    } catch {
-        Write-Host ('  [AP] Hotspot path failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
-    }
-    try {
-        [void](Start-ApWifiDirect -Ssid $ssid -Pass $pass)
-        $Global:Bearer.Mode = 'wifidirect'; $Global:Bearer.Ssid = $ssid; $Global:Bearer.Pass = $pass
-        Write-Host ('  [AP] Wi-Fi Direct group up: {0}' -f $ssid) -ForegroundColor Green
-        return $true
-    } catch {
-        Write-Host ('  [AP] Wi-Fi Direct path failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+    foreach ($mode in $order) {
+        try {
+            if ($mode -eq 'wifidirect') {
+                [void](Start-ApWifiDirect -Ssid $ssid -Pass $pass)
+                $Global:Bearer.Mode = 'wifidirect'
+                Write-Host ('  [AP] Wi-Fi Direct group up: {0} (no internet shared)' -f $ssid) -ForegroundColor Green
+            } else {
+                [void](Start-ApHotspot -Ssid $ssid -Pass $pass)
+                $Global:Bearer.Mode = 'hotspot'
+                Write-Host ('  [AP] Mobile Hotspot up: {0}' -f $ssid) -ForegroundColor Green
+                Write-Host '  [AP] Note: tethering shares this machine internet connection.' -ForegroundColor DarkYellow
+                Start-ApWatchdog -Ssid $ssid -Pass $pass
+            }
+            $Global:Bearer.Ssid = $ssid; $Global:Bearer.Pass = $pass
+            return $true
+        } catch {
+            Write-Host ('  [AP] {0} path failed: {1}' -f $mode, $_.Exception.Message) -ForegroundColor Yellow
+        }
     }
     Write-Host '  [AP] No self-AP; falling back to whatever Wi-Fi is already connected.' -ForegroundColor Yellow
     return $false
@@ -2424,7 +2517,130 @@ function Stop-SelfAp {
         try { $Global:ApPublisher.Stop(); Write-Host '  [AP] Wi-Fi Direct group stopped.' -ForegroundColor DarkGray } catch {}
         $Global:ApPublisher = $null
     }
+    [void](Restore-ApConfig)
     $Global:Bearer.Mode = 'none'
+    $Global:Bearer.Ssid = ''
+    $Global:Bearer.Pass = ''
+}
+
+# ============================== CAPTIVE PORTAL ===============================
+# One QR instead of two. A phone that has just joined probes a known URL to see
+# whether it really has internet:
+#   Android  http://connectivitycheck.gstatic.com/generate_204   (wants 204)
+#   iOS      http://captive.apple.com/hotspot-detect.html        (wants "Success")
+#   Windows  http://www.msftconnecttest.com/connecttest.txt
+# We resolve every name to ourselves and answer those probes with a redirect,
+# so the OS decides it is behind a sign-in page and opens the portal by itself.
+#
+# Measured: UDP/53 is free on 192.168.137.1 with the AP up (ICS does not take
+# it), and binding a port below 1024 needs no elevation on Windows.
+#
+# The trade-off is deliberate: the phone will show "no internet" on this
+# network, because from its point of view that is exactly the truth.
+
+# Implemented in C# with a raw Socket, for a measured reason: UdpClient.Receive
+# does not fill in the "ref IPEndPoint" that names the sender - it stays
+# 0.0.0.0:0, and every reply then fails with "requested address is not valid in
+# its context". Verified in C# as well as PowerShell, so it is the API, not the
+# host. Socket.ReceiveFrom reports the sender correctly. C# also owns its own
+# thread here, so no extra runspace is needed.
+if (-not ('LFP.CaptiveDns' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace LFP {
+    public static class CaptiveDns {
+        static Socket _sock;
+        static Thread _thread;
+        static volatile bool _stop;
+        public static long Answered = 0;
+
+        public static bool Start(string ip, int port) {
+            IPAddress addr = IPAddress.Parse(ip);
+            try {
+                _sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                _sock.ReceiveTimeout = 1000;
+                _sock.Bind(new IPEndPoint(addr, port));
+            } catch { return false; }
+            _stop = false;
+            byte[] rdata = addr.GetAddressBytes();
+            _thread = new Thread(delegate() { Loop(rdata); });
+            _thread.IsBackground = true;
+            _thread.Start();
+            return true;
+        }
+
+        public static void Stop() {
+            _stop = true;
+            try { if (_sock != null) _sock.Close(); } catch {}
+        }
+
+        static void Loop(byte[] rdata) {
+            byte[] buf = new byte[512];
+            while (!_stop) {
+                EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                int n;
+                try { n = _sock.ReceiveFrom(buf, ref from); }
+                catch (SocketException) { continue; }   // 1s timeout re-checks _stop
+                catch { break; }                        // socket closed on shutdown
+                if (n < 12) continue;
+                byte[] q = new byte[n];
+                Array.Copy(buf, q, n);
+                try {
+                    // Walk the QNAME labels to find where the question ends.
+                    int qEnd = 12;
+                    while (qEnd < q.Length && q[qEnd] != 0) qEnd += q[qEnd] + 1;
+                    qEnd++;        // root label
+                    qEnd += 4;     // QTYPE + QCLASS
+                    if (qEnd > q.Length) continue;
+                    int qtype = (q[qEnd - 4] << 8) | q[qEnd - 3];
+                    bool isA = (qtype == 1);
+
+                    // A -> point at us. Anything else (AAAA especially) -> empty
+                    // NOERROR, so the client drops to IPv4 without waiting.
+                    byte[] r = new byte[qEnd + (isA ? 16 : 0)];
+                    r[0] = q[0]; r[1] = q[1];              // transaction id
+                    r[2] = 0x85; r[3] = 0x80;              // response, authoritative, RA
+                    r[4] = 0; r[5] = 1;                    // QDCOUNT
+                    r[6] = 0; r[7] = (byte)(isA ? 1 : 0);  // ANCOUNT
+                    r[8] = 0; r[9] = 0;                    // NSCOUNT
+                    r[10] = 0; r[11] = 0;                  // ARCOUNT
+                    Array.Copy(q, 12, r, 12, qEnd - 12);   // echo the question
+                    if (isA) {
+                        int o = qEnd;
+                        r[o++] = 0xC0; r[o++] = 0x0C;      // name: pointer to offset 12
+                        r[o++] = 0; r[o++] = 1;            // TYPE A
+                        r[o++] = 0; r[o++] = 1;            // CLASS IN
+                        r[o++] = 0; r[o++] = 0; r[o++] = 0; r[o++] = 30;   // TTL
+                        r[o++] = 0; r[o++] = 4;            // RDLENGTH
+                        r[o++] = rdata[0]; r[o++] = rdata[1]; r[o++] = rdata[2]; r[o++] = rdata[3];
+                    }
+                    _sock.SendTo(r, from);
+                    Answered++;
+                } catch {}
+            }
+            try { _sock.Close(); } catch {}
+        }
+    }
+}
+'@
+}
+
+function Start-CaptiveDns {
+    param([string]$Ip, [int]$Port)
+    if ([LFP.CaptiveDns]::Start($Ip, $Port)) {
+        Write-Host ('  [DNS] Answering every lookup with {0} (captive portal).' -f $Ip) -ForegroundColor Green
+        return $true
+    }
+    Write-Host ('  [DNS] Could not bind {0}:{1} - captive portal off, two QRs needed.' -f $Ip, $Port) -ForegroundColor Yellow
+    return $false
+}
+
+function Stop-CaptiveDns {
+    try { [LFP.CaptiveDns]::Stop() } catch {}
 }
 
 # ============================== NETWORK SETUP ================================
@@ -2547,6 +2763,12 @@ if ($null -eq $wifi) {
 }
 $Global:Bearer.IP = $wifi.IP
 $Global:Bearer.Prefix = $wifi.Prefix
+# Whether DNS actually bound decides what the lobby promises. On the hotspot
+# path ICS already owns UDP/53, so the one-QR flow is not available there.
+$Global:Bearer.Dns = $false
+if ($Global:CaptivePortal -and $Global:Bearer.Mode -ne 'none') {
+    $Global:Bearer.Dns = [bool](Start-CaptiveDns -Ip $wifi.IP -Port $Global:DnsPort)
+}
 
 # Restart-safe: load transfer records and sessions from disk
 Import-AllTransfers
@@ -2558,6 +2780,7 @@ $listener = New-Object System.Net.Sockets.TcpListener($bindAddr, $Global:Port)
 try {
     $listener.Start()
 } catch {
+    Stop-CaptiveDns
     Stop-SelfAp
     Write-Host ''
     Write-Host '  [ERROR] Failed to start listener.' -ForegroundColor Red
@@ -2647,6 +2870,9 @@ $sharedVars = @{
     SignalTTL   = $Global:SignalTTL
     Bearer      = $Global:Bearer
     P2P         = $Global:P2P
+    # Needed by both the router's probe interception and Get-LobbyPage; without
+    # it the workers see $null and silently fall back to the two-QR flow.
+    CaptivePortal = $Global:CaptivePortal
 }
 foreach ($k in $sharedVars.Keys) {
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($k, $sharedVars[$k], '')))
@@ -2724,6 +2950,7 @@ try {
     try { $listener.Stop() } catch {}
     foreach ($j in $jobs) { try { $j.PS.Dispose() } catch {} }
     try { $pool.Close(); $pool.Dispose() } catch {}
+    Stop-CaptiveDns
     Stop-SelfAp
     Write-Host ''
     Write-Host '  Server stopped.' -ForegroundColor Yellow

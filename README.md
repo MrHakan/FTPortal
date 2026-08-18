@@ -21,30 +21,61 @@ powershell.exe -ExecutionPolicy Bypass -File LocalFilePortal.ps1
 ```
 
 1. The portal raises its own Wi-Fi network and opens the **Lobby** page on the host screen.
-2. On the phone: scan **QR 1** to join the network, then **QR 2** to open the portal.
+2. On the phone: scan the QR, tap *Join network*. The portal opens by itself.
    No router, no internet, no existing Wi-Fi involved.
 3. Sign in with the password (default `hako123`), pick a device name, transfer away.
 
 The SSID is `FTPHAKAN-XXXX` and the passphrase is regenerated on every run — both are shown
-in the console banner and on the Lobby page.
+in the console banner and on the Lobby page, and both are gone when the portal stops.
 
 ## Bearers
 
 The host becomes the network. Tried in order at startup:
 
-| # | Bearer | Needs | Notes |
+| # | Bearer | Shares internet? | Notes |
 |---|---|---|---|
-| A | Mobile Hotspot (`NetworkOperatorTetheringManager`) | a connection profile | Preferred. Windows supplies DHCP + DNS. Max 8 clients. |
-| B | Wi-Fi Direct autonomous GO | nothing | Fallback when there is **no internet at all**. Phones see a normal WPA2 network. |
-| — | An already-connected Wi-Fi | — | Used if both fail, or set `$Global:SelfAp = $false`. |
+| **A** | **Wi-Fi Direct autonomous GO** | **No** | Default. A closed island: clients get an address but no route out. Needs no connection profile, so it works with nothing plugged in. Leaves the machine's hotspot settings untouched. |
+| B | Mobile Hotspot (`NetworkOperatorTetheringManager`) | **Yes** | Fallback. Tethering *is* internet sharing — that is what the API does. Also borrows the saved hotspot SSID (see below). |
+| — | An already-connected Wi-Fi | n/a | Used if both fail, or set `$Global:SelfAp = $false`. |
 
-Both self-AP paths land on `192.168.137.1/24` and **neither needs admin rights**.
+Both self-AP paths land on `192.168.137.1/24`, get DHCP from ICS, and **neither needs admin
+rights**. Swap the order with `$Global:ApPrefer = 'hotspot'`.
 
-> **Idle timeout.** Windows powers the Mobile Hotspot down after ~5 minutes with no client
-> attached — measured, not theoretical. The portal runs a watchdog that re-raises it, and a
-> bound listener survives the gap, so you can start the portal and walk to the other device.
-> To remove the timeout at the source instead, set `PeerlessTimeoutEnabled` to `0` under
+Measured with Wi-Fi Direct up: DHCP is served on `192.168.137.1:67`, but the AP interface has
+`Forwarding: Disabled` and tethering stays `Off` — addresses are handed out, nothing is routed.
+
+> **Your hotspot settings are borrowed, then given back.** `ConfigureAccessPointAsync`
+> overwrites the machine's saved Mobile Hotspot SSID and passphrase permanently — the change
+> is not scoped to our process. If path B is used, the originals are parked in
+> `ap-restore.json` and put back on exit, including after `StopPortal.vbs` kills the process.
+> Path A never touches them at all.
+
+> **Idle timeout (path B only).** Windows powers the Mobile Hotspot down after exactly
+> 5 minutes with no client attached — measured, not theoretical. A watchdog re-raises it and a
+> bound listener survives the gap. Wi-Fi Direct showed no such timeout. To remove it at the
+> source, set `PeerlessTimeoutEnabled` to `0` under
 > `HKLM\SYSTEM\CurrentControlSet\Services\icssvc\Settings` — that one *does* need admin.
+
+## One QR
+
+With `$Global:CaptivePortal = $true` (the default) the portal answers **every** DNS lookup with
+its own address and redirects any request whose `Host` is not ours. That is exactly what an OS
+connectivity probe does after joining a network:
+
+| OS | Probe | Wants |
+|---|---|---|
+| Android | `connectivitycheck.gstatic.com/generate_204` | `204` |
+| iOS | `captive.apple.com/hotspot-detect.html` | body containing `Success` |
+| Windows | `www.msftconnecttest.com/connecttest.txt` | `Microsoft Connect Test` |
+
+They get a redirect instead, conclude they are behind a sign-in page, and **open the portal by
+themselves**. So the Lobby shows one QR: scan, join, done. The second QR stays on the page,
+dimmed, for the odd build that suppresses the sign-in sheet.
+
+The trade-off is deliberate: the phone will report *no internet* on this network, which from
+its point of view is the truth. Binding UDP/53 needs no elevation on Windows, and ICS was
+measured not to hold that port on either bearer. If the bind does fail, the portal says so on
+startup and the Lobby keeps showing both QRs rather than promising something it cannot do.
 
 ## Features
 
@@ -89,7 +120,9 @@ Edit the settings block at the top of `LocalFilePortal.ps1`:
 | `$Global:MaxThreads` | `32` | Concurrent request workers |
 | `$Global:DeviceTTL` | 5 min | How recently a device must be seen to count as *online* |
 | `$Global:SelfAp` | `$true` | Raise our own access point at startup |
+| `$Global:ApPrefer` | `wifidirect` | Bearer order; `hotspot` to prefer tethering instead |
 | `$Global:ApSsid` | `FTPHAKAN` | SSID prefix; a 4-hex suffix is appended per run |
+| `$Global:CaptivePortal` | `$true` | Own DNS + redirect, so one QR is enough |
 | `$Global:P2P` | `$true` | Offer the direct browser-to-browser path |
 
 ## HTTP endpoints

@@ -94,12 +94,24 @@ kabul edilebilir, dosya transferi için değil. Otomatikleştirilmez, sadece dok
 
 ### Seçim mantığı
 
+**v2'de sıra ters çevrildi: artık B (Wi-Fi Direct) birincil.** Gerekçe ölçümle netleşti:
+
+- **Tethering tanımı gereği internet paylaşımıdır.** `NetworkOperatorTetheringManager` bir
+  `ConnectionProfile` alıp onu paylaşır; "paylaşmadan tethering" diye bir mod yok.
+- **WFD ise kapalı ada.** Ölçüm: WFD ayaktayken `UDP/67`'de DHCP dağıtılıyor
+  (ICS, scope `192.168.137.1`) ama AP arayüzünde `Forwarding: Disabled` ve
+  `TetheringOperationalState: Off`. Yani adres var, çıkış yolu yok.
+- **WFD kayıtlı hotspot ayarlarına dokunmuyor.** A yolu `ConfigureAccessPointAsync` ile
+  makinenin kayıtlı SSID/parolasını **kalıcı olarak** eziyor (bkz. §8-c).
+- **WFD'de boşta-kapanma yok.** Ölçüm: 8 dakika kesintisiz ayakta; A yolu 5. dakikada düşüyor.
+
 ```
 Start-Bearer:
-  1. Self-AP istendiyse:  A dene -> olmazsa B dene
+  1. Self-AP istendiyse: $ApPrefer sırasıyla dene (varsayılan: wifidirect -> hotspot)
+     - hotspot seçilirse: kayıtlı SSID/parola ap-restore.json'a park edilir
   2. Zaten bağlı Wi-Fi (STA) varsa: mevcut v2 davranışı
   3. Hiçbiri yoksa: hata + kullanıcıya C/D talimatı
-Stop-Portal:  AP'yi de kapat (StopPortal.vbs genişletilecek)
+Stop-Portal: AP'yi kapat, DNS'i kapat, kayıtlı hotspot ayarlarını geri yükle
 ```
 
 ---
@@ -126,15 +138,25 @@ Offline çalışır, uygulama gerekmez.
 http://192.168.137.1:8080/
 ```
 
-### QR #2'yi yok etme: captive portal (opsiyonel, feature-flag'li)
+### QR #2'yi yok etme: captive portal — **uygulandı**
 Android `http://connectivitycheck.gstatic.com/generate_204`, iOS
 `http://captive.apple.com/hotspot-detect.html` yoklar. Bu yoklamayı yakalayıp portala
-yönlendirirsek telefon **kendiliğinden** portalı açar — tek QR yeter.
+yönlendirince telefon **kendiliğinden** portalı açıyor — tek QR yetiyor.
 
-Bunun için `192.168.137.1:53`'te DNS'e sahip olmak gerekir. Yoklama anında UDP/53 boştu, **ama
-hotspot açıkken ICS kendi DNS proxy'sini oraya bağlıyor** — çakışma ihtimali yüksek.
-Bu yüzden captive portal **bağımlılık değil, iyileştirme** olarak tasarlanır; tutmazsa iki-QR
-akışı sorunsuz devam eder.
+Endişe ICS'in `192.168.137.1:53`'ü tutmasıydı. **Ölçüldü: tutmuyor** — her iki bearer'da da
+UDP/53 boş ve bind ediliyor; Windows'ta 1024 altı port bağlamak yükseltilmiş yetki de
+istemiyor. Bu yüzden captive portal artık varsayılan.
+
+(Test sırasında bir kez "bind edilemedi" görüldü ve ICS sanıldı; sebep aslında aynı anda
+çalışan ikinci bir portal örneğiydi. Yine de bind başarısız olursa lobby iki QR'a geri
+dönüyor — söz verip tutamamaktansa.)
+
+Uygulama: kendi DNS yanıtlayıcımız her A sorgusuna `192.168.137.1` dönüyor, HTTP tarafında
+`Host` başlığı bize ait olmayan her istek portala 302'leniyor.
+
+**Bilinçli takas:** telefon bu ağda "internet yok" gösterecek — ki kendi açısından bu doğru.
+Faz 1'in diğer yarısı (`generate_204`'e gerçekten 204 dönüp Android'i ağda tutmak) bunun
+tam tersini gerektiriyor; ikisi aynı anda olamaz. Tek QR hızı seçildi.
 
 ### Gemide asıl önemli olan yan etki
 İnternet olmayan bir AP'de Android "İnternet yok" der ve **mobil veriye geri düşüp AP'yi
@@ -253,6 +275,16 @@ gerektiriyor — aracın "admin yok" ilkesine aykırı.
 görürse yeniden kaldırıyor. Ölçüm: 20:42:47'de geri geldi (6 sn).
 Ayrıca test edildi — **bağlı `TcpListener` bu boşluktan sağ çıkıyor**, yeniden bind gerekmiyor.
 
+**c) Tethering makinenin kayıtlı hotspot ayarlarını kalıcı olarak eziyor.**
+`ConfigureAccessPointAsync` süreç kapsamlı değil — sistem ayarını değiştiriyor. Ölçüm:
+başlangıçta SSID `000` idi, portal çalıştıktan sonra `FTPHAKAN-90E3` olarak kalmıştı.
+Çözüm: A yolu kullanılırsa orijinaller `ap-restore.json`'a park ediliyor, hem temiz çıkışta
+hem de `taskkill /F` sonrası `StopAccessPoint.ps1` tarafından geri yükleniyor.
+Asıl çözüm ise B yolunu birincil yapmak: WFD bu ayarlara hiç dokunmuyor.
+
+**d) WFD'de boşta-kapanma yok.** Ölçüm: 8 dakika kesintisiz `Started` ve `192.168.137.1`
+ayakta. Watchdog yalnızca A yolu için gerekli.
+
 ### Hâlâ açık kalanlar
 
 - **İki telefon birbirini görüyor mu (client isolation)?** İki gerçek cihaz gerektiriyor, test edilmedi. İzolasyon varsa P2P istemci↔istemci yolu düşer, relay çalışmaya devam eder.
@@ -267,13 +299,15 @@ Ayrıca test edildi — **bağlı `TcpListener` bu boşluktan sağ çıkıyor**,
 | Faz | İçerik | Kazanç | Risk |
 |---|---|---|---|
 | **0** ✅ | Self-AP (A→B) + `/lobby` çift QR | **"Wi-Fi gerektirmez" şartı burada tamamen karşılanır.** Transfer mevcut relay ile çalışır. | Düşük — üst katmanlara dokunulmaz |
-| **1** ⬜ | Captive portal: otomatik açılış + `204` ile Android'i ağda tutma | Tek QR; Android'in AP'yi bırakması engellenir | Orta — ICS DNS çakışması |
+| **1** ✅ | Captive portal: otomatik açılış (tek QR) | Katılma tek adıma indi | ICS DNS çakışması ölçüldü — yok |
 | **2** ✅ | WebRTC P2P veri düzlemi + relay'e düşme | Sunucu diski yazılmaz, çift atlama yok | Orta — mDNS / izolasyon |
 | **3** ⬜ | BT-PAN acil taşıyıcı, USB tether dokümantasyonu | Wi-Fi radyosu tamamen kapalıyken çalışır | Düşük — manuel |
 
-Faz 0 ve 2 uygulandı. Faz 1 bilinçli olarak ertelendi: kazancının çoğu (Android'i internetsiz
-AP'de tutmak) ICS'in UDP/53'ü bırakmasına bağlı ve bu doğrulanmadı; bağımlılık hâline
-getirilmesi çalışan bir sistemi kırılgan yapardı.
+Faz 0, 1 ve 2 uygulandı. Faz 1'in yalnızca yarısı hayata geçti: otomatik açılış (tek QR) var,
+`204` ile Android'i "internet var" sanmaya ikna etme yok — ikisi birbirini dışlıyor, çünkü
+biri probe'a yönlendirme, diğeri 204 dönmeyi gerektiriyor. Hız tercih edildi.
+
+Faz 3 (BT-PAN / USB) hâlâ açık ve manuel.
 
 **Faz 0 tek başına talebi karşılar.** P2P (Faz 2) bir optimizasyondur, ön şart değil — bu ayrım
 bilinçli: "router'sız çalışsın" ile "baytlar doğrudan aksın" bağımsız iki hedeftir ve
