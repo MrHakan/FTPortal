@@ -21,9 +21,11 @@ powershell.exe -ExecutionPolicy Bypass -File LocalFilePortal.ps1
 ```
 
 1. The portal raises its own Wi-Fi network and opens the **Lobby** page on the host screen.
-2. On the phone: scan the QR, tap *Join network*. The portal opens by itself.
-   No router, no internet, no existing Wi-Fi involved.
-3. Sign in with the password (default `hako123`), pick a device name, transfer away.
+2. On the phone: scan the QR, tap *Join network*. No router, no internet, no existing Wi-Fi.
+3. The portal opens by itself, already signed in. Transfer away.
+
+One scan, no typing. If auto sign-in is off or the phone lands on the login page anyway, the
+shared password is `hako123`.
 
 The SSID is `FTPHAKAN-XXXX` and the passphrase is regenerated on every run — both are shown
 in the console banner and on the Lobby page, and both are gone when the portal stops.
@@ -36,10 +38,19 @@ The host becomes the network. Tried in order at startup:
 |---|---|---|---|
 | **A** | **Wi-Fi Direct autonomous GO** | **No** | Default. A closed island: clients get an address but no route out. Needs no connection profile, so it works with nothing plugged in. Leaves the machine's hotspot settings untouched. |
 | B | Mobile Hotspot (`NetworkOperatorTetheringManager`) | **Yes** | Fallback. Tethering *is* internet sharing — that is what the API does. Also borrows the saved hotspot SSID (see below). |
-| — | An already-connected Wi-Fi | n/a | Used if both fail, or set `$Global:SelfAp = $false`. |
+| C | **Station mode** — join a network we already know | n/a | Last resort, for adapters that cannot be an AP at all. Instead of giving up, the portal joins a saved network that is in range (a phone's hotspot, the ship Wi-Fi) and serves from there. |
+| — | An already-connected Wi-Fi | n/a | Used if all three fail, or set `$Global:SelfAp = $false`. |
 
 Both self-AP paths land on `192.168.137.1/24`, get DHCP from ICS, and **neither needs admin
 rights**. Swap the order with `$Global:ApPrefer = 'hotspot'`.
+
+Station mode (C) uses `netsh wlan connect` against an already-saved profile, which also needs
+no elevation — the WinRT `Windows.Devices.WiFi` route was avoided because it demands a
+location-capability consent prompt a background script cannot answer. Name preferred networks
+with `$Global:StationPrefer = @('MT ADVANTAGE','my-phone')`; otherwise any saved profile in
+range is tried. On someone else's network the portal is a guest, so the captive portal and
+auto sign-in both switch themselves off — hijacking DNS there would break every other device
+on that network, and handing out free sessions would expose the portal to strangers.
 
 Measured with Wi-Fi Direct up: DHCP is served on `192.168.137.1:67`, but the AP interface has
 `Forwarding: Disabled` and tethering stays `Off` — addresses are handed out, nothing is routed.
@@ -71,6 +82,16 @@ connectivity probe does after joining a network:
 They get a redirect instead, conclude they are behind a sign-in page, and **open the portal by
 themselves**. So the Lobby shows one QR: scan, join, done. The second QR stays on the page,
 dimmed, for the odd build that suppresses the sign-in sheet.
+
+Two things make that one scan land you *inside* the portal rather than on a password box:
+
+- The redirect carries a **per-run sign-in key** (`?k=…`), so the phone arrives already signed
+  in. It is only ever issued on a network the portal raised itself, where the random WPA2
+  passphrase already gated entry — never in station mode. Turn it off with
+  `$Global:AutoLogin = $false` and the shared password comes back.
+- The portal prefers **port 80**, so the address is `http://192.168.137.1/` with no `:8080`.
+  A shorter string is a lower-density QR, which phone cameras lock onto faster. If something
+  else already owns port 80 it falls back to 8080 and says so.
 
 The trade-off is deliberate: the phone will report *no internet* on this network, which from
 its point of view is the truth. Binding UDP/53 needs no elevation on Windows, and ICS was
@@ -115,12 +136,16 @@ Edit the settings block at the top of `LocalFilePortal.ps1`:
 | Variable | Default | Meaning |
 |---|---|---|
 | `$Global:Password` | `hako123` | Shared sign-in password |
-| `$Global:Port` | `8080` | TCP port (>1024 needs no admin) |
+| `$Global:Port` | `80` | Preferred TCP port; needs no admin on Windows |
+| `$Global:PortFallback` | `8080` | Used when something already owns port 80 |
 | `$Global:ShareFolder` | `C:\SharedTransfer` | Where uploaded files are stored |
 | `$Global:MaxThreads` | `32` | Concurrent request workers |
 | `$Global:DeviceTTL` | 5 min | How recently a device must be seen to count as *online* |
 | `$Global:SelfAp` | `$true` | Raise our own access point at startup |
 | `$Global:ApPrefer` | `wifidirect` | Bearer order; `hotspot` to prefer tethering instead |
+| `$Global:StationFallback` | `$true` | Join a known network when no AP path works |
+| `$Global:StationPrefer` | `@()` | SSIDs to try first in station mode |
+| `$Global:AutoLogin` | `$true` | One-scan sign-in on our own network |
 | `$Global:ApSsid` | `FTPHAKAN` | SSID prefix; a 4-hex suffix is appended per run |
 | `$Global:CaptivePortal` | `$true` | Own DNS + redirect, so one QR is enough |
 | `$Global:P2P` | `$true` | Offer the direct browser-to-browser path |

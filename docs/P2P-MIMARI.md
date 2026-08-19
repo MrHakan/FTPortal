@@ -16,7 +16,10 @@ oturum modeli, bundle/ZIP mantığı aynen korunur.
 | Okuma | Anlamı | Bu mimarideki karşılığı |
 |---|---|---|
 | **A** (varsayılan) | Hazır bir Wi-Fi **ağına** / router'a gerek yok. Sunucu cihazı kendi ağını yayınlar. | **L0-A / L0-B** — birincil tasarım |
-| **B** (uç durum) | Wi-Fi **radyosu** hiç kullanılmayacak. | **L0-C / L0-D** — USB tether ve Bluetooth PAN, dokümante edilmiş yedek |
+| **B** (uç durum) | Wi-Fi **radyosu** hiç kullanılmayacak. | **L0-D / L0-E** — USB tether ve Bluetooth PAN, dokümante edilmiş yedek |
+
+Adaptör AP olamıyorsa üçüncü bir yol var: **L0-C**, mevcut bir ağa istemci olarak katılmak.
+O durumda "kendi ağını kur" hedefinden vazgeçilir ama transfer çalışmaya devam eder.
 
 Pratikte istenen A'dır: telefon hâlâ Wi-Fi radyosunu kullanır ama bağlandığı ağ **dizüstünün
 kendisidir**; altyapı, internet, kablo, router yoktur. Gemide çalışacak senaryo budur.
@@ -84,11 +87,35 @@ desteklemeleri gerekmez. Host yine `192.168.137.1` alır.
   `169.254.x.x` alır ve portal görünmez → o durumda QR'a sabit IP talimatı eklenir ya da
   A yoluna geri dönülür.
 
-### C. USB tethering (RNDIS) — manuel katman
+### C. İstasyon modu — bildiğimiz bir ağa katıl (ÜÇÜNCÜ YOL)
+
+A ve B, adaptörün **AP olabilmesini** varsayar. Olamıyorsa (eski sürücü, WFD desteği yok,
+radyo başka işte) ikisi de düşer ve eskiden iş orada biterdi. Artık portal ağ olmayı bırakıp
+makinenin **zaten kayıtlı olduğu** bir ağa katılıyor: telefonun hotspot'u, gemi Wi-Fi'si,
+taşınabilir router. Üst katmanlar yine değişmiyor — portal kendisine verilen adrese bağlanıyor.
+
+```powershell
+netsh wlan show profiles    # kayıtlı olanlar
+netsh wlan show networks    # şu an menzilde olanlar
+netsh wlan connect name="<SSID>"
+```
+
+`netsh` tercih edildi çünkü WinRT `Windows.Devices.WiFi` konum izni onayı istiyor ve arka
+planda çalışan bir script bunu geçemiyor; `netsh connect` ise kayıtlı profile karşı
+yükseltilmiş yetki istemiyor.
+
+**Ölçüm:** 10 kayıtlı profil, 2'si menzilde, 1 aday; bağlandı ve `192.168.115.2/24` aldı.
+
+**Kritik fark: burada misafiriz.** Bu yüzden istasyon modunda captive portal ve otomatik
+oturum **kendiliğinden kapanıyor**:
+- Başkasının ağında her DNS sorgusunu kendimize yönlendirmek o ağdaki diğer tüm cihazları bozardı.
+- Bedava oturum dağıtmak portalı o ağdaki yabancılara açardı.
+
+### D. USB tethering (RNDIS) — manuel katman
 Telefonu kabloyla bağlayıp USB tethering açmak PC'ye yeni bir subnet verir. PC tarafından
 script'lenemez, kullanıcı hareketi ister. Wi-Fi radyosu kapalıyken tek hızlı yol budur.
 
-### D. Bluetooth PAN — acil durum
+### E. Bluetooth PAN — acil durum
 Bu makinede adaptör var ama link hızı **3 Mbps** (~0.3 MB/s gerçek). Not ve küçük PDF için
 kabul edilebilir, dosya transferi için değil. Otomatikleştirilmez, sadece dokümante edilir.
 
@@ -109,8 +136,10 @@ kabul edilebilir, dosya transferi için değil. Otomatikleştirilmez, sadece dok
 Start-Bearer:
   1. Self-AP istendiyse: $ApPrefer sırasıyla dene (varsayılan: wifidirect -> hotspot)
      - hotspot seçilirse: kayıtlı SSID/parola ap-restore.json'a park edilir
-  2. Zaten bağlı Wi-Fi (STA) varsa: mevcut v2 davranışı
-  3. Hiçbiri yoksa: hata + kullanıcıya C/D talimatı
+  2. İkisi de olmadıysa: C (istasyon modu) - kayıtlı ve menzilde bir ağa katıl
+     - burada misafiriz: captive portal ve otomatik oturum kapanır
+  3. Zaten bağlı Wi-Fi (STA) varsa: mevcut v2 davranışı
+  4. Hiçbiri yoksa: hata + kullanıcıya D/E talimatı
 Stop-Portal: AP'yi kapat, DNS'i kapat, kayıtlı hotspot ayarlarını geri yükle
 ```
 

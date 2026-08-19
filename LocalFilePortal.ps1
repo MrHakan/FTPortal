@@ -14,7 +14,11 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyCon
 
 # ============================== SETTINGS ======================================
 $Global:Password    = 'hako123'
-$Global:Port        = 8080
+# Port 80 needs no elevation on Windows and keeps the URL free of a ":port"
+# suffix - a shorter string makes a lower-density QR, which phones lock onto
+# faster. Falls back automatically if something already owns 80.
+$Global:Port        = 80
+$Global:PortFallback= 8080
 $Global:ShareFolder = 'C:\SharedTransfer'
 $Global:MetaFolder  = Join-Path $Global:ShareFolder '.meta'
 $Global:CookieName  = 'LDSID'
@@ -31,6 +35,12 @@ $Global:ApPassphrase= ''             # generated per run; never hard-coded
 # shared with clients) and it never touches the machine's saved Mobile Hotspot
 # settings. 'hotspot' shares the host's internet connection by definition.
 $Global:ApPrefer    = 'wifidirect'   # 'wifidirect' | 'hotspot'
+# Third bearer, used when neither AP path works (adapter without AP/Wi-Fi Direct
+# support, radio already busy). Instead of giving up, join a network this
+# machine already knows - a phone's hotspot, the ship Wi-Fi - and serve from
+# there. We are a guest on that network, so the captive portal stays off.
+$Global:StationFallback = $true
+$Global:StationPrefer   = @()        # SSIDs to try first, in order; empty = any saved profile in range
 # Own DNS + redirect unknown hosts, so the phone pops the portal by itself right
 # after joining and one QR is enough. Costs the "internet available" indicator.
 $Global:CaptivePortal = $true
@@ -40,6 +50,11 @@ $Global:ApRestoreFile = Join-Path $PSScriptRoot 'ap-restore.json'
 # --- P2P: browser-to-browser DataChannel, server only brokers the handshake ---
 $Global:P2P         = $true
 $Global:SignalTTL   = [TimeSpan]::FromSeconds(60)
+# Hand the phone a signed-in session straight from the captive redirect, so one
+# scan lands inside the portal instead of on a password box. Only ever offered
+# on a network we raised ourselves - see Test-AutoLoginAllowed.
+$Global:AutoLogin   = $true
+$Global:AutoLoginKey= ''             # random per run
 
 $Global:Sessions    = [hashtable]::Synchronized(@{})   # sid -> @{Sid;PubId;Nick;IP;UA;Created;LastSeen}
 $Global:PubIndex    = [hashtable]::Synchronized(@{})   # pubId -> sid
@@ -272,6 +287,54 @@ function Import-Sessions {
 # ============================== WEBRTC SIGNALLING =============================
 # A mailbox per device, drained by the normal /api/state poll. Offers, answers
 # and ICE candidates pass through; file bytes never do.
+
+function New-PortalSession {
+    # Creates a signed-in session for this request. Factored out of the login
+    # POST so the one-scan auto-login path gets identical identity handling
+    # rather than a second, subtly different copy.
+    param($Req, [string]$Nick)
+    $sid = New-SessionId
+    $pub = New-ShortId 4
+
+    # Same device signing in again (matching IP + user agent): adopt the old
+    # session instead of piling up ghost devices.
+    $oldSids = @()
+    foreach ($k in @($Global:Sessions.Keys)) {
+        $s = $Global:Sessions[$k]
+        if ($s -and $s.IP -eq $Req.ClientIp -and $s.UA -eq $Req.UserAgent) { $oldSids += $k }
+    }
+
+    if ($Nick) { $Nick = $Nick.Trim() }
+    $useNick = if ($Nick) { $Nick }
+               elseif ($oldSids.Count -gt 0 -and $Global:Sessions[$oldSids[0]].Nick) { $Global:Sessions[$oldSids[0]].Nick }
+               else { Get-DeviceLabel -UA $Req.UserAgent -IP $Req.ClientIp }
+    if ($useNick.Length -gt 32) { $useNick = $useNick.Substring(0,32) }
+
+    $now = Get-Date
+    $Global:Sessions[$sid] = @{
+        Sid=$sid; PubId=$pub; Nick=$useNick
+        IP=$Req.ClientIp; UA=$Req.UserAgent
+        Created=$now; LastSeen=$now
+    }
+    $Global:PubIndex[$pub] = $sid
+
+    # Re-point old transfers at the new identity, then drop old sessions
+    foreach ($old in $oldSids) {
+        foreach ($tk in @($Global:Transfers.Keys)) {
+            $t = $Global:Transfers[$tk]
+            if ($null -eq $t) { continue }
+            $changed = $false
+            if ($t.Target -eq $old) { $t.Target = $sid; $changed = $true }
+            if ($t.Sender -eq $old) { $t.Sender = $sid; $changed = $true }
+            if ($changed) { try { Save-TransferMeta -T $t } catch {} }
+        }
+        $os = $Global:Sessions[$old]
+        if ($os -and $os.PubId) { [void]$Global:PubIndex.Remove($os.PubId) }
+        [void]$Global:Sessions.Remove($old)
+    }
+    Save-Sessions
+    return $sid
+}
 
 function Add-Signal {
     param([string]$ToPub, [string]$FromPub, [string]$Kind, [string]$Data)
@@ -1879,7 +1942,12 @@ function Get-LobbyPage {
     $mode = $Global:Bearer.Mode
     $ssid = $Global:Bearer.Ssid
     $pass = $Global:Bearer.Pass
-    $hasAp = ($mode -ne 'none' -and $ssid)
+    # Station mode: we joined someone else's network. We know its name but not
+    # its passphrase, so there is no join QR to offer - only the address.
+    $isStation = ($mode -eq 'station')
+    $hasAp = ($mode -ne 'none' -and $ssid -and -not $isStation)
+    # Scanning the address QR should sign you in too, not just open a password box.
+    if ($Global:AutoLoginKey) { $Url += ('?k={0}' -f $Global:AutoLoginKey) }
     # WIFI: payload is understood natively by iOS 11+ and Android 10+ cameras.
     # Escape the separators WPA passphrases are allowed to contain.
     $esc = { param($s) ($s -replace '([\\;:,"])', '\$1') }
@@ -1887,6 +1955,7 @@ function Get-LobbyPage {
     $modeLabel = switch ($mode) {
         'hotspot'    { 'Mobile Hotspot' }
         'wifidirect' { 'Wi-Fi Direct group' }
+        'station'    { 'Joined "{0}" as a client' -f $ssid }
         default      { 'Existing Wi-Fi (no self-AP)' }
     }
     # Pre-build the JS string literal; nesting quotes inside the here-string is brittle.
@@ -1908,6 +1977,15 @@ function Get-LobbyPage {
         <div class="kv"><span>Password</span><b class="mono">$([System.Web.HttpUtility]::HtmlEncode($pass))</b></div>
         <p class="hint">Point the phone camera at the code and tap <i>Join network</i>.
         $(if ($oneQr) { 'The portal opens by itself a second later - nothing else to scan.' } else { 'No internet is needed.' })</p>
+      </div>
+"@ } elseif ($isStation) { @"
+      <div class="card warn">
+        <div class="step">Step 1</div>
+        <h2>Join &quot;$([System.Web.HttpUtility]::HtmlEncode($ssid))&quot;</h2>
+        <p class="hint">This machine could not raise its own access point, so it joined a network
+        it already knew and is serving from there. Put the other device on
+        <b>$([System.Web.HttpUtility]::HtmlEncode($ssid))</b> as well - the password is that
+        network's own, not ours.</p>
       </div>
 "@ } else { @"
       <div class="card warn">
@@ -2005,7 +2083,10 @@ function Invoke-RequestRouter {
             $Global:Bearer.IP
         )
         if ($hostHdr -and ($mine -notcontains $hostHdr.ToLowerInvariant())) {
-            $portal = 'http://{0}:{1}/' -f $Global:Bearer.IP, $Global:Port
+            # Carry the one-scan key so the phone lands inside the portal rather
+            # than on a password box. Only set where auto-login is allowed.
+            $portal = Get-PortalUrl
+            if ($Global:AutoLoginKey) { $portal += ('?k={0}' -f $Global:AutoLoginKey) }
             Write-Host ("[captive] {0} -> portal" -f $hostHdr) -ForegroundColor DarkCyan
             Send-RedirectResponse -Stream $Stream -Location $portal
             return
@@ -2020,47 +2101,7 @@ function Invoke-RequestRouter {
                 $form = [System.Web.HttpUtility]::ParseQueryString($bodyText)
                 $pw = $form['password']
                 if ($pw -eq $Global:Password) {
-                    $sid = New-SessionId
-                    $pub = New-ShortId 4
-
-                    # Same device logging in again (matching IP + user agent):
-                    # adopt the old session instead of piling up ghost devices.
-                    $oldSids = @()
-                    foreach ($k in @($Global:Sessions.Keys)) {
-                        $s = $Global:Sessions[$k]
-                        if ($s -and $s.IP -eq $Req.ClientIp -and $s.UA -eq $Req.UserAgent) { $oldSids += $k }
-                    }
-
-                    $providedNick = $form['nick']
-                    if ($providedNick) { $providedNick = $providedNick.Trim() }
-                    $nick = if ($providedNick) { $providedNick }
-                            elseif ($oldSids.Count -gt 0 -and $Global:Sessions[$oldSids[0]].Nick) { $Global:Sessions[$oldSids[0]].Nick }
-                            else { Get-DeviceLabel -UA $Req.UserAgent -IP $Req.ClientIp }
-                    if ($nick.Length -gt 32) { $nick = $nick.Substring(0,32) }
-                    $now = Get-Date
-                    $Global:Sessions[$sid] = @{
-                        Sid=$sid; PubId=$pub; Nick=$nick
-                        IP=$Req.ClientIp; UA=$Req.UserAgent
-                        Created=$now; LastSeen=$now
-                    }
-                    $Global:PubIndex[$pub] = $sid
-
-                    # Re-point old transfers at the new identity, then drop old sessions
-                    foreach ($old in $oldSids) {
-                        foreach ($tk in @($Global:Transfers.Keys)) {
-                            $t = $Global:Transfers[$tk]
-                            if ($null -eq $t) { continue }
-                            $changed = $false
-                            if ($t.Target -eq $old) { $t.Target = $sid; $changed = $true }
-                            if ($t.Sender -eq $old) { $t.Sender = $sid; $changed = $true }
-                            if ($changed) { try { Save-TransferMeta -T $t } catch {} }
-                        }
-                        $os = $Global:Sessions[$old]
-                        if ($os -and $os.PubId) { [void]$Global:PubIndex.Remove($os.PubId) }
-                        [void]$Global:Sessions.Remove($old)
-                    }
-                    Save-Sessions
-
+                    $sid = New-PortalSession -Req $Req -Nick $form['nick']
                     $cookie = New-SessionCookieHeader -Sid $sid
                     Send-RedirectResponse -Stream $Stream -Location '/dashboard' -ExtraHeaders @{ 'Set-Cookie' = $cookie }
                 } else {
@@ -2068,8 +2109,21 @@ function Invoke-RequestRouter {
                 }
             } else {
                 $sid = Test-ValidSession -Req $Req
-                if ($sid) { Send-RedirectResponse -Stream $Stream -Location '/dashboard' }
-                else { Send-HtmlResponse -Stream $Stream -Html (Get-LoginPage -Error $false) }
+                if ($sid) { Send-RedirectResponse -Stream $Stream -Location '/dashboard'; return }
+                # One-scan sign-in: the captive redirect carries a per-run key, so
+                # scanning the single QR lands inside the portal. The key is only
+                # ever issued on a network we raised, where WPA2 already gated
+                # entry - see Test-AutoLoginAllowed.
+                $q = [System.Web.HttpUtility]::ParseQueryString($Req.Query)
+                $k = $q['k']
+                if ($Global:AutoLoginKey -and $k -and $k -eq $Global:AutoLoginKey) {
+                    $sid = New-PortalSession -Req $Req -Nick $null
+                    $cookie = New-SessionCookieHeader -Sid $sid
+                    Write-Host ("[autologin] {0}" -f $Req.ClientIp) -ForegroundColor DarkCyan
+                    Send-RedirectResponse -Stream $Stream -Location '/dashboard' -ExtraHeaders @{ 'Set-Cookie' = $cookie }
+                    return
+                }
+                Send-HtmlResponse -Stream $Stream -Html (Get-LoginPage -Error $false)
             }
         }
 
@@ -2088,7 +2142,7 @@ function Invoke-RequestRouter {
             # Host screen only: this page shows the Wi-Fi passphrase in clear text.
             # The listener binds to the bearer IP, so the host browser arrives from it.
             if ($Req.ClientIp -ne $Global:Bearer.IP) { Send-HtmlResponse -Stream $Stream -Html '<h1>404</h1>' -Status 404; return }
-            Send-HtmlResponse -Stream $Stream -Html (Get-LobbyPage -Url ("http://{0}:{1}/" -f $Global:Bearer.IP, $Global:Port))
+            Send-HtmlResponse -Stream $Stream -Html (Get-LobbyPage -Url (Get-PortalUrl))
         }
 
         '/api/lobby' {
@@ -2432,6 +2486,59 @@ function Start-ApWifiDirect {
     return $true
 }
 
+function Start-StationBearer {
+    # Third way in, for adapters that cannot be an AP at all. We stop trying to
+    # be the network and join one this machine already has a profile for: a
+    # phone's hotspot, the ship Wi-Fi, a portable router. Everything above the
+    # bearer is unchanged - the portal simply binds to the address we are given.
+    #
+    # netsh is used rather than WinRT here because Windows.Devices.WiFi requires
+    # a location-capability consent prompt that a background script cannot pass;
+    # netsh connect works unelevated against an already-saved profile.
+    $saved = @()
+    try {
+        foreach ($line in (netsh wlan show profiles)) {
+            $m = [regex]::Match($line, ':\s*(.+?)\s*$')
+            if ($m.Success -and $line -match 'All User Profile|Tum Kullanici|T\S*m Kullan') { $saved += $m.Groups[1].Value.Trim() }
+        }
+    } catch {}
+    if ($saved.Count -eq 0) { throw 'no saved Wi-Fi profiles' }
+
+    # Only bother with profiles whose SSID is actually in range right now.
+    $visible = @()
+    try {
+        foreach ($line in (netsh wlan show networks)) {
+            $m = [regex]::Match($line, '^\s*SSID\s+\d+\s*:\s*(.+?)\s*$')
+            if ($m.Success) { $visible += $m.Groups[1].Value.Trim() }
+        }
+    } catch {}
+
+    $candidates = @()
+    foreach ($want in $Global:StationPrefer) { if ($saved -contains $want) { $candidates += $want } }
+    foreach ($s in $saved) {
+        if ($candidates -contains $s) { continue }
+        if ($visible.Count -eq 0 -or $visible -contains $s) { $candidates += $s }
+    }
+    if ($candidates.Count -eq 0) { throw 'no saved profile is in range' }
+
+    foreach ($ssid in $candidates) {
+        Write-Host ('  [STA] Trying saved network: {0}' -f $ssid) -ForegroundColor DarkGray
+        try { $null = netsh wlan connect name="$ssid" } catch { continue }
+        for ($i = 0; $i -lt 24; $i++) {
+            Start-Sleep -Milliseconds 500
+            $iface = netsh wlan show interfaces
+            if (($iface | Select-String '^\s*State\s*:\s*connected') -and
+                ($iface | Select-String ([regex]::Escape($ssid)))) {
+                $Global:Bearer.Mode = 'station'
+                $Global:Bearer.Ssid = $ssid
+                $Global:Bearer.Pass = ''      # not ours to know or show
+                return $true
+            }
+        }
+    }
+    throw 'could not associate with any saved network'
+}
+
 function Restore-ApConfig {
     # Puts the machine's own hotspot SSID/passphrase back. Safe to call twice:
     # the parked copy is deleted once it has been applied.
@@ -2495,8 +2602,26 @@ function Start-SelfAp {
             Write-Host ('  [AP] {0} path failed: {1}' -f $mode, $_.Exception.Message) -ForegroundColor Yellow
         }
     }
+    # Neither AP path worked. Rather than stopping, join a network we know.
+    if ($Global:StationFallback) {
+        try {
+            [void](Start-StationBearer)
+            Write-Host ('  [STA] Joined "{0}" as a client - serving from there.' -f $Global:Bearer.Ssid) -ForegroundColor Green
+            Write-Host '  [STA] Guest on someone else network: captive portal and auto-login stay off.' -ForegroundColor DarkYellow
+            return $true
+        } catch {
+            Write-Host ('  [STA] Station fallback failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
     Write-Host '  [AP] No self-AP; falling back to whatever Wi-Fi is already connected.' -ForegroundColor Yellow
     return $false
+}
+
+function Test-AutoLoginAllowed {
+    # Only on a network we raised ourselves. In station mode the other people on
+    # that network are strangers, and handing them a session for free would turn
+    # the shared password into no password at all.
+    return ($Global:AutoLogin -and $Global:Bearer.Mode -in @('wifidirect','hotspot'))
 }
 
 function Stop-SelfAp {
@@ -2675,6 +2800,13 @@ function Get-WifiInterface {
     return $null
 }
 
+function Get-PortalUrl {
+    # Drops the ":80" so the QR encodes the shortest possible string.
+    param([string]$Ip = $Global:Bearer.IP, [string]$Path = '/')
+    if ([int]$Global:Port -eq 80) { return ('http://{0}{1}' -f $Ip, $Path) }
+    return ('http://{0}:{1}{2}' -f $Ip, $Global:Port, $Path)
+}
+
 function Test-SameSubnet {
     param([string]$ClientIp, [string]$LocalIp, [int]$Prefix)
     try {
@@ -2708,7 +2840,7 @@ function Show-StartupBanner {
 "@
     Write-Host $logo -ForegroundColor Cyan
 
-    $url = "http://$($Wifi.IP):$($Global:Port)/"
+    $url = Get-PortalUrl -Ip $Wifi.IP
     Write-Host ''
     Write-Host '  +--------------------------------------------------------+' -ForegroundColor DarkGray
     Write-Host ('  |  URL          : {0,-38} |' -f $url)                                  -ForegroundColor Green
@@ -2730,6 +2862,11 @@ function Show-StartupBanner {
     } elseif ($Wifi.Hotspot) {
         Write-Host '  [Hotspot] Mobile Hotspot network (192.168.137.x).' -ForegroundColor Green
     }
+    if ($Global:Bearer.Mode -eq 'station') {
+        Write-Host ('  [Station] Joined "{0}" - other devices must be on that network too.' -f $Global:Bearer.Ssid) -ForegroundColor Green
+    }
+    if ($Global:Bearer.Dns) { Write-Host '  [1-QR] Captive portal on: scanning the join code opens the portal.' -ForegroundColor Green }
+    if ($Global:AutoLoginKey) { Write-Host '  [1-QR] Auto sign-in armed: no password typing on the phone.' -ForegroundColor Green }
     if ($Global:P2P) { Write-Host '  [P2P] Direct device-to-device transfer, server relay as fallback.' -ForegroundColor Green }
     Write-Host '  [Bidirectional] Device-to-device private + public broadcast.' -ForegroundColor Green
     Write-Host '  [Invite] Dashboard "Invite" button shows link + QR code.' -ForegroundColor Green
@@ -2763,22 +2900,45 @@ if ($null -eq $wifi) {
 }
 $Global:Bearer.IP = $wifi.IP
 $Global:Bearer.Prefix = $wifi.Prefix
-# Whether DNS actually bound decides what the lobby promises. On the hotspot
-# path ICS already owns UDP/53, so the one-QR flow is not available there.
+# Whether DNS actually bound decides what the lobby promises.
+# Never in station mode: on someone else's network we are a guest, and answering
+# every lookup with our own address would break every other device on it.
 $Global:Bearer.Dns = $false
-if ($Global:CaptivePortal -and $Global:Bearer.Mode -ne 'none') {
+if ($Global:CaptivePortal -and $Global:Bearer.Mode -in @('wifidirect','hotspot')) {
     $Global:Bearer.Dns = [bool](Start-CaptiveDns -Ip $wifi.IP -Port $Global:DnsPort)
+} elseif ($Global:Bearer.Mode -eq 'station') {
+    Write-Host '  [DNS] Captive portal skipped - we are a guest on this network.' -ForegroundColor DarkGray
 }
+
+# One-scan sign-in token. Only meaningful where auto-login is allowed at all.
+if (Test-AutoLoginAllowed) { $Global:AutoLoginKey = New-ShortId 12 }
 
 # Restart-safe: load transfer records and sessions from disk
 Import-AllTransfers
 Import-Sessions
 
 $bindAddr = [System.Net.IPAddress]::Parse($wifi.IP)
-$listener = New-Object System.Net.Sockets.TcpListener($bindAddr, $Global:Port)
+
+# Prefer port 80 so the URL carries no ":port" - a shorter string is a lower
+# density QR, which phone cameras lock onto noticeably faster. Anything already
+# owning 80 (IIS, another server) sends us to the historical 8080.
+$listener = $null
+foreach ($tryPort in @($Global:Port, $Global:PortFallback)) {
+    if ($null -eq $tryPort) { continue }
+    $cand = New-Object System.Net.Sockets.TcpListener($bindAddr, $tryPort)
+    try {
+        $cand.Start()
+        $listener = $cand
+        $Global:Port = $tryPort
+        break
+    } catch {
+        try { $cand.Stop() } catch {}
+        Write-Host ('  [HTTP] Port {0} unavailable, trying next.' -f $tryPort) -ForegroundColor DarkGray
+    }
+}
 
 try {
-    $listener.Start()
+    if ($null -eq $listener) { throw 'no port available' }
 } catch {
     Stop-CaptiveDns
     Stop-SelfAp
@@ -2803,8 +2963,8 @@ Write-Host ''
 # rundll32's URL handler are kept as fallbacks for odd shell-association setups.
 # With a self-AP up, open the lobby: it carries the join QR the phone needs
 # before it can reach anything else on this machine.
-$startUrl = if ($Global:Bearer.Mode -ne 'none') { "http://$($wifi.IP):$($Global:Port)/lobby" }
-            else { "http://$($wifi.IP):$($Global:Port)/" }
+$startUrl = if ($Global:Bearer.Mode -ne 'none') { Get-PortalUrl -Ip $wifi.IP -Path '/lobby' }
+            else { Get-PortalUrl -Ip $wifi.IP }
 $opened = $false
 try {
     Start-Process $startUrl -WindowStyle Normal -ErrorAction Stop | Out-Null
@@ -2841,7 +3001,7 @@ $funcNames = @(
     'Test-ValidSession','Resolve-TargetSid','Get-MultipartField','Save-Sessions',
     'Save-UploadedFileStream','Send-FileDownload','Send-ZipDownload','Get-StateJson',
     'Get-LoginPage','Get-DashboardPage','Get-LobbyPage','Invoke-RequestRouter',
-    'Add-Signal','Get-SignalsFor'
+    'Add-Signal','Get-SignalsFor','New-PortalSession','Get-PortalUrl'
 )
 foreach ($fn in $funcNames) {
     $def = (Get-Command $fn -CommandType Function).Definition
@@ -2873,6 +3033,8 @@ $sharedVars = @{
     # Needed by both the router's probe interception and Get-LobbyPage; without
     # it the workers see $null and silently fall back to the two-QR flow.
     CaptivePortal = $Global:CaptivePortal
+    AutoLogin     = $Global:AutoLogin
+    AutoLoginKey  = $Global:AutoLoginKey
 }
 foreach ($k in $sharedVars.Keys) {
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($k, $sharedVars[$k], '')))
