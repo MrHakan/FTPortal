@@ -55,6 +55,12 @@ $script:BearerCalls = @()          # what the chain asked for, in order
 $script:BearerFail  = @()          # kinds that should refuse to come up
 $script:BearerHangs = $false
 
+# Keep a real copy of the LAN picker before the guards go in. It touches no
+# radio - only Get-NetCandidates / Get-NetConnectionProfile / Get-NetRoute,
+# all of which the adapter-choice tests below stub out - so its actual scoring
+# can be exercised for real rather than described in a comment.
+Set-Item -Path function:Start-LanBearerReal -Value (Get-Command Start-LanBearer -CommandType Function).ScriptBlock
+
 function Start-Bearer {
     param([string]$Kind, [string]$Ssid = '', [string]$Pass = '')
     $script:BearerCalls += ,@{ Kind = $Kind; Ssid = $Ssid; Pass = $Pass }
@@ -312,6 +318,94 @@ It 'a /16 bearer admits the whole wider range, a /24 does not' {
     Stop-Bearer -Kind 'lan'
     Set-BearerRecord -Kind 'lan' -Ssid 'Narrow' -IP '172.16.0.1' -Prefix 24
     Should-BeFalse (Test-AllowedClient -ClientIp '172.16.250.9')
+}
+
+# ========================= LAN ADAPTER CHOICE =================================
+# Reproduces the ship laptop exactly: an Ethernet port on the real LAN, and a
+# Wi-Fi radio that happens to be associated with a printer's own Wi-Fi Direct
+# group. Ranking by "wireless first" picked the printer.
+Write-Host '  -- LAN adapter choice --' -ForegroundColor Yellow
+
+function Use-ShipLaptopAdapters {
+    function Global:Get-NetCandidates {
+        param([switch]$IncludeWired)
+        $all = @(
+            @{ IP='10.0.7.35';     Prefix=8;  Name='Ethernet 2';               Index=11; Wireless=$false; Bluetooth=$false; Hotspot=$false }
+            @{ IP='192.168.115.3'; Prefix=24; Name='Wi-Fi 2';                  Index=14; Wireless=$true;  Bluetooth=$false; Hotspot=$false }
+            @{ IP='192.168.137.1'; Prefix=24; Name='Local Area Connection* 2'; Index=22; Wireless=$true;  Bluetooth=$false; Hotspot=$true  }
+        )
+        if (-not $IncludeWired) { return @($all | Where-Object { $_.Wireless }) }
+        return $all
+    }
+    function Global:Get-NetConnectionProfile {
+        param([switch]$ErrorAction)
+        @(
+            [pscustomobject]@{ Name='advspring.local';          InterfaceIndex=11; NetworkCategory='DomainAuthenticated'; IPv4Connectivity='Internet' }
+            [pscustomobject]@{ Name='DIRECT-LT0A-GX6000series'; InterfaceIndex=14; NetworkCategory='Public';              IPv4Connectivity='LocalNetwork' }
+        )
+    }
+    function Global:Get-NetRoute { param($InterfaceIndex, $DestinationPrefix, $ErrorAction) return [pscustomobject]@{ NextHop='x' } }
+}
+function Clear-AdapterStubs {
+    foreach ($f in @('Get-NetConnectionProfile','Get-NetRoute','Get-NetCandidates')) {
+        if (Test-Path "function:Global:$f") { Remove-Item "function:Global:$f" -Force }
+    }
+}
+
+It 'picks the real LAN over a printer the Wi-Fi happens to be joined to' {
+    Reset-World
+    Use-ShipLaptopAdapters
+    try { [void](Start-LanBearerReal) } finally { Clear-AdapterStubs }
+    $b = $Global:Bearers['lan']
+    Should-Be $b.IP '10.0.7.35' 'the Ethernet LAN, not the printer group'
+    Should-Be $b.Prefix 8
+}
+It 'names the network, not the adapter' {
+    Should-Be $Global:Bearers['lan'].Ssid 'advspring.local' 'not "Ethernet 2"'
+}
+It 'the printer subnet is still carried as an alt, not discarded' {
+    $alt = @($Global:Bearers['lan'].Alt)
+    Should-Be $alt.Count 1
+    Should-Be $alt[0].IP '192.168.115.3'
+    Should-BeTrue ($Global:Bearers['lan'].Note -match '\+1 more subnet')
+}
+It 'our own SoftAP address is never mistaken for the LAN' {
+    Should-BeFalse ($Global:Bearers['lan'].IP -eq '192.168.137.1')
+    Should-BeFalse ((@($Global:Bearers['lan'].Alt) | ForEach-Object { $_.IP }) -contains '192.168.137.1')
+}
+It 'devices on either real subnet are admitted, the SoftAP range is not' {
+    Should-BeTrue  (Test-AllowedClient -ClientIp '10.0.7.99')
+    Should-BeTrue  (Test-AllowedClient -ClientIp '192.168.115.40')
+    Should-BeFalse (Test-AllowedClient -ClientIp '192.168.137.50')
+}
+It 'with no connection profiles at all it still picks something sane' {
+    # Older boxes, or a machine where Get-NetConnectionProfile returns nothing:
+    # fall back to gateway + wired and do not throw.
+    Reset-World
+    Use-ShipLaptopAdapters
+    function Global:Get-NetConnectionProfile { param([switch]$ErrorAction) @() }
+    try { [void](Start-LanBearerReal) } finally { Clear-AdapterStubs }
+    Should-Be $Global:Bearers['lan'].IP '10.0.7.35' 'wired tie-break carries it'
+}
+It 'a wireless-only machine on a normal network is unaffected' {
+    Reset-World
+    function Global:Get-NetCandidates {
+        param([switch]$IncludeWired)
+        @(@{ IP='192.168.1.50'; Prefix=24; Name='Wi-Fi'; Index=9; Wireless=$true; Bluetooth=$false; Hotspot=$false })
+    }
+    function Global:Get-NetConnectionProfile { param([switch]$ErrorAction) @([pscustomobject]@{ Name='TP-Link_B9D4'; InterfaceIndex=9; NetworkCategory='Private'; IPv4Connectivity='Internet' }) }
+    function Global:Get-NetRoute { param($InterfaceIndex,$DestinationPrefix,$ErrorAction) [pscustomobject]@{ NextHop='x' } }
+    try { [void](Start-LanBearerReal) } finally { Clear-AdapterStubs }
+    Should-Be $Global:Bearers['lan'].IP '192.168.1.50'
+    Should-Be $Global:Bearers['lan'].Ssid 'TP-Link_B9D4'
+    Should-Be @($Global:Bearers['lan'].Alt).Count 0
+}
+It 'no connected network at all is an error, not a silent bind to nothing' {
+    Reset-World
+    function Global:Get-NetCandidates { param([switch]$IncludeWired) @() }
+    $threw = $false
+    try { [void](Start-LanBearerReal) } catch { $threw = $true } finally { Clear-AdapterStubs }
+    Should-BeTrue $threw
 }
 
 # ============================== HOST CHECK ====================================

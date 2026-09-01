@@ -1824,7 +1824,7 @@ function Get-DashboardPage {
     if(el>0.5 && loaded>0){
       var speed=loaded/el;
       var remain=speed>0?Math.max(0,(total-loaded)/speed):0;
-      document.getElementById('upStats').textContent=fmtSize(loaded)+' / '+fmtSize(total)+'  ·  '+fmtSize(speed)+'/s  ·  ETA '+fmtEta(remain);
+      document.getElementById('upStats').textContent=fmtSize(loaded)+' / '+fmtSize(total)+'  \u00B7  '+fmtSize(speed)+'/s  \u00B7  ETA '+fmtEta(remain);
     }
   }
   function uploadOne(item,bundleId,done){
@@ -1978,7 +1978,15 @@ function Get-DashboardPage {
   }
 
   // ---- Transports: status, switching, failover notices ---------------------
-  var BEARER_ICON={wifidirect:'📶',hotspot:'📡',station:'🔗',lan:'🌐',bluetooth:'🔵'};
+  // Escaped, not literal. This file has no BOM, so PowerShell 5.1 reads it as
+  // ANSI and any literal non-ASCII reaches the browser as mojibake - which is
+  // why every other glyph in this page is an entity or a \u escape too.
+  // Escaped, not literal. This file has no BOM, so PowerShell 5.1 reads it as
+  // ANSI and any literal non-ASCII reaches the browser as mojibake - which is
+  // why every other glyph in this page is an entity or a \u escape too.
+  var BEARER_ICON={wifidirect:'\uD83D\uDCF6',hotspot:'\uD83D\uDCE1',
+                   station:'\uD83D\uDD17',lan:'\uD83C\uDF10',
+                   bluetooth:'\uD83D\uDD35'};
   function showNotices(list){
     list.forEach(function(n){
       toast(n.text, n.level==='err'?'err':(n.level==='warn'?'info':'info'));
@@ -3278,13 +3286,41 @@ function Start-LanBearer {
     # are on the same wireless network, and both sides route fine.
     $cands = @(Get-NetCandidates -IncludeWired | Where-Object { -not $_.Hotspot -and -not $_.Bluetooth })
     if ($cands.Count -eq 0) { throw 'no connected network to serve from' }
-    # An adapter with a default gateway is on a real network rather than holding
-    # some leftover link-local address, so prefer those; wireless first.
+
+    # "The LAN" means the infrastructure network this machine belongs to - the
+    # one with a DHCP server, a gateway and the other people on it. Ranking by
+    # "wireless first" got this exactly backwards on the ship: the Ethernet port
+    # was on advspring.local (domain, internet) while the Wi-Fi radio was
+    # associated with a PRINTER's Wi-Fi Direct group, and the printer won.
+    #
+    # Windows already knows the difference and will say so, so ask it rather
+    # than guessing from the media type.
+    $profiles = @{}
+    try { foreach ($p in (Get-NetConnectionProfile -ErrorAction SilentlyContinue)) { $profiles[[int]$p.InterfaceIndex] = $p } } catch {}
+
     $scored = @()
     foreach ($c in $cands) {
+        $score = 0
+        $prof = $profiles[[int]$c.Index]
+        if ($prof) {
+            # Reaching the internet is the strongest evidence of a real LAN.
+            if ("$($prof.IPv4Connectivity)" -eq 'Internet') { $score += 8 }
+            switch ("$($prof.NetworkCategory)") {
+                'DomainAuthenticated' { $score += 4 }   # a managed network: the ship's
+                'Private'             { $score += 3 }
+                default               { }               # 'Public' earns nothing
+            }
+            # DIRECT-* is a printer, TV or camera advertising its own group. It
+            # has an address and no people on it - the opposite of a LAN.
+            if ($prof.Name -like 'DIRECT-*') { $score -= 10 }
+        }
         $gw = $null
         try { $gw = Get-NetRoute -InterfaceIndex $c.Index -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1 } catch {}
-        $scored += [pscustomobject]@{ C = $c; Score = (([int][bool]$gw) * 2 + [int][bool]$c.Wireless) }
+        if ($gw) { $score += 2 }
+        # Tie-break toward wired: on a ship the cable is the stable LAN and the
+        # radio is whatever it last associated with.
+        if (-not $c.Wireless) { $score += 1 }
+        $scored += [pscustomobject]@{ C = $c; Score = $score }
     }
     $best = ($scored | Sort-Object -Property Score -Descending | Select-Object -First 1).C
     # The address we advertise is the best one - that is what goes in the QR and
@@ -3295,7 +3331,11 @@ function Start-LanBearer {
     foreach ($c in $cands) { if ($c.IP -ne $best.IP) { $alt += @{ IP = $c.IP; Prefix = $c.Prefix } } }
     $note = 'Existing network - other devices must already be on it'
     if ($alt.Count -gt 0) { $note += (' (+{0} more subnet{1})' -f $alt.Count, $(if ($alt.Count -eq 1) { '' } else { 's' })) }
-    Set-BearerRecord -Kind 'lan' -Ssid $best.Name -Pass '' -IP $best.IP -Prefix $best.Prefix -Alt $alt -Note $note
+    # Show what the network is called, not what the adapter is called:
+    # "advspring.local" tells you where the portal is, "Ethernet 2" does not.
+    $bestProf = $profiles[[int]$best.Index]
+    $label = if ($bestProf -and $bestProf.Name) { "$($bestProf.Name)" } else { $best.Name }
+    Set-BearerRecord -Kind 'lan' -Ssid $label -Pass '' -IP $best.IP -Prefix $best.Prefix -Alt $alt -Note $note
     return $true
 }
 

@@ -40,7 +40,7 @@ the **primary** — the one the QR and the banner advertise.
 | **A** | **Wi-Fi Direct autonomous GO** | **No** | Default. A closed island: clients get an address but no route out. Needs no connection profile, so it works with nothing plugged in. Leaves the machine's hotspot settings untouched. |
 | B | Mobile Hotspot (`NetworkOperatorTetheringManager`) | **Yes** | Tethering *is* internet sharing — that is what the API does. Also borrows the saved hotspot SSID (see below). |
 | C | **Station mode** — join a network we already know | n/a | For adapters that cannot be an AP at all. The portal joins a saved network in range (a phone's hotspot, the ship Wi-Fi) and serves from there. |
-| D | **Local network** | n/a | Raises nothing. Serves over whatever this machine is already on, Ethernet included — fastest path where a working wireless LAN already exists. |
+| D | **Local network (LAN)** | n/a | Raises nothing. Serves over the infrastructure network this machine already belongs to — typically the wired LAN. Fastest path where one already exists. |
 | E | **Bluetooth PAN** | n/a | Off by default. ~3 Mbps measured: fine for a photo or a form, useless for anything large. Windows will not raise a PAN unattended, so pairing stays manual — the portal only binds once the adapter carries an address. |
 
 Both self-AP paths land on `192.168.137.1/24`, get DHCP from ICS, and **neither needs admin
@@ -58,7 +58,28 @@ What keeps that from opening the portal to the whole ship is `Test-AllowedClient
 is admitted only if its source address falls inside an **active transport's** subnet. Stop a
 transport and its subnet is shut out on the next connection, with no rebind.
 
-The local-network transport admits *every* local subnet the host sits on, not only the one it
+### Which network the LAN transport picks
+
+"The LAN" means the infrastructure network this machine belongs to — the one with a gateway,
+a DHCP server, and the other people on it. That is not the same as "the wireless one", so the
+choice is made from what Windows already knows rather than from the media type:
+
+| Signal | Weight |
+|---|---|
+| `IPv4Connectivity = Internet` | +8 |
+| `NetworkCategory = DomainAuthenticated` / `Private` | +4 / +3 |
+| Has a default gateway | +2 |
+| Wired | +1 |
+| Profile name matches `DIRECT-*` | **−10** |
+
+The last row matters more than it looks. A `DIRECT-*` profile is a printer, TV or camera
+advertising its own Wi-Fi Direct group: you get an address and no other device on it. On the
+ship laptop the Ethernet port was on `advspring.local` (domain, internet) while the Wi-Fi radio
+was associated with a Canon printer — and an earlier "wireless first" rule picked the printer.
+
+The card shows the **network** name, not the adapter name: `advspring.local`, not `Ethernet 2`.
+
+The transport then admits *every* local subnet the host sits on, not only the one it
 advertises — a host wired to Ethernet while the phones are on the site Wi-Fi would otherwise
 serve one and silently lock out the other.
 
@@ -266,7 +287,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
 powershell -ExecutionPolicy Bypass -File .\tests\Run-IsolationTests.ps1
 ```
 
-70 + 10 cases, no radio and no listening socket required. `Run-Tests.ps1` parses the portal,
+78 + 10 cases, no radio and no listening socket required. `Run-Tests.ps1` parses the portal,
 lifts every function out via the AST and evaluates those, so the server never starts; routes
 are exercised for real over a `MemoryStream`. **Everything that reaches a radio is mocked at
 script scope**, and one test asserts those mocks are still in place — an earlier version

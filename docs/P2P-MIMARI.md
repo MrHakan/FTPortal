@@ -116,11 +116,29 @@ Telefonu kabloyla bağlayıp USB tethering açmak PC'ye yeni bir subnet verir. P
 script'lenemez, kullanıcı hareketi ister. Wi-Fi radyosu kapalıyken tek hızlı yol budur.
 
 ### D2. Yerel ağ (`lan`) — hiçbir şey kurmadan hizmet ver — **uygulandı**
-Makinenin zaten bağlı olduğu ağ üzerinden servis. Kablolu dâhil: gemide host çoğu zaman
-Ethernet'te, telefonlar aynı sahanın Wi-Fi'sinde, ve ikisi birbirine yönleniyor. Radyo
-harcamaz, çalışan bir kablosuz LAN varsa en hızlı yol budur.
+Makinenin **hâlihazırda üyesi olduğu altyapı ağı** üzerinden servis: gateway'i, DHCP'si ve
+üzerinde başka insanlar olan ağ. Gemide bu tipik olarak kablolu LAN. Radyo harcamaz, çalışan
+bir LAN varsa en hızlı yol budur.
 
-Tek incelik: **host birden çok yerel subnet üzerinde olabilir.** Ethernet'te 10.0.7.35/8 ve
+**"LAN" ile "kablosuz olan" aynı şey değil.** İlk sürüm kablosuzu öncelikledi ve saha testinde
+şunu seçti: laptop'ın Ethernet portu `advspring.local` üzerinde (domain, internet erişimi),
+Wi-Fi radyosu ise bir **Canon yazıcının** Wi-Fi Direct grubuna (`DIRECT-LT0A-GX6000series`,
+`Public`, internet yok) bağlıydı — ve yazıcı kazandı. Seçim artık medya tipinden tahmin
+edilmiyor, Windows'un zaten bildiği şey soruluyor:
+
+| Sinyal | Ağırlık |
+|---|---|
+| `IPv4Connectivity = Internet` | +8 |
+| `NetworkCategory = DomainAuthenticated` / `Private` | +4 / +3 |
+| Varsayılan ağ geçidi var | +2 |
+| Kablolu | +1 |
+| Profil adı `DIRECT-*` | **−10** |
+
+Son satır göründüğünden önemli: `DIRECT-*` bir yazıcı/TV/kamera grubudur, adres verir ama
+üzerinde başka cihaz yoktur — yani LAN'ın tam tersi. Kartta **ağın adı** gösteriliyor,
+adaptörün adı değil: `advspring.local`, `Ethernet 2` değil.
+
+İkinci incelik: **host birden çok yerel subnet üzerinde olabilir.** Ethernet'te 10.0.7.35/8 ve
 Wi-Fi'de 192.168.115.3/24 iken sadece birini kabul etmek, diğerindeki cihazı sessizce dışarıda
 bırakıyordu — ölçümle çıktı, test client'ı Ethernet'ten gelince `DENY` yedi. Artık en iyi adres
 duyurulan adres, geri kalan yerel subnet'ler kayıtta `Alt` olarak taşınıyor ve kabul filtresi
@@ -408,11 +426,22 @@ portala adresle düzgünce ulaşan cihaz login'e yönlendirilmeye başladı. Do�
 `$Bearer.Dns` — yönlendirme yalnızca sorguyu bizim çözücümüz yanıtladıysa anlamlı. Ayrıca
 "benim adresim" listesi artık tüm aktif taşıyıcıları ve onların yan subnet adreslerini içeriyor.
 
-**h) Test paketi gerçek bir erişim noktası kaldırdı.** Zincir testlerinden biri `Start-Bearer`
+**h) `lan` taşıyıcısı LAN yerine bir yazıcıyı seçti.** İlk sıralama kablosuzu öncelikliyordu.
+Saha makinesinde Ethernet `advspring.local` üzerindeydi (domain, internet), Wi-Fi ise bir Canon
+yazıcının Wi-Fi Direct grubuna bağlıydı — ve yazıcı kazandı. `Get-NetConnectionProfile` bu
+farkı zaten biliyor: bağlanabilirlik, ağ kategorisi ve `DIRECT-*` adı. Ayrıntı için §2/D2.
+
+**i) Test paketi gerçek bir erişim noktası kaldırdı.** Zincir testlerinden biri `Start-Bearer`
 mock'unu kendi `It` bloğu içinde tanımlıyordu; bir başkası tanımlamayı unutunca gerçek WinRT
 çağrısı çalıştı ve geliştirme makinesinde **gerçekten bir Wi-Fi Direct ağı yayınlandı** —
 üstelik koşu zaman aşımıyla öldürülünce arkada kaldı. Radyoya dokunan her şey artık script
 kapsamında, tek yerde mock'lanıyor; ayrıca mock'ların yerinde durduğunu doğrulayan bir test var.
+
+**j) Kaynak dosyada düz emoji mojibake oluyor.** Dosyanın BOM'u yok, PowerShell 5.1 de BOM'suz
+dosyayı ANSI okuyor; taşıyıcı ikonları tarayıcıya `ðŸ"¶` diye gitti. Sayfanın geri kalanının
+neden hep `&#128193;` ve `🗜` kullandığı da böylece anlaşıldı. Dosya artık baştan
+sona 7-bit ASCII — yanlış çözümlenebilecek bayt kalmadı. Aynı hata upStats satırındaki iki düz
+`·` karakterinde de vardı ve v2'den beri duruyordu.
 
 ### Hâlâ açık kalanlar
 
