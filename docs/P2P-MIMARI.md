@@ -115,9 +115,23 @@ oturum **kendiliğinden kapanıyor**:
 Telefonu kabloyla bağlayıp USB tethering açmak PC'ye yeni bir subnet verir. PC tarafından
 script'lenemez, kullanıcı hareketi ister. Wi-Fi radyosu kapalıyken tek hızlı yol budur.
 
-### E. Bluetooth PAN — acil durum
-Bu makinede adaptör var ama link hızı **3 Mbps** (~0.3 MB/s gerçek). Not ve küçük PDF için
-kabul edilebilir, dosya transferi için değil. Otomatikleştirilmez, sadece dokümante edilir.
+### D2. Yerel ağ (`lan`) — hiçbir şey kurmadan hizmet ver — **uygulandı**
+Makinenin zaten bağlı olduğu ağ üzerinden servis. Kablolu dâhil: gemide host çoğu zaman
+Ethernet'te, telefonlar aynı sahanın Wi-Fi'sinde, ve ikisi birbirine yönleniyor. Radyo
+harcamaz, çalışan bir kablosuz LAN varsa en hızlı yol budur.
+
+Tek incelik: **host birden çok yerel subnet üzerinde olabilir.** Ethernet'te 10.0.7.35/8 ve
+Wi-Fi'de 192.168.115.3/24 iken sadece birini kabul etmek, diğerindeki cihazı sessizce dışarıda
+bırakıyordu — ölçümle çıktı, test client'ı Ethernet'ten gelince `DENY` yedi. Artık en iyi adres
+duyurulan adres, geri kalan yerel subnet'ler kayıtta `Alt` olarak taşınıyor ve kabul filtresi
+hepsine bakıyor.
+
+### E. Bluetooth PAN — seçilebilir taşıyıcı — **uygulandı, ölçüm değişmedi**
+Link hızı hâlâ **3 Mbps** (~0.3 MB/s gerçek). Karar değişmedi, sunum değişti: artık otomatik
+zincirde değil ama `$Global:BluetoothPan = $true` ile açılabilen bir taşıyıcı. Windows PAN'ı
+kendiliğinden ayağa kaldırmıyor — eşleştirme ve "ağa katıl" telefonun kendi Bluetooth
+ayarlarından yapılıyor — dolayısıyla portal yalnızca adaptör adres taşımaya başladıktan sonra
+ona bağlanıyor. Panelde ve notta hız açıkça yazıyor; 2 GB'lık transferin yarısında öğrenilmesin.
 
 ### Seçim mantığı
 
@@ -133,15 +147,76 @@ kabul edilebilir, dosya transferi için değil. Otomatikleştirilmez, sadece dok
 - **WFD'de boşta-kapanma yok.** Ölçüm: 8 dakika kesintisiz ayakta; A yolu 5. dakikada düşüyor.
 
 ```
-Start-Bearer:
-  1. Self-AP istendiyse: $ApPrefer sırasıyla dene (varsayılan: wifidirect -> hotspot)
-     - hotspot seçilirse: kayıtlı SSID/parola ap-restore.json'a park edilir
-  2. İkisi de olmadıysa: C (istasyon modu) - kayıtlı ve menzilde bir ağa katıl
-     - burada misafiriz: captive portal ve otomatik oturum kapanır
-  3. Zaten bağlı Wi-Fi (STA) varsa: mevcut v2 davranışı
-  4. Hiçbiri yoksa: hata + kullanıcıya D/E talimatı
-Stop-Portal: AP'yi kapat, DNS'i kapat, kayıtlı hotspot ayarlarını geri yükle
+Start-BearerChain ($Global:BearerOrder, varsayılan wifidirect -> hotspot -> station -> lan):
+  - ayarlarda kapalı olan atlanır (SelfAp / StationFallback / LanBearer / BluetoothPan)
+  - host'un bilerek kapattığı atlanır  ($Global:BearerOff)
+  - ilk ayağa kalkan PRIMARY olur; MultiConnect açıksa zincir DURMAZ,
+    kalkabilen her taşıyıcı yedek olarak ayakta bırakılır
+  - tüm koşu boyunca TEK SSID + TEK parola kullanılır
+Stop-Bearer <kind>: sadece o yolu kapatır; AP yollarında OS durumu geri sarılır
 ```
+
+### v3'te eklenen: çoklu taşıyıcı, devretme ve elle değiştirme
+
+**MultiConnect.** Zincir ilk başarıda durmuyor; kalkabilen her taşıyıcı ayakta kalıyor ve
+dinleyici tek adres yerine **tüm arayüzlere** bağlanıyor. Wi-Fi Direct grubundaki telefon ile
+gemi LAN'ındaki laptop aynı portalı görüyor, aynı cihaz listesinde birbirlerini buluyorlar.
+
+Tüm arayüzlere bağlanmanın ikinci ve asıl gerekçesi yapısal: bir taşıyıcı düşüp yeniden
+kalktığında (hotspot'un boşta kapanması) ya da adresi değiştiğinde (LAN'da DHCP) dinleyicinin
+canlı yüklemelerin altından yeniden kurulması gerekmiyor.
+
+Bunu "portalı tüm gemiye açmak"tan ayıran şey `Test-AllowedClient`: bir bağlantı ancak kaynak
+adresi **ayakta olan bir taşıyıcının** subnet'ine düşüyorsa kabul ediliyor. Taşıyıcı kapanınca
+o subnet bir sonraki bağlantıda dışarıda kalıyor, rebind yok.
+
+**Devretme.** Supervisor thread'i her 3 saniyede her taşıyıcıyı yokluyor. Taşıyan düşerse
+zincirden bir sonrakini yükseltiyor ve **oturum açmış her cihaza haber veriyor** — bildirim
+`/api/state` üzerindeki sıra numaralı notice akışıyla gidiyor, websocket yok. Lobi sayfası da
+kendi QR'ını yeniden çiziyor; ekranda ölü bir ağa katılan kod kalmıyor. Tek SSID kararı tam da
+bunun için: hotspot → Wi-Fi Direct devretmesi telefonun okuduğu QR'ı geçersizleştirmiyor.
+
+**Elle değiştirme.** Host ekranındaki Network paneli. Sadece host: `Test-HostRequest` loopback
+ve kendi taşıyıcı adreslerimizi kabul ediyor, ikisi de uzaktaki bir istemcinin kaynak adres
+olarak taklit edemeyeceği şeyler. Aynı AP'deki telefon portala girebiliyor ama paneli hiç
+görmüyor.
+
+İstek satır içinde işlenmiyor: bir posta kutusuna bırakılıyor, supervisor thread'i boşaltıyor.
+Gerekçe mimari — WinRT AP nesneleri (`$Global:ApHotspotMgr`, `$Global:ApPublisher`) tek bir
+runspace'e ait; bir HTTP worker kendi runspace'inden `StopTethering` çağırsa nesneyi `null`
+bulur ve hotspot sessizce ayakta kalırdı. Bunu bir test yapısal olarak doğruluyor
+(`Run-IsolationTests.ps1`).
+
+**Son yol kapatılamıyor.** Kapatmayı geri alacak bir yol kalmazdı.
+
+### Boşta-kapanma: üç savunma
+
+Ölçüm değişmedi — hotspot, istemci yokken tam 5. dakikada kendini kapatıyor. Değişen, buna ne
+kadar direndiğimiz. **Artık bir taşıyıcıyı yalnızca host, portal üzerinden kapatabiliyor.**
+
+1. Portal zaten yetkili çalışıyorsa `icssvc\Settings\PeerlessTimeoutEnabled` sıfırlanıyor ve
+   çıkışta eski değer geri konuyor. Asıl çözüm bu, ve admin isteyen tek şey bu.
+2. Değilse supervisor düşüşü ~3 saniyede fark edip AP'yi yeniden kaldırıyor. Bağlı
+   `TcpListener` boşluktan sağ çıkıyor (doğrulandı), rebind gerekmiyor.
+3. Host'un **bilerek** kapattığı taşıyıcı kapalı olarak hatırlanıyor. Aksi hâlde düşen
+   taşıyıcıları geri getiren dakikalık re-arm onu da geri getirir, Stop düğmesi bozuk görünürdü.
+
+Eski watchdog'da bulunan gerçek hata: önce `GetInternetConnectionProfile()` soruyor, `null`
+gelince `continue` ediyordu — yani **tam olarak bu aracın var olma sebebi olan internetsiz
+durumda hiç çalışmıyordu.** Kayıtlı tethering manager'ı profil aramasına hiç ihtiyaç duymuyor;
+profil taraması artık yalnızca yedek ve adaptör sahibi herhangi bir profili kabul ediyor.
+
+### İstasyon modunda devretmeyi zararsızlaştırmak
+
+Saha testinde çıktı: `Start-StationBearer` kayıtlı profiller arasından ilkini seçerken makineyi
+bağlı olduğu ağdan koparıp bir **yazıcının** Wi-Fi Direct grubuna (`DIRECT-LT0A-GX6000series`)
+taşıdı. İki kural eklendi:
+
+- **Zaten bağlı olunan ağ mutlak öncelikli.** Yeniden ilişkilendirme her bağlantıyı birkaç
+  saniye düşürüyor; devretmenin amacı portalı ulaşılabilir tutmak, host'u başka yere taşımak değil.
+- **`DIRECT-*` profilleri atlanıyor** (`StationPrefer`'da açıkça adı geçmedikçe). Bunlar
+  yazıcı/TV/kamera grupları: katılınca adres alınıyor ama üzerinde başka cihaz olmuyor —
+  yani başarı gibi görünüyor, işe yaramıyor, ve host'un gerçek ağına mal oluyor.
 
 ---
 
@@ -314,6 +389,31 @@ Asıl çözüm ise B yolunu birincil yapmak: WFD bu ayarlara hiç dokunmuyor.
 **d) WFD'de boşta-kapanma yok.** Ölçüm: 8 dakika kesintisiz `Started` ve `192.168.137.1`
 ayakta. Watchdog yalnızca A yolu için gerekli.
 
+### v3 sırasında çıkan, yine öngörülmemiş dört sorun
+
+**e) Watchdog internetsiz durumda hiç çalışmıyordu.** (b)'nin çözümü olarak yazılan döngü
+önce `GetInternetConnectionProfile()` soruyor, `null` gelince `continue` ediyordu. Yani
+hotspot'u ayakta tutması gereken kod, tam olarak bu aracın var olma sebebi olan "internet yok"
+durumunda hiçbir şey yapmıyordu. Kayıtlı manager profil aramasına ihtiyaç duymuyor; artık
+öncelikli yol o.
+
+**f) PowerShell tek elemanlı diziyi açıyor, `.Count` hashtable'ın anahtar sayısını veriyor.**
+`(Get-ActiveBearers).Count -le 1` kontrolü tek taşıyıcı varken `9` görüp geçiriyordu — yani
+"son yolu kapatma" koruması hiç çalışmıyordu. Testte yakalandı, `@(...)` ile sarıldı. Aynı
+tuzağın ikinci örneği bir satır ötede duruyordu ve kazara doğru sonuç veriyordu.
+
+**g) Captive yakalama, kendi DNS'imiz kalkmasa da devreye giriyordu.** Koşul
+`$Bearer.Mode -ne 'none'` idi; `lan` taşıyıcısı gelince bu koşul her zaman doğru oldu ve
+portala adresle düzgünce ulaşan cihaz login'e yönlendirilmeye başladı. Doğru koşul
+`$Bearer.Dns` — yönlendirme yalnızca sorguyu bizim çözücümüz yanıtladıysa anlamlı. Ayrıca
+"benim adresim" listesi artık tüm aktif taşıyıcıları ve onların yan subnet adreslerini içeriyor.
+
+**h) Test paketi gerçek bir erişim noktası kaldırdı.** Zincir testlerinden biri `Start-Bearer`
+mock'unu kendi `It` bloğu içinde tanımlıyordu; bir başkası tanımlamayı unutunca gerçek WinRT
+çağrısı çalıştı ve geliştirme makinesinde **gerçekten bir Wi-Fi Direct ağı yayınlandı** —
+üstelik koşu zaman aşımıyla öldürülünce arkada kaldı. Radyoya dokunan her şey artık script
+kapsamında, tek yerde mock'lanıyor; ayrıca mock'ların yerinde durduğunu doğrulayan bir test var.
+
 ### Hâlâ açık kalanlar
 
 - **İki telefon birbirini görüyor mu (client isolation)?** İki gerçek cihaz gerektiriyor, test edilmedi. İzolasyon varsa P2P istemci↔istemci yolu düşer, relay çalışmaya devam eder.
@@ -330,7 +430,8 @@ ayakta. Watchdog yalnızca A yolu için gerekli.
 | **0** ✅ | Self-AP (A→B) + `/lobby` çift QR | **"Wi-Fi gerektirmez" şartı burada tamamen karşılanır.** Transfer mevcut relay ile çalışır. | Düşük — üst katmanlara dokunulmaz |
 | **1** ✅ | Captive portal: otomatik açılış (tek QR) | Katılma tek adıma indi | ICS DNS çakışması ölçüldü — yok |
 | **2** ✅ | WebRTC P2P veri düzlemi + relay'e düşme | Sunucu diski yazılmaz, çift atlama yok | Orta — mDNS / izolasyon |
-| **3** ⬜ | BT-PAN acil taşıyıcı, USB tether dokümantasyonu | Wi-Fi radyosu tamamen kapalıyken çalışır | Düşük — manuel |
+| **3** ✅ | BT-PAN seçilebilir taşıyıcı, USB tether dokümantasyonu | Wi-Fi radyosu tamamen kapalıyken çalışır | Düşük — manuel eşleştirme, 3 Mbps |
+| **4** ✅ | Çoklu taşıyıcı, devretme + bildirim, elle değiştirme, `lan` taşıyıcısı | Tek bir yolun düşmesi kesinti değil, düşüş oluyor; host taşıyıcıyı portaldan seçiyor | Orta — kabul filtresi tek subnet yerine çoklu subnet mantığına geçti |
 
 Faz 0, 1 ve 2 uygulandı. Faz 1'in yalnızca yarısı hayata geçti: otomatik açılış (tek QR) var,
 `204` ile Android'i "internet var" sanmaya ikna etme yok — ikisi birbirini dışlıyor, çünkü

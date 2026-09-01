@@ -41,6 +41,27 @@ $Global:ApPrefer    = 'wifidirect'   # 'wifidirect' | 'hotspot'
 # there. We are a guest on that network, so the captive portal stays off.
 $Global:StationFallback = $true
 $Global:StationPrefer   = @()        # SSIDs to try first, in order; empty = any saved profile in range
+# Fourth bearer, and the only one that raises nothing at all: serve over the
+# network this machine is already on, router included. This is the pre-v2
+# behaviour, kept as an explicit choice rather than an accident - on a ship with
+# a working wireless LAN it is the fastest path and costs no radio.
+$Global:LanBearer   = $true
+# Fifth bearer. Measured ~3 Mbps on this hardware, so it is off unless asked
+# for: it exists for the case where both radios are refused and a phone can
+# still be paired over Bluetooth. Windows will not raise a PAN unattended, so
+# the pairing itself stays manual - we only bind to the adapter once it is up.
+$Global:BluetoothPan = $false
+# Order the supervisor walks when the running bearer dies and nobody has picked
+# a replacement by hand. First entry that comes up wins.
+$Global:BearerOrder = @('wifidirect','hotspot','station','lan')
+# Keep every bearer that came up running, not just the primary, and accept
+# clients from all of them at once. A phone on the Wi-Fi Direct group and a
+# laptop on the ship LAN then see the same portal and each other.
+$Global:MultiConnect = $true
+$Global:SuperviseMs = 3000           # bearer health poll
+# Windows powers the Mobile Hotspot down after ~5 min with no client attached.
+# With this on, the portal is the only thing that may stop it.
+$Global:HotspotKeepAlive = $true
 # Own DNS + redirect unknown hosts, so the phone pops the portal by itself right
 # after joining and one QR is enough. Costs the "internet available" indicator.
 $Global:CaptivePortal = $true
@@ -64,8 +85,27 @@ $Global:SessionLock = New-Object object
 $Global:SweepState  = [hashtable]::Synchronized(@{ Last = [datetime]::MinValue })
 $Global:Signals     = [hashtable]::Synchronized(@{})   # pubId -> ArrayList of pending WebRTC signals
 $Global:SignalLock  = New-Object object
+# $Global:Bearer stays exactly what it was: the PRIMARY bearer, mirrored out of
+# the registry below. Everything written before multi-bearer existed - the
+# captive redirect, the lobby page, the QR - reads this and needs no changes.
 $Global:Bearer      = [hashtable]::Synchronized(@{ Mode='none'; Ssid=''; Pass=''; Dns=$false })
-$Global:ApWatch     = [hashtable]::Synchronized(@{ Stop=$false; Restarts=0 })
+# kind -> @{Kind;Ssid;Pass;IP;Prefix;Up;Since;Primary;Note}. One entry per bearer
+# that is actually carrying traffic, which with MultiConnect can be several.
+$Global:Bearers     = [hashtable]::Synchronized(@{})
+# Kinds the host closed on purpose. The periodic re-arm walks the same chain as
+# boot, so without this it would put back, sixty seconds later, exactly the
+# transport the host just chose to shut. Cleared when the host starts it again.
+$Global:BearerOff   = [hashtable]::Synchronized(@{})
+$Global:BearerLock  = New-Object object
+# Portal -> supervisor mailbox. HTTP workers must never touch WinRT themselves
+# (wrong apartment, and the AP functions are not in their session state), so a
+# switch request is queued here and the supervisor runspace performs it.
+$Global:BearerCmd   = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
+# Broadcast bus: bearer changes, failovers, host announcements. Clients pull
+# anything newer than the sequence number they last saw, off /api/state.
+$Global:Notices     = [hashtable]::Synchronized(@{ Seq = 0; Items = (New-Object System.Collections.ArrayList) })
+$Global:NoticeLock  = New-Object object
+$Global:ApWatch     = [hashtable]::Synchronized(@{ Stop=$false; Restarts=0; Switching=$false })
 # .dat extension on purpose: transfer import scans .meta\*.json and must skip this
 $Global:SessionFile = Join-Path $Global:MetaFolder 'sessions.dat'
 
@@ -145,6 +185,128 @@ function New-ShortId {
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($b) } finally { $rng.Dispose() }
     return ([System.BitConverter]::ToString($b) -replace '-','').ToLowerInvariant()
+}
+
+# ====================== BEARER REGISTRY + NOTICE BUS ==========================
+# The registry is the one place that knows which ways in are open. Two consumers
+# read it from different threads - the HTTP workers (for the client filter and
+# the network panel) and the supervisor runspace (for health and failover) - so
+# it is a synchronized hashtable and every write goes through here.
+
+function Get-BearerLabel {
+    param([string]$Kind, [string]$Ssid)
+    switch ($Kind) {
+        'wifidirect' { 'Wi-Fi Direct group' }
+        'hotspot'    { 'Mobile Hotspot' }
+        'station'    { if ($Ssid) { 'Joined "{0}"' -f $Ssid } else { 'Joined a saved network' } }
+        'lan'        { 'Local network' }
+        'bluetooth'  { 'Bluetooth PAN' }
+        default      { 'None' }
+    }
+}
+
+function Add-Notice {
+    param([string]$Kind, [string]$Text, [string]$Level = 'info')
+    # Sequence-numbered so a client can ask for "anything after N" and never see
+    # the same message twice, however often it polls.
+    [System.Threading.Monitor]::Enter($Global:NoticeLock)
+    try {
+        $Global:Notices.Seq = [int]$Global:Notices.Seq + 1
+        [void]$Global:Notices.Items.Add([pscustomobject]@{
+            seq   = $Global:Notices.Seq
+            kind  = $Kind
+            level = $Level
+            text  = $Text
+            at    = (Get-Date).ToString('o')
+        })
+        # A device that has been asleep for an hour does not need the whole log.
+        while ($Global:Notices.Items.Count -gt 40) { $Global:Notices.Items.RemoveAt(0) }
+    } finally { [System.Threading.Monitor]::Exit($Global:NoticeLock) }
+    Write-Host ('  [notice] {0}' -f $Text) -ForegroundColor DarkCyan
+}
+
+function Get-NoticesAfter {
+    param([int]$Since = 0)
+    $out = @()
+    [System.Threading.Monitor]::Enter($Global:NoticeLock)
+    try { foreach ($n in $Global:Notices.Items) { if ([int]$n.seq -gt $Since) { $out += $n } } }
+    finally { [System.Threading.Monitor]::Exit($Global:NoticeLock) }
+    return $out
+}
+
+function Set-BearerRecord {
+    param(
+        [string]$Kind, [string]$Ssid = '', [string]$Pass = '',
+        [string]$IP = '', [int]$Prefix = 24, [string]$Note = '', [bool]$Up = $true,
+        # Extra subnets this bearer also answers on, as @{IP;Prefix}. Only the
+        # LAN bearer uses it: a host wired to Ethernet and joined to the same
+        # site's Wi-Fi is on two subnets, and "serve the local network" means
+        # both, not whichever one scored higher.
+        [array]$Alt = @()
+    )
+    [System.Threading.Monitor]::Enter($Global:BearerLock)
+    try {
+        $existing = $Global:Bearers[$Kind]
+        $since = if ($existing -and $existing.Since) { $existing.Since } else { Get-Date }
+        # Primary survives a re-register: the hotspot keepalive rewrites this
+        # record every time it re-raises the AP, and losing the flag there would
+        # make the banner and the panel disagree about what is carrying.
+        $wasPrimary = [bool]($existing -and $existing.Primary)
+        $Global:Bearers[$Kind] = @{
+            Kind = $Kind; Ssid = $Ssid; Pass = $Pass; IP = $IP; Prefix = $Prefix
+            Up = $Up; Since = $since; Note = $Note; Primary = $wasPrimary
+            Alt = @($Alt)
+            Label = (Get-BearerLabel -Kind $Kind -Ssid $Ssid)
+        }
+    } finally { [System.Threading.Monitor]::Exit($Global:BearerLock) }
+}
+
+function Remove-BearerRecord {
+    param([string]$Kind)
+    [System.Threading.Monitor]::Enter($Global:BearerLock)
+    try { if ($Global:Bearers.ContainsKey($Kind)) { [void]$Global:Bearers.Remove($Kind) } }
+    finally { [System.Threading.Monitor]::Exit($Global:BearerLock) }
+}
+
+function Get-ActiveBearers {
+    $out = @()
+    foreach ($k in @($Global:Bearers.Keys)) {
+        $b = $Global:Bearers[$k]
+        if ($b -and $b.Up -and $b.IP) { $out += $b }
+    }
+    return @($out)
+}
+
+function Set-PrimaryBearer {
+    param([string]$Kind)
+    # $Global:Bearer is the compatibility mirror. Keeping it in step means the
+    # captive redirect, the lobby QR and the banner keep working untouched.
+    $b = $Global:Bearers[$Kind]
+    if (-not $b) { return $false }
+    $Global:Bearer.Mode   = $Kind
+    $Global:Bearer.Ssid   = $b.Ssid
+    $Global:Bearer.Pass   = $b.Pass
+    $Global:Bearer.IP     = $b.IP
+    $Global:Bearer.Prefix = $b.Prefix
+    foreach ($k in @($Global:Bearers.Keys)) { $Global:Bearers[$k].Primary = ($k -eq $Kind) }
+    return $true
+}
+
+function Test-HostRequest {
+    param($Req)
+    # "Is this the machine running the portal?" Since the listener binds every
+    # interface, the host browser arrives either on loopback or on one of our own
+    # bearer addresses - neither of which a remote client can forge as a source.
+    $ip = $Req.ClientIp
+    if (-not $ip) { return $false }
+    if ($ip -eq '127.0.0.1' -or $ip -eq '::1') { return $true }
+    foreach ($b in (Get-ActiveBearers)) {
+        if ($ip -eq $b.IP) { return $true }
+        # An address of ours on a second local subnet is still ours: the host
+        # browser reaches a LAN-bearer portal by whichever interface routes first.
+        foreach ($a in @($b.Alt)) { if ($a -and $ip -eq $a.IP) { return $true } }
+    }
+    return $false
 }
 
 function Get-DeviceLabel {
@@ -804,8 +966,39 @@ function Send-ZipDownload {
 }
 
 # ============================== STATE JSON ====================================
+function Get-BearerListJson {
+    # Shape shared by /api/state and /api/bearers so the client has one renderer.
+    # Every kind the build knows about is listed, running or not, because the
+    # network panel needs to offer the ones that are off as switch targets.
+    $known = @('wifidirect','hotspot','station','lan','bluetooth')
+    $out = @()
+    foreach ($kind in $known) {
+        $b = $Global:Bearers[$kind]
+        $enabled = switch ($kind) {
+            'station'   { [bool]$Global:StationFallback }
+            'lan'       { [bool]$Global:LanBearer }
+            'bluetooth' { [bool]$Global:BluetoothPan }
+            default     { $true }
+        }
+        $out += [pscustomobject]@{
+            kind    = $kind
+            label   = (Get-BearerLabel -Kind $kind -Ssid $(if ($b) { $b.Ssid } else { '' }))
+            up      = [bool]($b -and $b.Up)
+            primary = [bool]($Global:Bearer.Mode -eq $kind)
+            ip      = $(if ($b) { $b.IP } else { '' })
+            ssid    = $(if ($b) { $b.Ssid } else { '' })
+            note    = $(if ($b) { $b.Note } else { '' })
+            enabled = $enabled
+            # Distinguishes "the host closed this" from "this never came up",
+            # so the panel does not look broken after a deliberate stop.
+            closed  = [bool]$Global:BearerOff.ContainsKey($kind)
+        }
+    }
+    return $out
+}
+
 function Get-StateJson {
-    param([string]$Sid)
+    param([string]$Sid, [int]$NoticeSince = 0, [bool]$IsHost = $false)
     Invoke-PeriodicSweep
     $me  = $Global:Sessions[$Sid]
     $now = Get-Date
@@ -913,6 +1106,19 @@ function Get-StateJson {
         transfers = $entries
         p2p       = [bool]$Global:P2P
         signals   = @(Get-SignalsFor -Pub $me.PubId)
+        # Failover announcements. The client sends back the highest seq it has
+        # seen, so a device that was asleep gets the backlog once and never a
+        # repeat. noticeSeq is sent even when the list is empty, so a client
+        # joining mid-run starts from "now" instead of replaying old alarms.
+        notices   = @(Get-NoticesAfter -Since $NoticeSince)
+        noticeSeq = [int]$Global:Notices.Seq
+        bearers   = @(Get-BearerListJson)
+        bearer    = (Get-BearerLabel -Kind $Global:Bearer.Mode -Ssid $Global:Bearer.Ssid)
+        multi     = [bool]$Global:MultiConnect
+        switching = [bool]$Global:ApWatch.Switching
+        # Only the machine running the portal gets the network controls. A phone
+        # that could switch bearers could also cut every other phone off.
+        isHost    = $IsHost
     }
     return ($payload | ConvertTo-Json -Depth 8 -Compress)
 }
@@ -1047,6 +1253,23 @@ function Get-DashboardPage {
   .connect-flex{display:flex;gap:26px;align-items:center;flex-wrap:wrap}
   .url-box{font-size:16px;font-weight:600;background:var(--bg);padding:11px 15px;border-radius:9px;border:1px solid var(--border);margin-bottom:12px;word-break:break-all;letter-spacing:.3px}
   #qrbox{background:#fff;padding:10px;border-radius:10px;line-height:0}
+  #lobbyBtn{margin-top:12px;text-decoration:none;display:inline-block}
+  .bearer-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
+  .bearer{background:var(--bg);border:1px solid var(--border);border-radius:11px;padding:13px 14px;display:flex;flex-direction:column;gap:5px}
+  .bearer.on{border-color:var(--ok);box-shadow:0 0 0 1px rgba(79,247,142,.18) inset}
+  .bearer.primary{border-color:var(--accent);box-shadow:0 0 0 1px rgba(79,142,247,.22) inset}
+  .bearer.off{opacity:.5}
+  .bearer .bname{font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:7px}
+  .bearer .bmeta{font-size:11.5px;color:var(--muted);word-break:break-all;min-height:14px}
+  .bearer .brow{display:flex;gap:7px;margin-top:6px;flex-wrap:wrap}
+  .bearer .bbtn{flex:1;background:transparent;border:1px solid var(--border);color:var(--muted);padding:5px 9px;border-radius:7px;font-size:12px;cursor:pointer;font-family:inherit}
+  .bearer .bbtn:hover:not(:disabled){color:var(--text);border-color:var(--accent)}
+  .bearer .bbtn:disabled{opacity:.35;cursor:default}
+  .bearer .bbtn.danger:hover:not(:disabled){color:var(--err);border-color:var(--err)}
+  .bdot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none}
+  .bdot.up{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  .bdot.pri{background:var(--accent);box-shadow:0 0 6px var(--accent)}
+  .btag{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);font-weight:700}
   .hint{color:var(--muted);font-size:12px;margin-top:10px}
   .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:60;align-items:center;justify-content:center}
   .modal-bg.show{display:flex}
@@ -1086,7 +1309,8 @@ function Get-DashboardPage {
       </div>
       <span id="onlineCount" style="color:var(--muted)">...</span>
       <button class="hbtn" id="inviteBtn" title="Show connection link and QR code">&#128279; Invite</button>
-      <button class="hbtn" id="notifBtn" title="Toggle sound + browser notifications">&#128276;</button>
+      <button class="hbtn" id="netBtn" style="display:none" title="Transports: switch how this portal is carried">&#128246; Network</button>
+      <button class="hbtn" id="notifBtn" title="Sound + notifications on send and receive - click to toggle">&#128276;</button>
       <a class="logout" href="/logout">&#128682; Sign Out</a>
     </div>
   </header>
@@ -1099,9 +1323,17 @@ function Get-DashboardPage {
           <div class="url-box" id="urlBox"></div>
           <button class="btn" id="copyUrl">&#128203; Copy Link</button>
           <div class="hint">Other device must be on the same Wi-Fi.<br>Scan the QR or open the link, then enter the password.</div>
+          <a class="btn ghost" id="lobbyBtn" href="/lobby" style="display:none">&#128273; Go to Lobby</a>
         </div>
         <div id="qrbox"></div>
       </div>
+    </section>
+
+    <section class="panel" id="netPanel" style="display:none">
+      <h2>Transports <span class="target-chip" id="netNow">...</span></h2>
+      <div id="bearerList" class="bearer-grid"></div>
+      <div class="hint" id="netHint">Switching moves the portal onto another carrier. Devices on the old
+      one are told to rejoin from the lobby - open it on this screen for the new QR.</div>
     </section>
 
     <section class="panel">
@@ -1171,6 +1403,8 @@ function Get-DashboardPage {
   var target='public';
   var queued=[];
   var uploading=false;
+  var noticeSeq=0;          // highest bearer/failover notice this tab has shown
+  var bearerBusy=false;     // a switch is queued; buttons stay dead until it lands
   var seq=0;
   var filter='all';
   var toasts=document.getElementById('toasts');
@@ -1190,10 +1424,15 @@ function Get-DashboardPage {
 
   async function fetchState(){
     try{
-      var r=await fetch('/api/state',{cache:'no-store'});
+      var r=await fetch('/api/state?ns='+noticeSeq,{cache:'no-store'});
       if(r.status===401){location.href='/';return;}
       if(!r.ok)return;
       var st=await r.json();
+      // Bearer news is handled before the uploading guard below: a failover is
+      // exactly the moment a mid-upload client most needs to be told.
+      if(st.notices&&st.notices.length)showNotices(st.notices);
+      if(typeof st.noticeSeq==='number')noticeSeq=Math.max(noticeSeq,st.noticeSeq);
+      renderBearers(st);
       // Signals must drain even mid-upload: a P2P sender is "uploading" while it
       // waits for the peer's answer, and bailing out here would deadlock it.
       if(st.signals&&st.signals.length)handleSignals([].concat(st.signals));
@@ -1610,6 +1849,7 @@ function Get-DashboardPage {
   function finishRun(msg,type){
     bar.style.width='100%';
     toast(msg,type||'ok');
+    if((type||'ok')==='ok')notifySent(msg);
     currentRun=null;
     setTimeout(function(){uploading=false;renderQueue();fetchState();bar.style.width='0';barWrap.classList.remove('show');document.getElementById('upStats').textContent='';},900);
   }
@@ -1682,7 +1922,7 @@ function Get-DashboardPage {
     try{
       var r=await fetch('/upload?target='+encodeURIComponent(target),{method:'POST',body:fd});
       var j=await r.json();
-      if(j.ok){toast('Text sent','ok');inp.value='';fetchState();}
+      if(j.ok){toast('Text sent','ok');notifySent('Text sent');inp.value='';fetchState();}
       else toast('Failed: '+(j.msg||r.status),'err');
     }catch(e){toast('Connection error','err');}
   }
@@ -1697,19 +1937,34 @@ function Get-DashboardPage {
     localStorage.setItem('lfpNotif',notifOn?'1':'0');
     if(notifOn && window.Notification && Notification.permission==='default'){Notification.requestPermission();}
     syncNotifBtn();
-    toast(notifOn?'Notifications on':'Notifications off','info');
+    // Play it on the way on. Browsers only allow audio after a user gesture, so
+    // this click is also what unlocks the AudioContext for every later beep -
+    // without it the first real transfer would be silent.
+    if(notifOn)beep();
+    toast(notifOn?'Sound + notifications on (sending and receiving)':'Sound + notifications off','info');
   });
   syncNotifBtn();
-  function beep(){
+  // Two tones, so you can tell what happened without looking: rising for
+  // something arriving, falling for something of yours that finished going out.
+  function tone(freqs,ms){
     try{
       var ctx=new (window.AudioContext||window.webkitAudioContext)();
-      var o=ctx.createOscillator();var g=ctx.createGain();
-      o.connect(g);g.connect(ctx.destination);
-      o.frequency.value=880;g.gain.value=0.06;
-      o.start();
-      setTimeout(function(){o.stop();ctx.close();},180);
+      var t0=ctx.currentTime,step=(ms/1000)/freqs.length;
+      freqs.forEach(function(f,i){
+        var o=ctx.createOscillator(),g=ctx.createGain();
+        o.connect(g);g.connect(ctx.destination);
+        o.frequency.value=f;
+        // Ramped rather than switched: a raw gate on a square edge clicks.
+        g.gain.setValueAtTime(0.0001,t0+i*step);
+        g.gain.exponentialRampToValueAtTime(0.07,t0+i*step+0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001,t0+(i+1)*step);
+        o.start(t0+i*step);o.stop(t0+(i+1)*step);
+      });
+      setTimeout(function(){try{ctx.close();}catch(e){}},ms+220);
     }catch(e){}
   }
+  function beep(){tone([740,1046],240);}       // inbound
+  function beepSent(){tone([1046,700],220);}   // outbound complete
   function notifyInbound(title,body){
     if(!notifOn)return;
     beep();
@@ -1717,6 +1972,87 @@ function Get-DashboardPage {
       try{new Notification(title,{body:body});}catch(e){}
     }
   }
+  function notifySent(msg){
+    if(!notifOn)return;
+    beepSent();
+  }
+
+  // ---- Transports: status, switching, failover notices ---------------------
+  var BEARER_ICON={wifidirect:'📶',hotspot:'📡',station:'🔗',lan:'🌐',bluetooth:'🔵'};
+  function showNotices(list){
+    list.forEach(function(n){
+      toast(n.text, n.level==='err'?'err':(n.level==='warn'?'info':'info'));
+      // A failover can happen while the phone is in a pocket, and the next thing
+      // the user does is wonder why the page is dead. Make it audible.
+      notifyInbound('Local File Portal', n.text);
+    });
+    bearerBusy=false;
+  }
+  var netState=null;
+  function renderBearers(st){
+    // Cached separately from `state`: that one is frozen while an upload runs,
+    // and the transport panel is precisely what you want live during one.
+    if(st)netState=st; else st=netState;
+    if(!st)return;
+    var panel=document.getElementById('netPanel'),btn=document.getElementById('netBtn');
+    var lobby=document.getElementById('lobbyBtn');
+    if(!st.isHost){btn.style.display='none';panel.style.display='none';lobby.style.display='none';return;}
+    btn.style.display='';
+    lobby.style.display='inline-block';
+    document.getElementById('netNow').textContent=st.bearer||'None';
+    if(panel.style.display==='none')return;      // panel closed: nothing to draw
+    var host=document.getElementById('bearerList');
+    var busy=bearerBusy||st.switching;
+    host.innerHTML='';
+    (st.bearers||[]).forEach(function(b){
+      var d=document.createElement('div');
+      d.className='bearer'+(b.primary?' primary':(b.up?' on':''))+(b.enabled?'':' off');
+      var dot='<span class="bdot'+(b.primary?' pri':(b.up?' up':''))+'"></span>';
+      var tag=b.primary?'<span class="btag">carrying</span>':'';
+      var meta=b.up?((b.ssid?esc(b.ssid)+' &middot; ':'')+esc(b.ip||''))
+                   :(b.closed?'closed by you - it will stay closed':(b.enabled?'not running':'disabled in settings'));
+      if(b.note)meta+='<br>'+esc(b.note);
+      var row='';
+      if(b.enabled){
+        row='<div class="brow">'+
+          '<button class="bbtn" data-op="switch" data-kind="'+b.kind+'"'+((b.primary||busy)?' disabled':'')+'>'+(b.up?'Make primary':'Start &amp; use')+'</button>'+
+          (b.up?('<button class="bbtn danger" data-op="stop" data-kind="'+b.kind+'"'+(busy?' disabled':'')+'>Stop</button>'):'')+
+          '</div>';
+      }
+      d.innerHTML='<div class="bname">'+dot+(BEARER_ICON[b.kind]||'')+' '+esc(b.label)+' '+tag+'</div>'+
+                  '<div class="bmeta">'+meta+'</div>'+row;
+      host.appendChild(d);
+    });
+    document.getElementById('netHint').textContent = busy
+      ? 'Working... the host is bringing that transport up.'
+      : (st.multi ? 'Every running transport accepts devices at once. Stopping one only closes that way in - the portal keeps serving on the rest.'
+                  : 'One transport at a time. Switching closes the current one.');
+    host.querySelectorAll('.bbtn').forEach(function(b){
+      b.addEventListener('click',function(){bearerCmd(b.dataset.op,b.dataset.kind);});
+    });
+  }
+  async function bearerCmd(op,kind){
+    if(bearerBusy)return;
+    if(op==='stop' && !confirm('Close this way in? Devices using it will drop off.'))return;
+    bearerBusy=true;renderBearers(null);
+    try{
+      var r=await fetch('/api/bearer',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'op='+encodeURIComponent(op)+'&kind='+encodeURIComponent(kind)});
+      var j=await r.json();
+      if(!j.ok){bearerBusy=false;toast(j.msg||('Failed ('+r.status+')'),'err');renderBearers(null);return;}
+      toast('Requested - the host is switching...','info');
+      // The supervisor answers with a notice, not with this response, so poll
+      // hard until it arrives instead of leaving the panel stale for 4s.
+      setPoll(1000);setTimeout(function(){setPoll(4000);},15000);
+    }catch(e){bearerBusy=false;toast('Connection error','err');}
+  }
+  document.getElementById('netBtn').addEventListener('click',function(){
+    var p=document.getElementById('netPanel');
+    var show=(p.style.display==='none');
+    p.style.display=show?'block':'none';
+    document.getElementById('netBtn').classList.toggle('on',show);
+    if(show)renderBearers(null);
+  });
 
   // ---- P2P: WebRTC DataChannel, server only brokers the handshake ----------
   // No STUN/TURN: one L2 segment, no internet. Host candidates are all we need.
@@ -2004,6 +2340,7 @@ function Get-LobbyPage {
     <div id="qrUrl" class="qr"></div>
     <div class="url">$([System.Web.HttpUtility]::HtmlEncode($Url))</div>
     <p class="hint">$(if ($oneQr) { 'Only needed if the portal did not pop up on its own.' } else { 'Once joined, scan this or type the address.' }) Then enter the portal password.</p>
+    <a class="gobtn" href="/dashboard">Open the portal on this screen &rarr;</a>
   </div>
 "@
 
@@ -2033,30 +2370,94 @@ h2{margin:0 0 14px;font-size:19px}
 .url{font-family:ui-monospace,Consolas,monospace;font-size:17px;color:var(--ok);word-break:break-all;margin-bottom:14px}
 .status{margin-top:26px;color:var(--muted);font-size:14px}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--ok);margin-right:7px;vertical-align:middle}
+.gobtn{display:inline-block;margin-top:6px;padding:10px 18px;border-radius:9px;background:var(--acc);color:#fff;text-decoration:none;font-size:14px;font-weight:600}
+.gobtn:hover{filter:brightness(1.12)}
+.gobtn.ghost{background:transparent;border:1px solid var(--acc);color:var(--acc)}
+.bearers{margin-top:18px;display:flex;gap:9px;flex-wrap:wrap}
+.bchip{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid #232a34;border-radius:20px;padding:6px 13px;font-size:12.5px;color:var(--muted)}
+.bchip.up{color:var(--ink)}
+.bchip.pri{border-color:var(--acc);color:var(--ink)}
+.bchip i{width:8px;height:8px;border-radius:50%;background:#3a4150;display:block}
+.bchip.up i{background:var(--ok)}
+.bchip.pri i{background:var(--acc)}
+.alerts{margin-top:16px;display:flex;flex-direction:column;gap:8px}
+.alert{padding:10px 14px;border-radius:9px;font-size:13px;background:#2a2413;border:1px solid var(--warn);color:var(--warn)}
+.alert.err{background:#2a1316;border-color:#f7566f;color:#f7869a}
 </style></head><body>
 <h1>Local File Portal</h1>
-<p class="sub">$modeLabel &middot; this machine is the network</p>
+<p class="sub"><span id="modeLbl">$modeLabel</span> &middot; this machine is the network</p>
 <div class="grid">
 $step1
 $step2
 </div>
-<div class="status"><span class="dot"></span><span id="cnt">no devices signed in yet</span></div>
+<div class="bearers" id="bearers"></div>
+<div class="alerts" id="alerts"></div>
+<div class="status"><span class="dot"></span><span id="cnt">no devices signed in yet</span>
+  &nbsp;&middot;&nbsp; <a class="gobtn ghost" style="padding:4px 12px;font-size:12.5px" href="/dashboard">Go to the portal</a></div>
 <script src="/qr.js"></script>
 <script>
 (function(){
   function draw(id,text){
     var el=document.getElementById(id);
-    if(!el||!text||!window.QRCode){if(el)el.style.display='none';return;}
+    if(!el){return;}
+    if(!text||!window.QRCode){el.style.display='none';return;}
+    el.style.display='flex';el.innerHTML='';
     try{new QRCode(el,{text:text,width:188,height:188,colorDark:'#000',colorLight:'#fff',correctLevel:QRCode.CorrectLevel.M});}
     catch(e){el.style.display='none';}
   }
+  function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  function wifiPayload(ssid,pass){
+    if(!ssid||!pass)return null;
+    var e=function(s){return String(s).replace(/([\\\\;:,"])/g,'\\\\$1');};
+    return 'WIFI:T:WPA;S:'+e(ssid)+';P:'+e(pass)+';H:false;;';
+  }
   draw('qrWifi',$wifiJs);
   draw('qrUrl','$Url');
+
+  // The lobby is the one screen that must survive a failover, because it is
+  // where people are sent to rejoin. Anything the host switches - SSID, address,
+  // whether there is a joinable AP at all - is re-read here and redrawn, so a
+  // code left on screen never points at a network that has already gone.
+  var lastSig='';
   function tick(){
     fetch('/api/lobby',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){
+      if(!j||!j.ok)return;
       var n=j.online||0;
       document.getElementById('cnt').textContent = n===0 ? 'no devices signed in yet'
         : (n+' device'+(n===1?'':'s')+' signed in');
+
+      var sig=[j.mode,j.ssid,j.pass,j.url,j.key].join('|');
+      if(sig!==lastSig){
+        lastSig=sig;
+        document.getElementById('modeLbl').textContent=j.label||'';
+        var url=j.url+(j.key?('?k='+j.key):'');
+        draw('qrUrl',url);
+        var uEl=document.querySelector('.url'); if(uEl)uEl.textContent=j.url;
+        var hasAp=(j.mode==='wifidirect'||j.mode==='hotspot');
+        draw('qrWifi',hasAp?wifiPayload(j.ssid,j.pass):null);
+        var kv=document.querySelectorAll('.kv b');
+        if(kv.length>=2){kv[0].textContent=j.ssid||'-';kv[1].textContent=j.pass||'-';}
+      }
+
+      var bl=document.getElementById('bearers');
+      bl.innerHTML='';
+      (j.bearers||[]).forEach(function(b){
+        if(!b.enabled&&!b.up)return;
+        var d=document.createElement('div');
+        d.className='bchip'+(b.primary?' pri':(b.up?' up':''));
+        d.innerHTML='<i></i><span>'+esc(b.label)+(b.primary?' &middot; carrying':(b.up?' &middot; also up':' &middot; off'))+'</span>';
+        bl.appendChild(d);
+      });
+
+      var al=document.getElementById('alerts');
+      al.innerHTML='';
+      (j.notices||[]).slice(-3).forEach(function(nn){
+        if(nn.level!=='warn'&&nn.level!=='err')return;
+        var d=document.createElement('div');
+        d.className='alert'+(nn.level==='err'?' err':'');
+        d.textContent=nn.text;
+        al.appendChild(d);
+      });
     }).catch(function(){});
   }
   tick(); setInterval(tick,3000);
@@ -2075,13 +2476,24 @@ function Invoke-RequestRouter {
     # arriving with a Host that is not ours is an OS connectivity probe (or a
     # stray request for some other site). Redirecting makes the phone show its
     # "sign in to network" sheet and open the portal on its own - one QR.
-    if ($Global:CaptivePortal -and $Global:Bearer.Mode -ne 'none') {
+    # Gated on Dns, not on "some bearer is up". Redirecting only makes sense when
+    # our own resolver is what answered the lookup; on the LAN and station
+    # bearers it never binds, and intercepting there would bounce a device that
+    # reached us perfectly well by address.
+    if ($Global:CaptivePortal -and $Global:Bearer.Dns) {
         $hostHdr = ''
         if ($Req.Headers -and $Req.Headers.ContainsKey('host')) { $hostHdr = $Req.Headers['host'] }
-        $mine = @(
-            ('{0}:{1}' -f $Global:Bearer.IP, $Global:Port),
-            $Global:Bearer.IP
-        )
+        # Every address we answer on, not just the primary: with MultiConnect a
+        # device may legitimately arrive via a secondary bearer or a second local
+        # subnet, and that is not a probe to be redirected.
+        $mine = @()
+        foreach ($b in (Get-ActiveBearers)) {
+            foreach ($ip in (@($b.IP) + @(@($b.Alt) | ForEach-Object { if ($_) { $_.IP } }))) {
+                if (-not $ip) { continue }
+                $mine += ('{0}:{1}' -f $ip, $Global:Port)
+                $mine += $ip
+            }
+        }
         if ($hostHdr -and ($mine -notcontains $hostHdr.ToLowerInvariant())) {
             # Carry the one-scan key so the phone lands inside the portal rather
             # than on a password box. Only set where auto-login is allowed.
@@ -2140,20 +2552,33 @@ function Invoke-RequestRouter {
 
         '/lobby' {
             # Host screen only: this page shows the Wi-Fi passphrase in clear text.
-            # The listener binds to the bearer IP, so the host browser arrives from it.
-            if ($Req.ClientIp -ne $Global:Bearer.IP) { Send-HtmlResponse -Stream $Stream -Html '<h1>404</h1>' -Status 404; return }
+            # With the listener on every interface the host can arrive on loopback
+            # as well as on a bearer address, so the check moved to Test-HostRequest.
+            if (-not (Test-HostRequest -Req $Req)) { Send-HtmlResponse -Stream $Stream -Html '<h1>404</h1>' -Status 404; return }
             Send-HtmlResponse -Stream $Stream -Html (Get-LobbyPage -Url (Get-PortalUrl))
         }
 
         '/api/lobby' {
-            if ($Req.ClientIp -ne $Global:Bearer.IP) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 404; return }
+            if (-not (Test-HostRequest -Req $Req)) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 404; return }
             $n = 0
             $now = Get-Date
             foreach ($k in @($Global:Sessions.Keys)) {
                 $s = $Global:Sessions[$k]
                 if ($s -and (($now - $s.LastSeen) -lt $Global:DeviceTTL)) { $n++ }
             }
-            Send-JsonResponse -Stream $Stream -Json ('{"ok":true,"online":' + $n + '}') -Status 200
+            # The lobby re-renders its QR when the bearer changes underneath it,
+            # so a failover does not leave a code on screen that joins a dead AP.
+            $payload = [pscustomobject]@{
+                ok = $true; online = $n
+                mode = $Global:Bearer.Mode; ssid = $Global:Bearer.Ssid; pass = $Global:Bearer.Pass
+                url = (Get-PortalUrl)
+                key = $Global:AutoLoginKey
+                dns = [bool]$Global:Bearer.Dns
+                label = (Get-BearerLabel -Kind $Global:Bearer.Mode -Ssid $Global:Bearer.Ssid)
+                bearers = @(Get-BearerListJson)
+                notices = @(Get-NoticesAfter -Since 0)
+            }
+            Send-JsonResponse -Stream $Stream -Json ($payload | ConvertTo-Json -Depth 5 -Compress) -Status 200
         }
 
         '/rtc/signal' {
@@ -2209,8 +2634,53 @@ function Invoke-RequestRouter {
         '/api/state' {
             $sid = Test-ValidSession -Req $Req
             if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 401; return }
-            $json = Get-StateJson -Sid $sid
+            $q = [System.Web.HttpUtility]::ParseQueryString($Req.Query)
+            $since = 0
+            if ($q['ns']) { [void][int]::TryParse($q['ns'], [ref]$since) }
+            $json = Get-StateJson -Sid $sid -NoticeSince $since -IsHost (Test-HostRequest -Req $Req)
             Send-JsonResponse -Stream $Stream -Json $json -Status 200
+        }
+
+        '/api/bearer' {
+            # Transport control. Host-only, and it never performs the operation
+            # inline: WinRT AP calls belong to the supervisor thread, so this
+            # validates the request and drops it in the mailbox. The client sees
+            # the result on its next /api/state poll, as a notice.
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 401; return }
+            if (-not (Test-HostRequest -Req $Req)) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"host only"}' -Status 403; return
+            }
+            if ($method -ne 'POST') { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 405; return }
+            $bt = [System.Text.Encoding]::UTF8.GetString($Req.Body)
+            $form = [System.Web.HttpUtility]::ParseQueryString($bt)
+            $op = $form['op']; $kind = $form['kind']
+            if ($op -notin @('switch','start','stop')) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"bad op"}' -Status 400; return
+            }
+            if ($kind -notin @('wifidirect','hotspot','station','lan','bluetooth')) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"bad kind"}' -Status 400; return
+            }
+            # @(...) is load-bearing: a single bearer comes back as a bare
+            # hashtable, and .Count on one of those is its key count, not 1.
+            if ($op -eq 'stop' -and @(Get-ActiveBearers).Count -le 1) {
+                # Refusing here rather than in the supervisor keeps the reason on
+                # the button that was pressed.
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"that is the only way in - start another first"}' -Status 409; return
+            }
+            $Global:BearerCmd.Enqueue(@{ Op = $op; Kind = $kind })
+            Send-JsonResponse -Stream $Stream -Json '{"ok":true,"queued":true}' -Status 200
+        }
+
+        '/api/bearers' {
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 401; return }
+            $payload = [pscustomobject]@{
+                ok = $true; isHost = (Test-HostRequest -Req $Req)
+                bearers = @(Get-BearerListJson); multi = [bool]$Global:MultiConnect
+                switching = [bool]$Global:ApWatch.Switching
+            }
+            Send-JsonResponse -Stream $Stream -Json ($payload | ConvertTo-Json -Depth 5 -Compress) -Status 200
         }
 
         '/api/nick' {
@@ -2412,54 +2882,261 @@ function Start-ApHotspot {
     return $true
 }
 
-function Start-ApWatchdog {
-    param([string]$Ssid, [string]$Pass)
-    # Windows powers the Mobile Hotspot down after ~5 minutes with no client
-    # attached. Measured here: AP raised at T, gone by T+6min. That kills the
-    # whole point - you start the portal, walk to the other device, and the
-    # network has vanished. Disabling it permanently means writing
-    # HKLM\SYSTEM\CurrentControlSet\Services\icssvc\Settings (admin), so instead
-    # we watch and re-raise it. A bound TcpListener survives the gap, verified,
-    # so nothing needs rebinding.
-    $rs = [runspacefactory]::CreateRunspace($Host)
+function Disable-HotspotIdleTimeout {
+    # The real fix for the 5-minute idle shutdown, when we are allowed to make
+    # it: icssvc's PeerlessTimeoutEnabled is what arms the timer. Writing it
+    # needs admin, so this is best-effort - Test-BearerHealth re-raises the AP
+    # either way, and that path is the one that has actually been exercised.
+    if (-not $Global:HotspotKeepAlive) { return $false }
+    try {
+        $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $pr = New-Object System.Security.Principal.WindowsPrincipal($id)
+        if (-not $pr.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) { return $false }
+        $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\icssvc\Settings'
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+        $cur = (Get-ItemProperty -Path $key -Name 'PeerlessTimeoutEnabled' -ErrorAction SilentlyContinue).PeerlessTimeoutEnabled
+        if ($cur -eq 0) { return $true }
+        $Global:IcsTimeoutWas = $cur     # restored on the way out
+        Set-ItemProperty -Path $key -Name 'PeerlessTimeoutEnabled' -Value 0 -Type DWord -Force
+        Write-Host '  [AP] Idle timeout disabled at the service level (admin).' -ForegroundColor Green
+        return $true
+    } catch { return $false }
+}
+
+function Restore-HotspotIdleTimeout {
+    if ($null -eq $Global:IcsTimeoutWas) { return }
+    try {
+        Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\icssvc\Settings' `
+                         -Name 'PeerlessTimeoutEnabled' -Value $Global:IcsTimeoutWas -Type DWord -Force
+    } catch {}
+    $Global:IcsTimeoutWas = $null
+}
+
+function Restart-HotspotBearer {
+    # Re-raises the Mobile Hotspot in place, keeping the run's SSID/passphrase so
+    # the join QR a phone already scanned stays valid.
+    #
+    # The old watchdog asked GetInternetConnectionProfile() first and gave up
+    # when it came back null - which is exactly the ship case, no internet, and
+    # the reason the AP still vanished at the 5-minute mark. The saved manager
+    # needs no profile lookup at all; the profile scan is only the fallback, and
+    # it now accepts any profile that owns an adapter rather than only the
+    # internet one.
+    $mgr = $Global:ApHotspotMgr
+    if (-not $mgr) {
+        $ni = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
+        $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
+        $prof = $ni::GetInternetConnectionProfile()
+        if (-not $prof) {
+            foreach ($p in $ni::GetConnectionProfiles()) {
+                if ($p.NetworkAdapter -and $p.GetNetworkConnectivityLevel() -ne 'None') { $prof = $p; break }
+            }
+        }
+        if (-not $prof) { return $false }
+        $mgr = $tm::CreateFromConnectionProfile($prof)
+        $Global:ApHotspotMgr = $mgr
+    }
+    $cfg = $mgr.GetCurrentAccessPointConfiguration()
+    $cfg.Ssid = $Global:ApSsidRun; $cfg.Passphrase = $Global:ApPassRun
+    Invoke-WinRtAction $mgr.ConfigureAccessPointAsync($cfg)
+    $res = Invoke-WinRtOp $mgr.StartTetheringAsync() ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+    return ("$($res.Status)" -eq 'Success')
+}
+
+function Test-BearerHealth {
+    # One pass over every registered bearer. Returns the list of kinds that were
+    # lost and could not be revived; the caller decides what to promote.
+    $lost = @()
+    foreach ($kind in @($Global:Bearers.Keys)) {
+        $b = $Global:Bearers[$kind]
+        if (-not $b) { continue }
+        try {
+            switch ($kind) {
+                'hotspot' {
+                    $state = ''
+                    if ($Global:ApHotspotMgr) { $state = "$($Global:ApHotspotMgr.TetheringOperationalState)" }
+                    if ($state -ne 'On') {
+                        # This is the idle shutdown, every time. A bound
+                        # TcpListener survives the gap (verified), so re-raising
+                        # is enough - nothing needs rebinding.
+                        if (Restart-HotspotBearer) {
+                            $Global:ApWatch.Restarts = [int]$Global:ApWatch.Restarts + 1
+                            $a = Wait-ApAddress -TimeoutMs 12000
+                            if ($a) { Set-BearerRecord -Kind 'hotspot' -Ssid $b.Ssid -Pass $b.Pass -IP $a.IP -Prefix $a.Prefix -Note $b.Note }
+                            Write-Host ('  [AP] Idle timeout hit - hotspot re-raised (x{0}).' -f $Global:ApWatch.Restarts) -ForegroundColor DarkYellow
+                        } else { $lost += $kind }
+                    }
+                }
+                'wifidirect' {
+                    if (-not $Global:ApPublisher -or "$($Global:ApPublisher.Status)" -ne 'Started') { $lost += $kind }
+                }
+                default {
+                    # Borrowed connections: the only question is whether the
+                    # address we bound is still on the machine. DHCP can hand out
+                    # a different one, which is a change, not a loss.
+                    $still = @(Get-NetCandidates -IncludeWired | Where-Object { $_.IP -eq $b.IP })
+                    if ($still.Count -eq 0) { $lost += $kind }
+                }
+            }
+        } catch { $lost += $kind }
+    }
+    return @($lost)
+}
+
+function Start-BearerSupervisor {
+    # One long-lived runspace owns every bearer operation after boot: health
+    # checks, the hotspot keepalive, failover, and the switch requests the portal
+    # queues. Keeping it in a single thread means the WinRT AP objects
+    # ($Global:ApHotspotMgr, $Global:ApPublisher) have exactly one home - an HTTP
+    # worker calling StopTethering from its own runspace would find them null.
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $iss.ApartmentState = 'MTA'
+    $fns = @(
+        'New-ShortId','Invoke-WinRtOp','Invoke-WinRtAction','New-ApPassphrase',
+        'Get-BearerLabel','Add-Notice','Set-BearerRecord','Remove-BearerRecord',
+        'Get-ActiveBearers','Set-PrimaryBearer','Get-NetCandidates','Wait-ApAddress',
+        'Start-ApHotspot','Start-ApWifiDirect','Start-StationBearer','Start-LanBearer',
+        'Start-BluetoothPan','Restore-ApConfig','Start-Bearer','Stop-Bearer',
+        'Start-BearerChain','Restart-HotspotBearer','Test-BearerHealth'
+    )
+    foreach ($fn in $fns) {
+        $def = (Get-Command $fn -CommandType Function).Definition
+        $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $def)))
+    }
+    $vars = @{
+        ApSsid = $Global:ApSsid; ApPrefer = $Global:ApPrefer; ApRestoreFile = $Global:ApRestoreFile
+        SelfAp = $Global:SelfAp
+        StationFallback = $Global:StationFallback; StationPrefer = $Global:StationPrefer
+        LanBearer = $Global:LanBearer; BluetoothPan = $Global:BluetoothPan
+        BearerOrder = $Global:BearerOrder; MultiConnect = $Global:MultiConnect
+        HotspotKeepAlive = $Global:HotspotKeepAlive; SuperviseMs = $Global:SuperviseMs
+        Bearers = $Global:Bearers; BearerLock = $Global:BearerLock; Bearer = $Global:Bearer
+        BearerOff = $Global:BearerOff
+        BearerCmd = $Global:BearerCmd; Notices = $Global:Notices; NoticeLock = $Global:NoticeLock
+        ApWatch = $Global:ApWatch
+    }
+    foreach ($k in $vars.Keys) {
+        $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($k, $vars[$k], '')))
+    }
+    $rs = [runspacefactory]::CreateRunspace($Host, $iss)
     $rs.Open()
     $ps = [powershell]::Create()
     $ps.Runspace = $rs
     [void]$ps.AddScript({
-        param($ssid, $pass, $flag)
         [void][System.Reflection.Assembly]::LoadWithPartialName('System.Runtime.WindowsRuntime')
-        function Await2($op, [Type]$rt) {
-            $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
-                $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
-                $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
-            $t = $m.MakeGenericMethod($rt).Invoke($null, @($op)); [void]$t.Wait(30000); $t.Result
+        $lastCheck = [datetime]::MinValue
+        $lastRearm = Get-Date
+        while (-not $Global:ApWatch.Stop) {
+
+            # --- portal requests first: a switch should feel immediate ---------
+            while ($Global:BearerCmd.Count -gt 0 -and -not $Global:ApWatch.Stop) {
+                $cmd = $null
+                try { $cmd = $Global:BearerCmd.Dequeue() } catch { break }
+                if (-not $cmd) { continue }
+                $Global:ApWatch.Switching = $true
+                try {
+                    switch ($cmd.Op) {
+                        'boot' {
+                            # Only place that unwinds a previous run's borrow.
+                            [void](Restore-ApConfig)
+                            $p = Start-BearerChain
+                            if ($p) { Add-Notice -Kind 'bearer' -Text ('Portal is on {0}.' -f (Get-BearerLabel -Kind $p -Ssid $Global:Bearer.Ssid)) }
+                            $Global:BootDone = $true
+                        }
+                        'switch' {
+                            $want = $cmd.Kind
+                            $before = $Global:Bearer.Mode
+                            # Asking for it again lifts an earlier deliberate stop.
+                            [void]$Global:BearerOff.Remove($want)
+                            if ($want -eq $before) { break }
+                            if (-not ($Global:Bearers.ContainsKey($want) -and $Global:Bearers[$want].Up)) {
+                                try { [void](Start-Bearer -Kind $want -Ssid $Global:ApSsidRun -Pass $Global:ApPassRun) }
+                                catch {
+                                    Add-Notice -Kind 'bearer' -Level 'err' -Text ('Could not switch to {0}: {1}' -f (Get-BearerLabel -Kind $want -Ssid ''), $_.Exception.Message)
+                                    break
+                                }
+                            }
+                            if (Set-PrimaryBearer -Kind $want) {
+                                Add-Notice -Kind 'bearer' -Level 'warn' -Text ('Host switched to {0}. If you drop off, rejoin from the lobby.' -f (Get-BearerLabel -Kind $want -Ssid $Global:Bearer.Ssid))
+                                # Without MultiConnect the old way in is dead weight
+                                # and, for the AP paths, a radio we want back.
+                                if (-not $Global:MultiConnect -and $before -and $before -ne 'none') { Stop-Bearer -Kind $before }
+                            }
+                        }
+                        'start' {
+                            [void]$Global:BearerOff.Remove($cmd.Kind)
+                            try {
+                                [void](Start-Bearer -Kind $cmd.Kind -Ssid $Global:ApSsidRun -Pass $Global:ApPassRun)
+                                Add-Notice -Kind 'bearer' -Text ('{0} is now available as well.' -f (Get-BearerLabel -Kind $cmd.Kind -Ssid $Global:Bearer.Ssid))
+                            } catch {
+                                Add-Notice -Kind 'bearer' -Level 'err' -Text ('Could not start {0}: {1}' -f (Get-BearerLabel -Kind $cmd.Kind -Ssid ''), $_.Exception.Message)
+                            }
+                        }
+                        'stop' {
+                            # The host asking is the ONLY thing that may take a
+                            # bearer down - never an idle timer, never a hiccup.
+                            # Remembering the choice is what makes it stick: the
+                            # re-arm below would otherwise restore it in a minute.
+                            $Global:BearerOff[$cmd.Kind] = $true
+                            if ($Global:Bearer.Mode -eq $cmd.Kind) {
+                                Stop-Bearer -Kind $cmd.Kind
+                                $p = Start-BearerChain
+                                if ($p) { Add-Notice -Kind 'bearer' -Level 'warn' -Text ('Host closed that network; moved to {0}.' -f (Get-BearerLabel -Kind $p -Ssid $Global:Bearer.Ssid)) }
+                                else { Add-Notice -Kind 'bearer' -Level 'err' -Text 'Host closed the last network.' }
+                            } else {
+                                Stop-Bearer -Kind $cmd.Kind
+                                Add-Notice -Kind 'bearer' -Text ('{0} closed by the host.' -f (Get-BearerLabel -Kind $cmd.Kind -Ssid ''))
+                            }
+                        }
+                        'stopall' {
+                            foreach ($k in @($Global:Bearers.Keys)) { try { Stop-Bearer -Kind $k } catch {} }
+                            $Global:ApWatch.Stop = $true
+                        }
+                    }
+                } catch {
+                    Write-Host ('  [bearer] command failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+                } finally { $Global:ApWatch.Switching = $false }
+            }
+
+            # --- health, on its own cadence -----------------------------------
+            if (((Get-Date) - $lastCheck).TotalMilliseconds -ge $Global:SuperviseMs) {
+                $lastCheck = Get-Date
+                try {
+                    $lost = @(Test-BearerHealth)
+                    foreach ($kind in $lost) {
+                        $wasPrimary = ($Global:Bearer.Mode -eq $kind)
+                        $label = Get-BearerLabel -Kind $kind -Ssid $Global:Bearers[$kind].Ssid
+                        Stop-Bearer -Kind $kind
+                        if ($wasPrimary) {
+                            $p = Start-BearerChain
+                            if ($p) {
+                                Add-Notice -Kind 'failover' -Level 'warn' -Text ('{0} dropped - now serving over {1}. Rejoin from the lobby if you lose the page.' -f $label, (Get-BearerLabel -Kind $p -Ssid $Global:Bearer.Ssid))
+                            } else {
+                                Add-Notice -Kind 'failover' -Level 'err' -Text ('{0} dropped and nothing else came up.' -f $label)
+                            }
+                        } else {
+                            Add-Notice -Kind 'failover' -Level 'warn' -Text ('{0} dropped. The portal is still up on the other networks.' -f $label)
+                        }
+                    }
+                    # Re-arm anything in the order that is not running, so a
+                    # bearer that failed at boot joins later when it can. Once a
+                    # minute, not every pass: retrying a station association or a
+                    # tethering start every 3s would thrash the radio for nothing.
+                    if ($Global:MultiConnect -and $lost.Count -eq 0 -and
+                        $Global:Bearer.Mode -ne 'none' -and
+                        ((Get-Date) - $lastRearm).TotalSeconds -ge 60) {
+                        $lastRearm = Get-Date
+                        [void](Start-BearerChain -Prefer $Global:Bearer.Mode)
+                    }
+                } catch {}
+            }
+
+            for ($i = 0; $i -lt 4 -and -not $Global:ApWatch.Stop; $i++) {
+                if ($Global:BearerCmd.Count -gt 0) { break }
+                Start-Sleep -Milliseconds 250
+            }
         }
-        function AwaitAction2($a) {
-            $m = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
-                $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and -not $_.IsGenericMethod -and
-                $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
-            $t = $m.Invoke($null, @($a)); [void]$t.Wait(30000)
-        }
-        $ni = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
-        $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
-        while (-not $flag.Stop) {
-            for ($i = 0; $i -lt 20 -and -not $flag.Stop; $i++) { Start-Sleep -Milliseconds 500 }
-            if ($flag.Stop) { break }
-            try {
-                $prof = $ni::GetInternetConnectionProfile()
-                if (-not $prof) { continue }
-                $mgr = $tm::CreateFromConnectionProfile($prof)
-                if ("$($mgr.TetheringOperationalState)" -eq 'Off') {
-                    $cfg = $mgr.GetCurrentAccessPointConfiguration()
-                    $cfg.Ssid = $ssid; $cfg.Passphrase = $pass
-                    AwaitAction2 $mgr.ConfigureAccessPointAsync($cfg)
-                    [void](Await2 $mgr.StartTetheringAsync() ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]))
-                    $flag.Restarts = [int]$flag.Restarts + 1
-                    Write-Host ("  [AP] Idle timeout hit - access point re-raised (x{0})." -f $flag.Restarts) -ForegroundColor DarkYellow
-                }
-            } catch {}
-        }
-    }).AddArgument($Ssid).AddArgument($Pass).AddArgument($Global:ApWatch)
+    })
     [void]$ps.BeginInvoke()
     $Global:ApWatchPs = $ps
     $Global:ApWatchRs = $rs
@@ -2513,13 +3190,30 @@ function Start-StationBearer {
         }
     } catch {}
 
+    # Whatever this machine is already associated with wins outright. Failover is
+    # meant to keep the portal reachable, not to move the host off the network it
+    # is on - and re-associating drops every connection for several seconds.
+    $current = ''
+    try {
+        $m = [regex]::Match(((netsh wlan show interfaces) -join "`n"), '(?m)^\s*SSID\s*:\s*(.+?)\s*$')
+        if ($m.Success) { $current = $m.Groups[1].Value.Trim() }
+    } catch {}
+
     $candidates = @()
     foreach ($want in $Global:StationPrefer) { if ($saved -contains $want) { $candidates += $want } }
+    if ($current -and $saved -contains $current -and $candidates -notcontains $current) {
+        $candidates = @($current) + $candidates
+    }
     foreach ($s in $saved) {
         if ($candidates -contains $s) { continue }
+        # DIRECT-* is a Wi-Fi Direct group belonging to a printer, a TV or a
+        # camera. Joining one gets an address and no other device on it, so it
+        # looks like success and is useless - and it costs the host whatever
+        # real network it was on. Only ever taken if named in StationPrefer.
+        if ($s -like 'DIRECT-*') { continue }
         if ($visible.Count -eq 0 -or $visible -contains $s) { $candidates += $s }
     }
-    if ($candidates.Count -eq 0) { throw 'no saved profile is in range' }
+    if ($candidates.Count -eq 0) { throw 'no usable saved profile is in range' }
 
     foreach ($ssid in $candidates) {
         Write-Host ('  [STA] Trying saved network: {0}' -f $ssid) -ForegroundColor DarkGray
@@ -2529,14 +3223,98 @@ function Start-StationBearer {
             $iface = netsh wlan show interfaces
             if (($iface | Select-String '^\s*State\s*:\s*connected') -and
                 ($iface | Select-String ([regex]::Escape($ssid)))) {
-                $Global:Bearer.Mode = 'station'
-                $Global:Bearer.Ssid = $ssid
-                $Global:Bearer.Pass = ''      # not ours to know or show
+                $addr = @(Get-NetCandidates | Where-Object { $_.Wireless -and -not $_.Hotspot }) | Select-Object -First 1
+                if (-not $addr) { continue }
+                # Passphrase stays empty on purpose: it is that network's, not ours
+                # to know or to print on the lobby screen.
+                Set-BearerRecord -Kind 'station' -Ssid $ssid -Pass '' -IP $addr.IP -Prefix $addr.Prefix `
+                                 -Note 'Guest on someone else network'
                 return $true
             }
         }
     }
     throw 'could not associate with any saved network'
+}
+
+function Get-NetCandidates {
+    # Every adapter that is Up and holds a real IPv4 address, classified. The AP
+    # bearers, the LAN bearer and the Bluetooth bearer all pick out of this one
+    # list, so "which address do I bind" is answered in a single place.
+    param([switch]$IncludeWired)
+    $out = @()
+    try {
+        foreach ($a in (Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })) {
+            $isBt = ($a.Name -match 'Bluetooth' -or $a.InterfaceDescription -match 'Bluetooth')
+            $isWifi = (-not $isBt) -and (
+                $a.PhysicalMediaType -match '802\.11' -or
+                $a.NdisPhysicalMedium -eq 'Native802_11' -or
+                $a.Name -match 'Wi-?Fi|Wireless|WLAN' -or
+                $a.InterfaceDescription -match 'Wireless|Wi-?Fi|802\.11'
+            )
+            if (-not $isWifi -and -not $isBt -and -not $IncludeWired) { continue }
+            # AddressState matters: a freshly raised SoftAP address stays 'Tentative'
+            # for ~4s while duplicate-address detection runs, and binding a Tentative
+            # address throws "requested address is not valid in its context".
+            $ips = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue |
+                   Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' -and
+                                  ($null -eq $_.AddressState -or "$($_.AddressState)" -eq 'Preferred') }
+            foreach ($ip in $ips) {
+                $out += @{
+                    IP = $ip.IPAddress; Prefix = $ip.PrefixLength; Name = $a.Name
+                    Index = $a.ifIndex
+                    Wireless = [bool]$isWifi; Bluetooth = [bool]$isBt
+                    Hotspot = ($ip.IPAddress -like '192.168.137.*')
+                }
+            }
+        }
+    } catch {}
+    return @($out)
+}
+
+function Start-LanBearer {
+    # Raises nothing. Serves over the network this machine is already joined to,
+    # router and all - which is what every device here is probably on anyway.
+    # Wired counts: on a ship LAN the host is often on Ethernet while the phones
+    # are on the same wireless network, and both sides route fine.
+    $cands = @(Get-NetCandidates -IncludeWired | Where-Object { -not $_.Hotspot -and -not $_.Bluetooth })
+    if ($cands.Count -eq 0) { throw 'no connected network to serve from' }
+    # An adapter with a default gateway is on a real network rather than holding
+    # some leftover link-local address, so prefer those; wireless first.
+    $scored = @()
+    foreach ($c in $cands) {
+        $gw = $null
+        try { $gw = Get-NetRoute -InterfaceIndex $c.Index -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1 } catch {}
+        $scored += [pscustomobject]@{ C = $c; Score = (([int][bool]$gw) * 2 + [int][bool]$c.Wireless) }
+    }
+    $best = ($scored | Sort-Object -Property Score -Descending | Select-Object -First 1).C
+    # The address we advertise is the best one - that is what goes in the QR and
+    # the banner. But every other local subnet is admitted too, otherwise a host
+    # wired to Ethernet while the phones sit on the site Wi-Fi would serve one
+    # and lock out the other, with no way to tell from the UI which.
+    $alt = @()
+    foreach ($c in $cands) { if ($c.IP -ne $best.IP) { $alt += @{ IP = $c.IP; Prefix = $c.Prefix } } }
+    $note = 'Existing network - other devices must already be on it'
+    if ($alt.Count -gt 0) { $note += (' (+{0} more subnet{1})' -f $alt.Count, $(if ($alt.Count -eq 1) { '' } else { 's' })) }
+    Set-BearerRecord -Kind 'lan' -Ssid $best.Name -Pass '' -IP $best.IP -Prefix $best.Prefix -Alt $alt -Note $note
+    return $true
+}
+
+function Start-BluetoothPan {
+    # Deliberately thin. Windows will not bring a PAN up unattended - the phone
+    # has to be paired and then asked to join, from its own Bluetooth settings -
+    # so all this does is find the "Bluetooth Network Connection" adapter once it
+    # carries an address and bind the portal to it.
+    #
+    # Measured ~3 Mbps on this hardware. That is fine for a photo or a form and
+    # useless for anything large; the UI says so rather than letting people find
+    # out halfway through a 2 GB transfer.
+    $bt = @(Get-NetCandidates | Where-Object { $_.Bluetooth }) | Select-Object -First 1
+    if (-not $bt) {
+        throw 'no Bluetooth PAN address - pair the phone, then join the PAN from its Bluetooth settings'
+    }
+    Set-BearerRecord -Kind 'bluetooth' -Ssid $bt.Name -Pass '' -IP $bt.IP -Prefix $bt.Prefix `
+                     -Note 'About 3 Mbps - small files only'
+    return $true
 }
 
 function Restore-ApConfig {
@@ -2569,58 +3347,145 @@ function Restore-ApConfig {
     }
 }
 
-function Start-SelfAp {
-    $ssid = '{0}-{1}' -f $Global:ApSsid, ((New-ShortId 2).ToUpperInvariant())
-    $pass = New-ApPassphrase
+function Wait-ApAddress {
+    # Measured on this hardware: the SoftAP address is bindable ~4.3s after
+    # StartTethering, and until then it is 'Tentative' and binding it throws.
+    # Both AP paths land on 192.168.137.1/24 over the Wi-Fi Direct virtual
+    # adapter, so that is what we wait for.
+    param([int]$TimeoutMs = 15000)
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $hit = @(Get-NetCandidates | Where-Object { $_.Hotspot }) | Select-Object -First 1
+        if ($hit) { return $hit }
+        Start-Sleep -Milliseconds 400
+    }
+    return $null
+}
+
+function Start-Bearer {
+    # One bearer, by name. Returns $true only when it is up AND has an address we
+    # can actually bind, so a caller walking the fallback chain never promotes a
+    # bearer that would fail at listener time.
+    param([string]$Kind, [string]$Ssid = '', [string]$Pass = '')
     [void][System.Reflection.Assembly]::LoadWithPartialName('System.Runtime.WindowsRuntime')
+    if (-not $Ssid) { $Ssid = '{0}-{1}' -f $Global:ApSsid, ((New-ShortId 2).ToUpperInvariant()) }
+    if (-not $Pass) { $Pass = New-ApPassphrase }
 
-    # A previous run may have been killed before it could put things back.
-    [void](Restore-ApConfig)
+    switch ($Kind) {
+        'wifidirect' {
+            [void](Start-ApWifiDirect -Ssid $Ssid -Pass $Pass)
+            $a = Wait-ApAddress
+            if (-not $a) { try { $Global:ApPublisher.Stop() } catch {}; $Global:ApPublisher = $null; throw 'group came up but no address settled' }
+            Set-BearerRecord -Kind 'wifidirect' -Ssid $Ssid -Pass $Pass -IP $a.IP -Prefix $a.Prefix `
+                             -Note 'Closed island - no internet is shared'
+            Write-Host ('  [AP] Wi-Fi Direct group up: {0} (no internet shared)' -f $Ssid) -ForegroundColor Green
+            return $true
+        }
+        'hotspot' {
+            [void](Start-ApHotspot -Ssid $Ssid -Pass $Pass)
+            $a = Wait-ApAddress
+            if (-not $a) { throw 'tethering started but no address settled' }
+            Set-BearerRecord -Kind 'hotspot' -Ssid $Ssid -Pass $Pass -IP $a.IP -Prefix $a.Prefix `
+                             -Note 'Shares this machine internet connection'
+            Write-Host ('  [AP] Mobile Hotspot up: {0}' -f $Ssid) -ForegroundColor Green
+            Write-Host '  [AP] Note: tethering shares this machine internet connection.' -ForegroundColor DarkYellow
+            return $true
+        }
+        'station'   { return [bool](Start-StationBearer) }
+        'lan'       { return [bool](Start-LanBearer) }
+        'bluetooth' { return [bool](Start-BluetoothPan) }
+        default     { throw ('unknown bearer: {0}' -f $Kind) }
+    }
+}
 
-    # Wi-Fi Direct first by default: it is an island (nothing of the host's
-    # internet reaches the clients) and it leaves the saved hotspot config alone.
-    # Mobile Hotspot is the fallback because tethering *is* internet sharing.
-    $order = if ($Global:ApPrefer -eq 'hotspot') { @('hotspot','wifidirect') } else { @('wifidirect','hotspot') }
-
-    Write-Host '  Raising self access point...' -ForegroundColor Cyan
-    foreach ($mode in $order) {
-        try {
-            if ($mode -eq 'wifidirect') {
-                [void](Start-ApWifiDirect -Ssid $ssid -Pass $pass)
-                $Global:Bearer.Mode = 'wifidirect'
-                Write-Host ('  [AP] Wi-Fi Direct group up: {0} (no internet shared)' -f $ssid) -ForegroundColor Green
-            } else {
-                [void](Start-ApHotspot -Ssid $ssid -Pass $pass)
-                $Global:Bearer.Mode = 'hotspot'
-                Write-Host ('  [AP] Mobile Hotspot up: {0}' -f $ssid) -ForegroundColor Green
-                Write-Host '  [AP] Note: tethering shares this machine internet connection.' -ForegroundColor DarkYellow
-                Start-ApWatchdog -Ssid $ssid -Pass $pass
+function Stop-Bearer {
+    # Tears down one bearer and forgets it. The AP paths own OS-level state that
+    # outlives this process, so both are unwound explicitly; 'lan', 'station' and
+    # 'bluetooth' borrow a connection we did not create and must not disturb.
+    param([string]$Kind)
+    switch ($Kind) {
+        'hotspot' {
+            if ($Global:ApHotspotMgr) {
+                try {
+                    [void](Invoke-WinRtOp $Global:ApHotspotMgr.StopTetheringAsync() ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]))
+                    Write-Host '  [AP] Mobile Hotspot stopped.' -ForegroundColor DarkGray
+                } catch {}
+                $Global:ApHotspotMgr = $null
             }
-            $Global:Bearer.Ssid = $ssid; $Global:Bearer.Pass = $pass
-            return $true
-        } catch {
-            Write-Host ('  [AP] {0} path failed: {1}' -f $mode, $_.Exception.Message) -ForegroundColor Yellow
+            [void](Restore-ApConfig)
+        }
+        'wifidirect' {
+            if ($Global:ApPublisher) {
+                try { $Global:ApPublisher.Stop(); Write-Host '  [AP] Wi-Fi Direct group stopped.' -ForegroundColor DarkGray } catch {}
+                $Global:ApPublisher = $null
+            }
         }
     }
-    # Neither AP path worked. Rather than stopping, join a network we know.
-    if ($Global:StationFallback) {
+    Remove-BearerRecord -Kind $Kind
+    if ($Global:Bearer.Mode -eq $Kind) {
+        $Global:Bearer.Mode = 'none'; $Global:Bearer.Ssid = ''; $Global:Bearer.Pass = ''
+    }
+}
+
+function Start-BearerChain {
+    # Walks $Global:BearerOrder until something comes up, and that first success
+    # becomes the primary. With MultiConnect the walk does not stop there: every
+    # remaining bearer that can also come up is left running beside it, so losing
+    # one is a demotion rather than an outage.
+    param([string[]]$Order = $null, [string]$Prefer = '')
+    if (-not $Order) {
+        $Order = @($Global:BearerOrder)
+        # Honour the AP preference by reordering rather than by branching.
+        if ($Global:ApPrefer -eq 'hotspot') { $Order = @('hotspot') + @($Order | Where-Object { $_ -ne 'hotspot' }) }
+    }
+    if ($Prefer) { $Order = @($Prefer) + @($Order | Where-Object { $_ -ne $Prefer }) }
+    # Filter out what the settings have switched off entirely. SelfAp=$false is
+    # an instruction, not a default: the periodic re-arm runs through here too,
+    # and without this it would quietly raise the access point a minute after
+    # the user asked for exactly the opposite.
+    $Order = @($Order | Where-Object {
+        (-not $Global:BearerOff.ContainsKey($_)) -and
+        ($_ -notin @('wifidirect','hotspot') -or $Global:SelfAp) -and
+        ($_ -ne 'station'   -or $Global:StationFallback) -and
+        ($_ -ne 'lan'       -or $Global:LanBearer) -and
+        ($_ -ne 'bluetooth' -or $Global:BluetoothPan)
+    })
+
+    # One SSID/passphrase per run, shared by whichever AP path ends up carrying
+    # it - so a hotspot->wifidirect failover does not invalidate the join QR the
+    # phone already scanned.
+    if (-not $Global:ApSsidRun) {
+        $Global:ApSsidRun = '{0}-{1}' -f $Global:ApSsid, ((New-ShortId 2).ToUpperInvariant())
+        $Global:ApPassRun = New-ApPassphrase
+    }
+    # NOTE: Restore-ApConfig is deliberately NOT called here. This function runs
+    # again on every failover and on the periodic re-arm, and restoring the
+    # parked SSID while we are still borrowing it would rename the live AP out
+    # from under the phones. It belongs to boot and to shutdown only.
+
+    $primary = $null
+    foreach ($kind in $Order) {
+        if ($Global:Bearers.ContainsKey($kind) -and $Global:Bearers[$kind].Up) {
+            if (-not $primary) { $primary = $kind }
+            continue
+        }
         try {
-            [void](Start-StationBearer)
-            Write-Host ('  [STA] Joined "{0}" as a client - serving from there.' -f $Global:Bearer.Ssid) -ForegroundColor Green
-            Write-Host '  [STA] Guest on someone else network: captive portal and auto-login stay off.' -ForegroundColor DarkYellow
-            return $true
+            if (Start-Bearer -Kind $kind -Ssid $Global:ApSsidRun -Pass $Global:ApPassRun) {
+                if (-not $primary) { $primary = $kind }
+                if (-not $Global:MultiConnect) { break }
+            }
         } catch {
-            Write-Host ('  [STA] Station fallback failed: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+            Write-Host ('  [bearer] {0} unavailable: {1}' -f $kind, $_.Exception.Message) -ForegroundColor DarkYellow
         }
     }
-    Write-Host '  [AP] No self-AP; falling back to whatever Wi-Fi is already connected.' -ForegroundColor Yellow
-    return $false
+    if ($primary) { [void](Set-PrimaryBearer -Kind $primary) }
+    return $primary
 }
 
 function Test-AutoLoginAllowed {
-    # Only on a network we raised ourselves. In station mode the other people on
-    # that network are strangers, and handing them a session for free would turn
-    # the shared password into no password at all.
+    # Only on a network we raised ourselves. On a borrowed network the other
+    # people are strangers, and handing them a session for free would turn the
+    # shared password into no password at all.
     return ($Global:AutoLogin -and $Global:Bearer.Mode -in @('wifidirect','hotspot'))
 }
 
@@ -2631,17 +3496,10 @@ function Stop-SelfAp {
         try { $Global:ApWatchRs.Close(); $Global:ApWatchRs.Dispose() } catch {}
         $Global:ApWatchPs = $null; $Global:ApWatchRs = $null
     }
-    if ($Global:ApHotspotMgr) {
-        try {
-            [void](Invoke-WinRtOp $Global:ApHotspotMgr.StopTetheringAsync() ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]))
-            Write-Host '  [AP] Mobile Hotspot stopped.' -ForegroundColor DarkGray
-        } catch {}
-        $Global:ApHotspotMgr = $null
-    }
-    if ($Global:ApPublisher) {
-        try { $Global:ApPublisher.Stop(); Write-Host '  [AP] Wi-Fi Direct group stopped.' -ForegroundColor DarkGray } catch {}
-        $Global:ApPublisher = $null
-    }
+    foreach ($k in @($Global:Bearers.Keys)) { try { Stop-Bearer -Kind $k } catch {} }
+    # Belt and braces: these run even if the registry was never populated.
+    if ($Global:ApHotspotMgr) { try { Stop-Bearer -Kind 'hotspot' } catch {} }
+    if ($Global:ApPublisher)  { try { Stop-Bearer -Kind 'wifidirect' } catch {} }
     [void](Restore-ApConfig)
     $Global:Bearer.Mode = 'none'
     $Global:Bearer.Ssid = ''
@@ -2770,34 +3628,15 @@ function Stop-CaptiveDns {
 
 # ============================== NETWORK SETUP ================================
 function Get-WifiInterface {
-    try {
-        $wifiAdapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
-            $_.Status -eq 'Up' -and (
-                $_.PhysicalMediaType -match '802\.11' -or
-                $_.NdisPhysicalMedium -eq 'Native802_11' -or
-                $_.Name -match 'Wi-?Fi|Wireless|WLAN' -or
-                $_.InterfaceDescription -match 'Wireless|Wi-?Fi|802\.11'
-            )
-        }
-        $candidates = @()
-        foreach ($a in $wifiAdapters) {
-            # AddressState matters: a freshly raised SoftAP address stays 'Tentative'
-            # for ~4s while duplicate-address detection runs, and binding a Tentative
-            # address throws "requested address is not valid in its context".
-            $ips = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue |
-                   Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' -and
-                                  ($null -eq $_.AddressState -or "$($_.AddressState)" -eq 'Preferred') }
-            foreach ($ip in $ips) {
-                $candidates += @{ IP = $ip.IPAddress; Prefix = $ip.PrefixLength; Name = $a.Name; Hotspot = ($ip.IPAddress -like '192.168.137.*') }
-            }
-        }
-        if ($candidates.Count -gt 0) {
-            $hot = $candidates | Where-Object { $_.Hotspot } | Select-Object -First 1
-            if ($hot) { return $hot }
-            return ($candidates | Select-Object -First 1)
-        }
-    } catch {}
-    return $null
+    # Last-resort address picker, used only when no bearer registered one: the
+    # self-AP was switched off and we are just serving over whatever is already
+    # connected. Prefers the 192.168.137.x SoftAP address when it is there.
+    $candidates = @(Get-NetCandidates | Where-Object { -not $_.Bluetooth })
+    if ($candidates.Count -eq 0) { $candidates = @(Get-NetCandidates -IncludeWired) }
+    if ($candidates.Count -eq 0) { return $null }
+    $hot = $candidates | Where-Object { $_.Hotspot } | Select-Object -First 1
+    if ($hot) { return $hot }
+    return ($candidates | Select-Object -First 1)
 }
 
 function Get-PortalUrl {
@@ -2823,6 +3662,34 @@ function Test-SameSubnet {
         }
         return $true
     } catch { return $false }
+}
+
+function Test-AllowedClient {
+    # The security model is unchanged in intent - only devices on a network this
+    # portal is actually carrying may talk to it - but the question is now "any
+    # of our bearers" rather than "the one Wi-Fi adapter". The listener binds
+    # every interface so that a bearer coming or going needs no rebind, which
+    # makes this filter the thing keeping the ship LAN out when we never joined it.
+    param([string]$ClientIp)
+    if (-not $ClientIp) { return $false }
+    if ($ClientIp -eq '127.0.0.1' -or $ClientIp -eq '::1') { return $true }
+    $active = @(Get-ActiveBearers)
+    if ($active.Count -eq 0) {
+        # No registry yet (self-AP off): fall back to the single-interface rule.
+        if (-not $Global:Bearer.IP) { return $false }
+        return ($ClientIp -eq $Global:Bearer.IP -or
+                (Test-SameSubnet -ClientIp $ClientIp -LocalIp $Global:Bearer.IP -Prefix $Global:Bearer.Prefix))
+    }
+    foreach ($b in $active) {
+        if ($ClientIp -eq $b.IP) { return $true }
+        if (Test-SameSubnet -ClientIp $ClientIp -LocalIp $b.IP -Prefix $b.Prefix) { return $true }
+        foreach ($a in @($b.Alt)) {
+            if (-not $a) { continue }
+            if ($ClientIp -eq $a.IP) { return $true }
+            if (Test-SameSubnet -ClientIp $ClientIp -LocalIp $a.IP -Prefix $a.Prefix) { return $true }
+        }
+    }
+    return $false
 }
 
 function Show-StartupBanner {
@@ -2853,18 +3720,28 @@ function Show-StartupBanner {
     Write-Host ('  |  Password     : {0,-38} |' -f $Global:Password)                      -ForegroundColor Magenta
     Write-Host '  +--------------------------------------------------------+' -ForegroundColor DarkGray
     Write-Host ''
-    Write-Host '  [Wi-Fi only] Only Wi-Fi IP allowed, LAN clients rejected.' -ForegroundColor Green
-    if ($Global:Bearer.Mode -ne 'none') {
-        $label = if ($Global:Bearer.Mode -eq 'hotspot') { 'Mobile Hotspot' } else { 'Wi-Fi Direct group' }
-        Write-Host ('  [Self-AP] {0} - this machine IS the network, no router needed.' -f $label) -ForegroundColor Green
+    $active = @(Get-ActiveBearers)
+    Write-Host '  [Access]  Only devices inside an active transport subnet are let in.' -ForegroundColor Green
+    if ($active.Count -gt 0) {
+        Write-Host ('  [Transports] {0} up, carrying on {1}:' -f $active.Count, (Get-BearerLabel -Kind $Global:Bearer.Mode -Ssid $Global:Bearer.Ssid)) -ForegroundColor Green
+        foreach ($b in ($active | Sort-Object { -[int][bool]$_.Primary })) {
+            $mark = if ($b.Primary) { '*' } else { ' ' }
+            Write-Host ('           {0} {1,-22} {2,-16} {3}' -f $mark, $b.Label, $b.IP, $b.Note) -ForegroundColor $(if ($b.Primary) { 'Cyan' } else { 'DarkGray' })
+        }
+    }
+    if ($Global:Bearer.Mode -in @('wifidirect','hotspot')) {
+        Write-Host '  [Self-AP] This machine IS the network, no router needed.' -ForegroundColor Green
         Write-Host ('            SSID: {0}   Password: {1}' -f $Global:Bearer.Ssid, $Global:Bearer.Pass) -ForegroundColor Magenta
         Write-Host ('  [Lobby]   Join QR on the host screen: {0}lobby' -f $url) -ForegroundColor Green
-    } elseif ($Wifi.Hotspot) {
-        Write-Host '  [Hotspot] Mobile Hotspot network (192.168.137.x).' -ForegroundColor Green
-    }
-    if ($Global:Bearer.Mode -eq 'station') {
+    } elseif ($Global:Bearer.Mode -eq 'station') {
         Write-Host ('  [Station] Joined "{0}" - other devices must be on that network too.' -f $Global:Bearer.Ssid) -ForegroundColor Green
+    } elseif ($Global:Bearer.Mode -eq 'lan') {
+        Write-Host ('  [LAN]     Serving over "{0}" - other devices must already be on it.' -f $Global:Bearer.Ssid) -ForegroundColor Green
+    } elseif ($Global:Bearer.Mode -eq 'bluetooth') {
+        Write-Host '  [BT-PAN]  Bluetooth PAN - about 3 Mbps, small files only.' -ForegroundColor DarkYellow
     }
+    if ($Global:MultiConnect) { Write-Host '  [Multi]   Every transport above accepts devices at once.' -ForegroundColor Green }
+    Write-Host '  [Switch]  Change transport from the dashboard: Network button (host screen).' -ForegroundColor Green
     if ($Global:Bearer.Dns) { Write-Host '  [1-QR] Captive portal on: scanning the join code opens the portal.' -ForegroundColor Green }
     if ($Global:AutoLoginKey) { Write-Host '  [1-QR] Auto sign-in armed: no password typing on the phone.' -ForegroundColor Green }
     if ($Global:P2P) { Write-Host '  [P2P] Direct device-to-device transfer, server relay as fallback.' -ForegroundColor Green }
@@ -2877,13 +3754,34 @@ function Show-StartupBanner {
 # ============================== MAIN LOOP ====================================
 # Become the network first, then look for the interface. The SoftAP surfaces as
 # "Microsoft Wi-Fi Direct Virtual Adapter" with PhysicalMediaType "Native 802.11",
-# so Get-WifiInterface picks it up and prefers its 192.168.137.1 address.
-if ($Global:SelfAp) { [void](Start-SelfAp) }
+# so Get-NetCandidates picks it up and prefers its 192.168.137.1 address.
+#
+# Bring-up runs inside the supervisor rather than here, so that every later AP
+# operation - keepalive, failover, a switch from the portal - is issued by the
+# same thread that holds the WinRT objects.
+#
+# The supervisor starts either way. With SelfAp off it raises nothing at boot,
+# but it is still what performs a switch requested from the portal - without it
+# the transport panel's buttons would queue commands nobody ever reads.
+[void](Disable-HotspotIdleTimeout)
+Start-BearerSupervisor
+if ($Global:SelfAp) {
+    $Global:BearerCmd.Enqueue(@{ Op = 'boot' })
+    Write-Host '  Raising the network...' -ForegroundColor Cyan
+    $deadline = (Get-Date).AddSeconds(45)
+    while ((Get-Date) -lt $deadline -and $Global:Bearer.Mode -eq 'none') { Start-Sleep -Milliseconds 250 }
+}
 
 # Measured on this hardware: the AP address is bindable ~4.3s after StartTethering.
 # Poll up to 15s so a slower adapter still makes it.
 $wifi = $null
 for ($try = 0; $try -lt 30; $try++) {
+    if ($Global:Bearer.IP) {
+        $wifi = @{ IP = $Global:Bearer.IP; Prefix = $Global:Bearer.Prefix
+                   Name = (Get-BearerLabel -Kind $Global:Bearer.Mode -Ssid $Global:Bearer.Ssid)
+                   Hotspot = ($Global:Bearer.IP -like '192.168.137.*') }
+        break
+    }
     $wifi = Get-WifiInterface
     if ($null -ne $wifi) { break }
     if ($try -eq 0) { Write-Host '  Waiting for the AP address to settle...' -ForegroundColor DarkGray }
@@ -2892,14 +3790,27 @@ for ($try = 0; $try -lt 30; $try++) {
 if ($null -eq $wifi) {
     Stop-SelfAp
     Write-Host ''
-    Write-Host '  [ERROR] No usable wireless interface found.' -ForegroundColor Red
-    Write-Host '  The self-AP could not start and no Wi-Fi is connected.' -ForegroundColor Yellow
+    Write-Host '  [ERROR] No usable network interface found.' -ForegroundColor Red
+    Write-Host '  No bearer came up and nothing is connected.' -ForegroundColor Yellow
     Write-Host '  Connect to a Wi-Fi network or enable Mobile Hotspot, then retry.' -ForegroundColor Yellow
     Write-Host ''
     return
 }
 $Global:Bearer.IP = $wifi.IP
 $Global:Bearer.Prefix = $wifi.Prefix
+# Self-AP off, or every bearer refused: register what we did find, so the client
+# filter and the network panel have something to work from either way. Goes
+# through Start-LanBearer rather than registering by hand, so this path picks up
+# every local subnet exactly like the chain does - a host on Ethernet AND Wi-Fi
+# must not silently serve only one of them.
+if (@(Get-ActiveBearers).Count -eq 0) {
+    try { [void](Start-LanBearer) }
+    catch { Set-BearerRecord -Kind 'lan' -Ssid $wifi.Name -Pass '' -IP $wifi.IP -Prefix $wifi.Prefix -Note 'Existing network' }
+    if ($Global:Bearer.Mode -eq 'none') { [void](Set-PrimaryBearer -Kind 'lan') }
+    $Global:Bearer.IP = $Global:Bearers['lan'].IP
+    $Global:Bearer.Prefix = $Global:Bearers['lan'].Prefix
+    $wifi.IP = $Global:Bearer.IP; $wifi.Prefix = $Global:Bearer.Prefix
+}
 # Whether DNS actually bound decides what the lobby promises.
 # Never in station mode: on someone else's network we are a guest, and answering
 # every lookup with our own address would break every other device on it.
@@ -2917,7 +3828,14 @@ if (Test-AutoLoginAllowed) { $Global:AutoLoginKey = New-ShortId 12 }
 Import-AllTransfers
 Import-Sessions
 
-$bindAddr = [System.Net.IPAddress]::Parse($wifi.IP)
+# MultiConnect binds every interface instead of one address. Two reasons, both
+# structural: a client may arrive on any of several bearers at once, and a bearer
+# that is re-raised (hotspot after its idle timeout) or that changes address
+# (DHCP on the LAN) would otherwise need the listener rebuilt underneath live
+# uploads. What keeps this from opening the portal to the whole ship is
+# Test-AllowedClient, which admits only addresses inside an active bearer's subnet.
+$bindAddr = if ($Global:MultiConnect) { [System.Net.IPAddress]::Any }
+            else { [System.Net.IPAddress]::Parse($wifi.IP) }
 
 # Prefer port 80 so the URL carries no ":port" - a shorter string is a lower
 # density QR, which phone cameras lock onto noticeably faster. Anything already
@@ -3001,7 +3919,9 @@ $funcNames = @(
     'Test-ValidSession','Resolve-TargetSid','Get-MultipartField','Save-Sessions',
     'Save-UploadedFileStream','Send-FileDownload','Send-ZipDownload','Get-StateJson',
     'Get-LoginPage','Get-DashboardPage','Get-LobbyPage','Invoke-RequestRouter',
-    'Add-Signal','Get-SignalsFor','New-PortalSession','Get-PortalUrl'
+    'Add-Signal','Get-SignalsFor','New-PortalSession','Get-PortalUrl',
+    'Get-BearerLabel','Add-Notice','Get-NoticesAfter','Get-ActiveBearers','Test-HostRequest',
+    'Get-BearerListJson'
 )
 foreach ($fn in $funcNames) {
     $def = (Get-Command $fn -CommandType Function).Definition
@@ -3035,6 +3955,21 @@ $sharedVars = @{
     CaptivePortal = $Global:CaptivePortal
     AutoLogin     = $Global:AutoLogin
     AutoLoginKey  = $Global:AutoLoginKey
+    # Multi-bearer: the workers read the registry (network panel, host check,
+    # lobby) and write to the command mailbox and the notice bus. All three are
+    # synchronized, so they are shared by reference, not copied.
+    Bearers       = $Global:Bearers
+    BearerOff     = $Global:BearerOff
+    BearerLock    = $Global:BearerLock
+    BearerCmd     = $Global:BearerCmd
+    BearerOrder   = $Global:BearerOrder
+    MultiConnect  = $Global:MultiConnect
+    LanBearer     = $Global:LanBearer
+    BluetoothPan  = $Global:BluetoothPan
+    StationFallback = $Global:StationFallback
+    Notices       = $Global:Notices
+    NoticeLock    = $Global:NoticeLock
+    ApWatch       = $Global:ApWatch
 }
 foreach ($k in $sharedVars.Keys) {
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($k, $sharedVars[$k], '')))
@@ -3088,8 +4023,8 @@ try {
 
         $remoteIp = $null
         try { $remoteIp = $client.Client.RemoteEndPoint.Address.ToString() } catch {}
-        if ($remoteIp -and $remoteIp -ne $wifi.IP -and -not (Test-SameSubnet -ClientIp $remoteIp -LocalIp $wifi.IP -Prefix $wifi.Prefix)) {
-            Write-Host ("[{0}] DENY  Non-Wi-Fi client rejected: {1}" -f $ts, $remoteIp) -ForegroundColor Yellow
+        if (-not (Test-AllowedClient -ClientIp $remoteIp)) {
+            Write-Host ("[{0}] DENY  Client outside every active bearer: {1}" -f $ts, $remoteIp) -ForegroundColor Yellow
             try { $client.Close() } catch {}
             continue
         }
@@ -3113,7 +4048,17 @@ try {
     foreach ($j in $jobs) { try { $j.PS.Dispose() } catch {} }
     try { $pool.Close(); $pool.Dispose() } catch {}
     Stop-CaptiveDns
+    # The supervisor holds the WinRT AP objects, so it has to be the one to put
+    # them down; Stop-SelfAp here would find its own copies null and leave the
+    # hotspot running. Give it a few seconds, then unwind whatever is left -
+    # StopAccessPoint.ps1 covers the taskkill case.
+    if ($Global:ApWatchPs) {
+        $Global:BearerCmd.Enqueue(@{ Op = 'stopall' })
+        $wait = (Get-Date).AddSeconds(12)
+        while ((Get-Date) -lt $wait -and $Global:Bearers.Count -gt 0) { Start-Sleep -Milliseconds 200 }
+    }
     Stop-SelfAp
+    Restore-HotspotIdleTimeout
     Write-Host ''
     Write-Host '  Server stopped.' -ForegroundColor Yellow
 }
@@ -3123,15 +4068,28 @@ try {
 #   powershell.exe -ExecutionPolicy Bypass -File LocalFilePortal.ps1
 #
 # FEATURES:
-#   - Self-AP: raises its own network (Mobile Hotspot, falling back to Wi-Fi
-#     Direct when there is no internet at all). No router, no admin rights.
-#     A watchdog re-raises it after Windows' ~5 min idle shutdown.
-#   - /lobby on the host screen: join QR + portal QR, because a phone that is
-#     not on the network yet cannot reach the dashboard's invite QR
+#   - Self-AP: raises its own network (Wi-Fi Direct by default, Mobile Hotspot
+#     as the alternative). No router, no admin rights.
+#   - Five transports: wifidirect / hotspot / station / lan / bluetooth. The
+#     chain is walked at startup and the first one up carries.
+#   - MultiConnect: every transport that came up keeps running and accepts
+#     clients, so devices on different networks share one portal. The listener
+#     binds all interfaces; Test-AllowedClient is what keeps outsiders out.
+#   - Failover: a supervisor thread health-checks every transport, promotes the
+#     next one when the carrier dies, and announces it to every signed-in device
+#     through the notice bus on /api/state. The lobby redraws its QR to match.
+#   - Only the host, through the portal, may close a transport. The hotspot idle
+#     shutdown is fought three ways: the icssvc registry flag when elevated, a
+#     ~3s re-raise otherwise, and a memory of what the host deliberately closed
+#     so the periodic re-arm does not undo it.
+#   - /lobby on the host screen: join QR + portal QR + a button into the portal,
+#     because a phone that is not on the network yet cannot reach the
+#     dashboard's invite QR
 #   - P2P: files to a single target go browser-to-browser over a WebRTC
 #     DataChannel (no STUN/TURN, DTLS encrypted); the server only brokers the
 #     handshake and falls back to the HTTP relay after 8 s
-#   - Wi-Fi only (LAN denied; two checks: bind + subnet)
+#   - Access is by active-transport subnet, not by adapter type: a wired LAN is
+#     invisible unless the 'lan' transport was deliberately switched on
 #   - Connected devices listed (all signed-in clients); click-to-target send
 #   - "Everyone (Public)" card broadcasts to every device
 #   - No size limit, no session expiry
@@ -3141,7 +4099,8 @@ try {
 #     the folder tree; bundle downloads as a single ZIP with structure intact
 #   - Invite panel: connection link + offline QR code (embedded qrcode.js)
 #   - Quick text/link share (sent as .txt to the current target)
-#   - Sound + browser notifications for inbound files (bell toggle)
+#   - Sound both ways (rising tone in, falling tone out) + browser notifications
+#     and an audible alert on failover; one bell toggle, remembered per device
 #   - Live upload stats: overall progress, MB/s, ETA
 #   - Inline preview for small text files (View button, copy from modal)
 #   - Restart-safe transfers (.meta\<id>.json) AND sessions (.meta\sessions.dat):
