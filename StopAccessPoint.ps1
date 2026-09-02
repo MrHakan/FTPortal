@@ -1,4 +1,4 @@
-# Tears down a Mobile Hotspot left running by LocalFilePortal.ps1 and puts the
+# Tears down a Mobile Hotspot left running by FTPortal.ps1 and puts the
 # machine's own hotspot SSID/passphrase back.
 #
 # StopPortal.vbs kills the portal with taskkill /F, so the script's own finally

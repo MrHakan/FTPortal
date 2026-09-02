@@ -1,4 +1,4 @@
-# Local File Portal
+# FTPortal
 
 A **single-file PowerShell** web portal for fast device-to-device file transfer.
 No installation, no admin rights, no external dependencies, **and no router** — the machine
@@ -7,17 +7,17 @@ through the browser. Where the browsers can manage it, the bytes go straight fro
 device and never touch the host's disk.
 
 ```
-   __    ____    ____    ___    ____  _____  __    __
-  / /   |  _ \  |  _ \  / _ \  |  _ \|_   _| \ \  / /
- | |    | | | | | |_) || | | | | |_) | | |    \ \/ /
- | |___ | |_| | |  __/ | |_| | |  _ <  | |     |  |
- |_____||____/  |_|     \___/  |_| \_\ |_|     |__|
+  _____ _____ ____            _        _
+ |  ___|_   _|  _ \ ___  _ __| |_ __ _| |
+ | |_    | | | |_) / _ \| '__| __/ _` | |
+ |  _|   | | |  __/ (_) | |  | || (_| | |
+ |_|     |_| |_|   \___/|_|   \__\__,_|_|
 ```
 
 ## Quick Start
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File LocalFilePortal.ps1
+powershell.exe -ExecutionPolicy Bypass -File FTPortal.ps1
 ```
 
 1. The portal raises its own Wi-Fi network and opens the **Lobby** page on the host screen.
@@ -180,10 +180,8 @@ dimmed, for the odd build that suppresses the sign-in sheet.
 
 Two things make that one scan land you *inside* the portal rather than on a password box:
 
-- The redirect carries a **per-run sign-in key** (`?k=…`), so the phone arrives already signed
-  in. It is only ever issued on a network the portal raised itself, where the random WPA2
-  passphrase already gated entry — never in station mode. Turn it off with
-  `$Global:AutoLogin = $false` and the shared password comes back.
+- A **per-run sign-in key** (`?k=…`) is minted at startup, so a scan arrives already signed in.
+  Turn it off with `$Global:AutoLogin = $false` and the shared password comes back.
 - The portal prefers **port 80**, so the address is `http://192.168.137.1/` with no `:8080`.
   A shorter string is a lower-density QR, which phone cameras lock onto faster. If something
   else already owns port 80 it falls back to 8080 and says so.
@@ -193,6 +191,19 @@ its point of view is the truth. Binding UDP/53 needs no elevation on Windows, an
 measured not to hold that port on either bearer. If the bind does fail, the portal says so on
 startup and the Lobby keeps showing both QRs rather than promising something it cannot do.
 
+### Who gets handed the sign-in key
+
+The key exists on every transport. What differs is who the portal will hand it to, and the
+split is about who can see the thing carrying it:
+
+| Carrier | Signs you in | Why |
+|---|---|---|
+| **Lobby QR** | **Always** | `/lobby` is served to the host machine only. Holding that code already means standing at the host screen — a stronger gesture than typing a password everyone knows. |
+| **Captive redirect** | Only on a network we raised | That reply goes to *anyone* who joins. On a borrowed network — station or LAN — those are strangers, so they get the password page instead. |
+
+So scanning the second QR signs you straight in, on any transport, with nothing to type. A
+device that merely joins a network the portal did not create still has to know the password.
+
 ## Features
 
 | Area | What you get |
@@ -201,6 +212,7 @@ startup and the Lobby keeps showing both QRs rather than promising something it 
 | **MultiConnect** | Several transports carry the portal at once; devices on any of them share one device list. |
 | **Failover** | A transport dies, the portal moves to the next one and announces it to every signed-in device. |
 | **Transport switching** | Host-screen **Network** panel: make any transport primary, or close one. Only the host can. |
+| **Stop from the browser** | A **Stop Server** button on the host dashboard and in the Lobby shuts the whole portal down - no going back to the console. Host-only. |
 | **Lobby QR** | Join QR on the *host* screen, where it has to be: the phone can't reach the dashboard before it's on the network. |
 | **True P2P** | Files to a single device go over a WebRTC DataChannel, browser to browser. The server brokers the handshake and never sees a byte. Falls back to the server relay in 8 s if the direct link doesn't come up. |
 | **Device-to-device** | Every signed-in device shows up as a card. Click one to send privately, or pick **Everyone (Public)** to broadcast. |
@@ -219,6 +231,7 @@ startup and the Lobby keeps showing both QRs rather than promising something it 
 ## Security model
 
 - **Only active transports are admitted** — the listener binds every interface (so a transport can come and go without rebinding under live uploads), and every connection is then checked against the subnets of the transports actually running. With only the self-AP up that is `192.168.137.0/24` and nothing else; a wired LAN is invisible unless the local-network transport is deliberately switched on.
+- **Stopping the portal is host-only** - `/api/shutdown` is `POST`-only (so it cannot be triggered by following a link) and refuses anything that is not loopback or one of the portal own bearer addresses. A phone that could stop the server could cut every other device off mid-transfer.
 - **Transport controls are host-only** — `/api/bearer` accepts loopback and the portal's own bearer addresses, which a remote client cannot forge as a source address. A phone on the same AP is signed in but cannot move or close a transport, and never sees the panel.
 - **Fresh AP passphrase every run** — 10 random characters from a CSPRNG, never hard-coded. WPA2 encrypts the air link.
 - **Direct transfers are end-to-end encrypted** — WebRTC mandates DTLS, so the server could not read a P2P payload even if it wanted to. It only ever sees offers, answers and ICE candidates.
@@ -230,7 +243,7 @@ startup and the Lobby keeps showing both QRs rather than promising something it 
 
 ## Configuration
 
-Edit the settings block at the top of `LocalFilePortal.ps1`:
+Edit the settings block at the top of `FTPortal.ps1`:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -263,6 +276,7 @@ Edit the settings block at the top of `LocalFilePortal.ps1`:
 | `/dashboard` | GET | Main UI |
 | `/api/state?ns=<seq>` | GET | Devices + transfers JSON (polled every 4 s). `ns` is the highest notice sequence this client has already shown |
 | `/api/bearers` | GET | Transport list + `isHost` |
+| `/api/shutdown` | POST | Stop the portal. Host only; answers first, then closes the listener |
 | `/api/bearer` | POST | `op=switch\|start\|stop`, `kind=wifidirect\|hotspot\|station\|lan\|bluetooth`. Host only; queued for the supervisor, answered as a notice |
 | `/upload?target=<pubId\|public>&bundle=<id>` | POST | Streaming multipart upload |
 | `/download?id=<transferId>` | GET | Single-file download |
@@ -287,7 +301,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
 powershell -ExecutionPolicy Bypass -File .\tests\Run-IsolationTests.ps1
 ```
 
-78 + 10 cases, no radio and no listening socket required. `Run-Tests.ps1` parses the portal,
+94 + 10 cases, no radio and no listening socket required. `Run-Tests.ps1` parses the portal,
 lifts every function out via the AST and evaluates those, so the server never starts; routes
 are exercised for real over a `MemoryStream`. **Everything that reaches a radio is mocked at
 script scope**, and one test asserts those mocks are still in place — an earlier version
@@ -303,9 +317,9 @@ entry point and proves the closure, for functions and for every `$Global:` they 
 
 | File | Purpose |
 |---|---|
-| `LocalFilePortal.ps1` | The portal itself |
+| `FTPortal.ps1` | The portal itself |
 | `StartPortalHidden.vbs` | Launch hidden in the background (writes `portal.pid`) |
-| `StopPortal.vbs` | Kill the portal **and** shut the access point down |
+| `StopPortal.vbs` | Kill the portal **and** shut the access point down (the **Stop Server** button in the portal does the same thing more gracefully) |
 | `StopAccessPoint.ps1` | Hotspot teardown on its own; safe to run any time |
 | `tests/Run-Tests.ps1` | Behavioural suite — registry, client filter, routes, fallback chain |
 | `tests/Run-IsolationTests.ps1` | Runspace session-state closure checks |

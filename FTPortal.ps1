@@ -1,7 +1,9 @@
 # ==============================================================================
-#  LocalFilePortal.ps1  v2.0
-#  Single-file PowerShell local file transfer portal
-#   - Wi-Fi only, no admin required (TcpListener)
+#  FTPortal.ps1  v3.0
+#  Single-file PowerShell device-to-device file transfer portal
+#   - Raises its own network: no router, no admin required (TcpListener)
+#   - Five transports, several at once, with failover between them
+#   - Stop the server from the portal itself
 #   - Connected devices visible, click-to-target + public broadcast
 #   - No time limit, no size limit
 #   - Streaming multipart parser + C# FastScan boundary -> fast upload
@@ -71,9 +73,15 @@ $Global:ApRestoreFile = Join-Path $PSScriptRoot 'ap-restore.json'
 # --- P2P: browser-to-browser DataChannel, server only brokers the handshake ---
 $Global:P2P         = $true
 $Global:SignalTTL   = [TimeSpan]::FromSeconds(60)
-# Hand the phone a signed-in session straight from the captive redirect, so one
-# scan lands inside the portal instead of on a password box. Only ever offered
-# on a network we raised ourselves - see Test-AutoLoginAllowed.
+# Hand the phone a signed-in session instead of a password box. The key itself
+# is minted every run; what differs is who may be handed it.
+#
+#   - The LOBBY QR always carries it. That page is served to the host machine
+#     only, so scanning it means standing in front of the host screen - a
+#     stronger gesture than typing a password everybody already knows.
+#   - The CAPTIVE REDIRECT carries it only on a network we raised ourselves
+#     (see Test-AutoLoginAllowed): that redirect answers every device that
+#     joins, and on a borrowed network those are strangers.
 $Global:AutoLogin   = $true
 $Global:AutoLoginKey= ''             # random per run
 
@@ -106,6 +114,11 @@ $Global:BearerCmd   = [System.Collections.Queue]::Synchronized((New-Object Syste
 $Global:Notices     = [hashtable]::Synchronized(@{ Seq = 0; Items = (New-Object System.Collections.ArrayList) })
 $Global:NoticeLock  = New-Object object
 $Global:ApWatch     = [hashtable]::Synchronized(@{ Stop=$false; Restarts=0; Switching=$false })
+# Set by /api/shutdown. The accept loop blocks in AcceptTcpClient, so the route
+# also closes the listener to wake it; this flag is what tells the loop that the
+# resulting exception was asked for rather than a fault.
+$Global:Shutdown    = [hashtable]::Synchronized(@{ Requested=$false; By='' })
+$Global:Listener    = $null
 # .dat extension on purpose: transfer import scans .meta\*.json and must skip this
 $Global:SessionFile = Join-Path $Global:MetaFolder 'sessions.dat'
 
@@ -1130,7 +1143,7 @@ function Get-LoginPage {
     return @"
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Local File Portal - Sign In</title>
+<title>FTPortal - Sign In</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%81%3C/text%3E%3C/svg%3E">
 <style>
   :root{--bg:#0d0f12;--card:#141720;--border:#1e2330;--accent:#4f8ef7;--text:#e8ecf5;--muted:#5a6480;--ok:#4ff78e;--err:#f74f6a}
@@ -1182,7 +1195,7 @@ function Get-DashboardPage {
     return @"
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Local File Portal</title>
+<title>FTPortal</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%81%3C/text%3E%3C/svg%3E">
 <style>
   :root{--bg:#0d0f12;--card:#141720;--border:#1e2330;--accent:#4f8ef7;--accent2:#8e6cf7;--text:#e8ecf5;--muted:#5a6480;--ok:#4ff78e;--err:#f74f6a;--warn:#f7c14f}
@@ -1245,6 +1258,12 @@ function Get-DashboardPage {
   .hbtn{background:transparent;border:1px solid var(--border);color:var(--muted);padding:6px 12px;border-radius:8px;font-size:13px;cursor:pointer}
   .hbtn:hover{color:var(--text)}
   .hbtn.on{color:var(--accent);border-color:var(--accent);background:rgba(79,142,247,.08)}
+  .hbtn.danger{color:var(--err);border-color:rgba(247,79,106,.45)}
+  .hbtn.danger:hover{color:var(--err);border-color:var(--err);background:rgba(247,79,106,.12)}
+  .gone{position:fixed;inset:0;z-index:200;background:rgba(6,8,12,.96);display:flex;align-items:center;justify-content:center;text-align:center;padding:30px}
+  .gone-in{max-width:430px}
+  .gone h2{font-size:20px;color:var(--text);margin-bottom:10px;text-transform:none;letter-spacing:0}
+  .gone p{color:var(--muted);font-size:14px;line-height:1.6}
   .linkish{color:var(--accent);cursor:pointer;text-decoration:underline}
   .up-stats{margin-top:8px;font-size:12px;color:var(--muted);text-align:right;min-height:15px;font-variant-numeric:tabular-nums}
   .txt-row{display:flex;gap:10px;margin-top:14px}
@@ -1311,6 +1330,7 @@ function Get-DashboardPage {
       <button class="hbtn" id="inviteBtn" title="Show connection link and QR code">&#128279; Invite</button>
       <button class="hbtn" id="netBtn" style="display:none" title="Transports: switch how this portal is carried">&#128246; Network</button>
       <button class="hbtn" id="notifBtn" title="Sound + notifications on send and receive - click to toggle">&#128276;</button>
+      <button class="hbtn danger" id="stopBtn" style="display:none" title="Stop the portal on this machine">&#9209; Stop Server</button>
       <a class="logout" href="/logout">&#128682; Sign Out</a>
     </div>
   </header>
@@ -1992,7 +2012,7 @@ function Get-DashboardPage {
       toast(n.text, n.level==='err'?'err':(n.level==='warn'?'info':'info'));
       // A failover can happen while the phone is in a pocket, and the next thing
       // the user does is wonder why the page is dead. Make it audible.
-      notifyInbound('Local File Portal', n.text);
+      notifyInbound('FTPortal', n.text);
     });
     bearerBusy=false;
   }
@@ -2004,8 +2024,10 @@ function Get-DashboardPage {
     if(!st)return;
     var panel=document.getElementById('netPanel'),btn=document.getElementById('netBtn');
     var lobby=document.getElementById('lobbyBtn');
-    if(!st.isHost){btn.style.display='none';panel.style.display='none';lobby.style.display='none';return;}
+    var stop=document.getElementById('stopBtn');
+    if(!st.isHost){btn.style.display='none';panel.style.display='none';lobby.style.display='none';stop.style.display='none';return;}
     btn.style.display='';
+    stop.style.display='';
     lobby.style.display='inline-block';
     document.getElementById('netNow').textContent=st.bearer||'None';
     if(panel.style.display==='none')return;      // panel closed: nothing to draw
@@ -2054,6 +2076,33 @@ function Get-DashboardPage {
       setPoll(1000);setTimeout(function(){setPoll(4000);},15000);
     }catch(e){bearerBusy=false;toast('Connection error','err');}
   }
+  // ---- Stop the server ----------------------------------------------------
+  // The confirm text names what actually happens, because this is not undoable
+  // from the browser: once the listener is closed there is nothing left to
+  // serve the page that would restart it.
+  document.getElementById('stopBtn').addEventListener('click',async function(){
+    if(!confirm('Stop the portal?\n\nEvery device is disconnected and any transfer in progress is lost. '
+              + 'Restarting it means going back to this machine and launching it again.'))return;
+    var b=document.getElementById('stopBtn');
+    b.disabled=true;b.textContent='Stopping...';
+    try{
+      var r=await fetch('/api/shutdown',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:''});
+      var j=await r.json();
+      if(!j.ok){b.disabled=false;b.innerHTML='\u23F9 Stop Server';toast(j.msg||('Failed ('+r.status+')'),'err');return;}
+    }catch(e){ /* the socket dying mid-answer is a normal outcome here */ }
+    if(pollTimer)clearInterval(pollTimer);
+    showGone();
+  });
+  function showGone(){
+    var d=document.createElement('div');
+    d.className='gone';
+    d.innerHTML='<div class="gone-in"><div style="font-size:42px;margin-bottom:14px">\uD83D\uDD0C</div>'
+      +'<h2>Portal stopped</h2>'
+      +'<p>The server on the host machine has shut down and this page is no longer connected. '
+      +'Start it again from the host to carry on.</p></div>';
+    document.body.appendChild(d);
+  }
+
   document.getElementById('netBtn').addEventListener('click',function(){
     var p=document.getElementById('netPanel');
     var show=(p.style.display==='none');
@@ -2290,7 +2339,9 @@ function Get-LobbyPage {
     # its passphrase, so there is no join QR to offer - only the address.
     $isStation = ($mode -eq 'station')
     $hasAp = ($mode -ne 'none' -and $ssid -and -not $isStation)
-    # Scanning the address QR should sign you in too, not just open a password box.
+    # Scanning the address QR signs you in - on every bearer, not just the ones
+    # we raised. This page is served to the host machine alone, so holding the
+    # code already means standing at the host screen.
     if ($Global:AutoLoginKey) { $Url += ('?k={0}' -f $Global:AutoLoginKey) }
     # WIFI: payload is understood natively by iOS 11+ and Android 10+ cameras.
     # Escape the separators WPA passphrases are allowed to contain.
@@ -2355,7 +2406,7 @@ function Get-LobbyPage {
     return @"
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Local File Portal - Lobby</title>
+<title>FTPortal - Lobby</title>
 <style>
 :root{--bg:#0e1116;--panel:#171b22;--ink:#e6edf3;--muted:#8b949e;--acc:#2f81f7;--ok:#3fb950;--warn:#d29922}
 *{box-sizing:border-box}
@@ -2381,6 +2432,11 @@ h2{margin:0 0 14px;font-size:19px}
 .gobtn{display:inline-block;margin-top:6px;padding:10px 18px;border-radius:9px;background:var(--acc);color:#fff;text-decoration:none;font-size:14px;font-weight:600}
 .gobtn:hover{filter:brightness(1.12)}
 .gobtn.ghost{background:transparent;border:1px solid var(--acc);color:var(--acc)}
+.gobtn.stop{background:transparent;border:1px solid #f7566f;color:#f7869a;font:inherit;cursor:pointer}
+.gobtn.stop:hover{background:rgba(247,86,111,.14)}
+.gone{position:fixed;inset:0;z-index:200;background:rgba(6,8,12,.96);display:flex;align-items:center;justify-content:center;text-align:center;padding:30px}
+.gone h2{font-size:20px;margin-bottom:10px}
+.gone p{color:var(--muted);font-size:14px;line-height:1.6;max-width:420px}
 .bearers{margin-top:18px;display:flex;gap:9px;flex-wrap:wrap}
 .bchip{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid #232a34;border-radius:20px;padding:6px 13px;font-size:12.5px;color:var(--muted)}
 .bchip.up{color:var(--ink)}
@@ -2392,7 +2448,7 @@ h2{margin:0 0 14px;font-size:19px}
 .alert{padding:10px 14px;border-radius:9px;font-size:13px;background:#2a2413;border:1px solid var(--warn);color:var(--warn)}
 .alert.err{background:#2a1316;border-color:#f7566f;color:#f7869a}
 </style></head><body>
-<h1>Local File Portal</h1>
+<h1>FTPortal</h1>
 <p class="sub"><span id="modeLbl">$modeLabel</span> &middot; this machine is the network</p>
 <div class="grid">
 $step1
@@ -2401,7 +2457,8 @@ $step2
 <div class="bearers" id="bearers"></div>
 <div class="alerts" id="alerts"></div>
 <div class="status"><span class="dot"></span><span id="cnt">no devices signed in yet</span>
-  &nbsp;&middot;&nbsp; <a class="gobtn ghost" style="padding:4px 12px;font-size:12.5px" href="/dashboard">Go to the portal</a></div>
+  &nbsp;&middot;&nbsp; <a class="gobtn ghost" style="padding:4px 12px;font-size:12.5px" href="/dashboard">Go to the portal</a>
+  &nbsp;&middot;&nbsp; <button class="gobtn stop" id="stopSrv" style="padding:4px 12px;font-size:12.5px">Stop server</button></div>
 <script src="/qr.js"></script>
 <script>
 (function(){
@@ -2468,7 +2525,27 @@ $step2
       });
     }).catch(function(){});
   }
-  tick(); setInterval(tick,3000);
+  var timer=setInterval(tick,3000);
+  tick();
+
+  // The lobby is the host screen, so it gets the same stop control the dashboard
+  // has - there is no reason to make someone open the portal just to shut it.
+  document.getElementById('stopSrv').addEventListener('click',function(){
+    if(!confirm('Stop the portal?
+
+Every device is disconnected and any transfer in progress is lost.'))return;
+    var b=this; b.disabled=true; b.textContent='Stopping...';
+    fetch('/api/shutdown',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:''})
+      .catch(function(){})            // the socket dying mid-answer is normal here
+      .then(function(){
+        clearInterval(timer);
+        var d=document.createElement('div');
+        d.className='gone';
+        d.innerHTML='<div><div style="font-size:42px;margin-bottom:14px">D83DDD0C</div>'
+          +'<h2>Portal stopped</h2><p>The server has shut down. Launch it again from this machine to carry on.</p></div>';
+        document.body.appendChild(d);
+      });
+  });
 })();
 </script>
 </body></html>
@@ -2504,9 +2581,12 @@ function Invoke-RequestRouter {
         }
         if ($hostHdr -and ($mine -notcontains $hostHdr.ToLowerInvariant())) {
             # Carry the one-scan key so the phone lands inside the portal rather
-            # than on a password box. Only set where auto-login is allowed.
+            # than on a password box - but ONLY where the redirect is safe to
+            # trust. This reply goes to whoever joined the network; on a network
+            # we did not raise, that is anybody, so there they get the password
+            # page instead. The lobby QR is unaffected: it is host-screen only.
             $portal = Get-PortalUrl
-            if ($Global:AutoLoginKey) { $portal += ('?k={0}' -f $Global:AutoLoginKey) }
+            if ($Global:AutoLoginKey -and (Test-AutoLoginAllowed)) { $portal += ('?k={0}' -f $Global:AutoLoginKey) }
             Write-Host ("[captive] {0} -> portal" -f $hostHdr) -ForegroundColor DarkCyan
             Send-RedirectResponse -Stream $Stream -Location $portal
             return
@@ -2689,6 +2769,34 @@ function Invoke-RequestRouter {
                 switching = [bool]$Global:ApWatch.Switching
             }
             Send-JsonResponse -Stream $Stream -Json ($payload | ConvertTo-Json -Depth 5 -Compress) -Status 200
+        }
+
+        '/api/shutdown' {
+            # Stops the whole portal from the browser, so the host never has to
+            # go back to the console or hunt for StopPortal.vbs. Host-only, for
+            # the same reason the transport controls are: a phone that could
+            # shut the server down could cut every other device off mid-transfer.
+            $sid = Test-ValidSession -Req $Req
+            if (-not $sid) { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 401; return }
+            if (-not (Test-HostRequest -Req $Req)) {
+                Send-JsonResponse -Stream $Stream -Json '{"ok":false,"msg":"host only"}' -Status 403; return
+            }
+            if ($method -ne 'POST') { Send-JsonResponse -Stream $Stream -Json '{"ok":false}' -Status 405; return }
+            $who = 'host'
+            if ($Global:Sessions.ContainsKey($sid) -and $Global:Sessions[$sid].Nick) { $who = $Global:Sessions[$sid].Nick }
+            Add-Notice -Kind 'shutdown' -Level 'warn' -Text ('{0} is shutting the portal down.' -f $who)
+            # Answer BEFORE tearing anything down, or the browser that asked gets
+            # a dead socket instead of a confirmation.
+            Send-JsonResponse -Stream $Stream -Json '{"ok":true,"msg":"shutting down"}' -Status 200
+            try { $Stream.Flush() } catch {}
+            $Global:Shutdown.Requested = $true
+            $Global:Shutdown.By = $who
+            Write-Host ('[shutdown] requested by {0} ({1})' -f $who, $Req.ClientIp) -ForegroundColor Yellow
+            # The main thread is parked in AcceptTcpClient and will not look at a
+            # flag until something arrives. Closing the listening socket makes it
+            # throw at once; connections already accepted are untouched, so this
+            # response still reaches the browser.
+            try { if ($Global:Listener) { $Global:Listener.Stop() } } catch {}
         }
 
         '/api/nick' {
@@ -3523,9 +3631,12 @@ function Start-BearerChain {
 }
 
 function Test-AutoLoginAllowed {
-    # Only on a network we raised ourselves. On a borrowed network the other
-    # people are strangers, and handing them a session for free would turn the
-    # shared password into no password at all.
+    # "May the CAPTIVE REDIRECT hand out a session?" - not "does a key exist".
+    # Only on a network we raised ourselves: the redirect answers every device
+    # that joins, and on a borrowed network those are strangers, so handing them
+    # a session free would turn the shared password into no password at all.
+    # The lobby QR is a different question - it is only ever visible on the host
+    # screen, so it carries the key on every bearer.
     return ($Global:AutoLogin -and $Global:Bearer.Mode -in @('wifidirect','hotspot'))
 }
 
@@ -3734,17 +3845,19 @@ function Test-AllowedClient {
 
 function Show-StartupBanner {
     param([hashtable]$Wifi)
-    $logo = @"
+    # Literal here-string: the logo contains a backtick, which an expandable
+    # one would treat as an escape character.
+    $logo = @'
 
-   __    ____    ____    ___    ____  _____  __    __
-  / /   |  _ \  |  _ \  / _ \  |  _ \|_   _| \ \  / /
- | |    | | | | | |_) || | | | | |_) | | |    \ \/ /
- | |___ | |_| | |  __/ | |_| | |  _ <  | |     |  |
- |_____||____/  |_|     \___/  |_| \_\ |_|     |__|
+  _____ _____ ____            _        _
+ |  ___|_   _|  _ \ ___  _ __| |_ __ _| |
+ | |_    | | | |_) / _ \| '__| __/ _` | |
+ |  _|   | | |  __/ (_) | |  | || (_| | |
+ |_|     |_| |_|   \___/|_|   \__\__,_|_|
 
-      L O C A L   F I L E   P O R T A L   v2.0
+              F T P o r t a l   v3.0
             Bidirectional Wi-Fi Transfer
-"@
+'@
     Write-Host $logo -ForegroundColor Cyan
 
     $url = Get-PortalUrl -Ip $Wifi.IP
@@ -3861,8 +3974,10 @@ if ($Global:CaptivePortal -and $Global:Bearer.Mode -in @('wifidirect','hotspot')
     Write-Host '  [DNS] Captive portal skipped - we are a guest on this network.' -ForegroundColor DarkGray
 }
 
-# One-scan sign-in token. Only meaningful where auto-login is allowed at all.
-if (Test-AutoLoginAllowed) { $Global:AutoLoginKey = New-ShortId 12 }
+# Sign-in token for the QR. Minted whenever auto-login is on at all, not only
+# where the captive redirect may hand it out - the lobby QR is shown on the host
+# screen and so can carry it on every bearer.
+if ($Global:AutoLogin) { $Global:AutoLoginKey = New-ShortId 12 }
 
 # Restart-safe: load transfer records and sessions from disk
 Import-AllTransfers
@@ -3887,6 +4002,9 @@ foreach ($tryPort in @($Global:Port, $Global:PortFallback)) {
     try {
         $cand.Start()
         $listener = $cand
+        # /api/shutdown needs a handle it can close from a worker runspace to wake
+        # the accept loop; this is that handle.
+        $Global:Listener = $cand
         $Global:Port = $tryPort
         break
     } catch {
@@ -3961,7 +4079,7 @@ $funcNames = @(
     'Get-LoginPage','Get-DashboardPage','Get-LobbyPage','Invoke-RequestRouter',
     'Add-Signal','Get-SignalsFor','New-PortalSession','Get-PortalUrl',
     'Get-BearerLabel','Add-Notice','Get-NoticesAfter','Get-ActiveBearers','Test-HostRequest',
-    'Get-BearerListJson'
+    'Get-BearerListJson','Test-AutoLoginAllowed'
 )
 foreach ($fn in $funcNames) {
     $def = (Get-Command $fn -CommandType Function).Definition
@@ -4010,6 +4128,9 @@ $sharedVars = @{
     Notices       = $Global:Notices
     NoticeLock    = $Global:NoticeLock
     ApWatch       = $Global:ApWatch
+    # /api/shutdown sets the flag and closes the listener from a worker thread.
+    Shutdown      = $Global:Shutdown
+    Listener      = $Global:Listener
 }
 foreach ($k in $sharedVars.Keys) {
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($k, $sharedVars[$k], '')))
@@ -4058,7 +4179,16 @@ $jobs = New-Object System.Collections.ArrayList
 
 try {
     while ($true) {
-        $client = $listener.AcceptTcpClient()
+        # A shutdown asked for from the portal closes the listening socket, which
+        # is what unblocks this call. Treat that as the exit it is; anything
+        # else thrown here is a real fault and still propagates.
+        try {
+            $client = $listener.AcceptTcpClient()
+        } catch {
+            if ($Global:Shutdown.Requested) { break }
+            throw
+        }
+        if ($Global:Shutdown.Requested) { try { $client.Close() } catch {}; break }
         $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 
         $remoteIp = $null
@@ -4100,12 +4230,16 @@ try {
     Stop-SelfAp
     Restore-HotspotIdleTimeout
     Write-Host ''
-    Write-Host '  Server stopped.' -ForegroundColor Yellow
+    if ($Global:Shutdown.Requested) {
+        Write-Host ('  Server stopped from the portal by {0}.' -f $Global:Shutdown.By) -ForegroundColor Yellow
+    } else {
+        Write-Host '  Server stopped.' -ForegroundColor Yellow
+    }
 }
 
 # ==============================================================================
 # RUN (NO ADMIN REQUIRED):
-#   powershell.exe -ExecutionPolicy Bypass -File LocalFilePortal.ps1
+#   powershell.exe -ExecutionPolicy Bypass -File FTPortal.ps1
 #
 # FEATURES:
 #   - Self-AP: raises its own network (Wi-Fi Direct by default, Mobile Hotspot

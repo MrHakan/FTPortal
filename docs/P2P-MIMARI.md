@@ -1,10 +1,10 @@
-# Local File Portal v3 — Kendi Ağını Kuran P2P Transfer Mimarisi
+# FTPortal v3 — Kendi Ağını Kuran P2P Transfer Mimarisi
 
 > Hedef: sunucuyu çalıştıran cihazın **kendisi ağ olsun**. Bağlanacak cihazların hazır bir
 > Wi-Fi ağına (router / gemi ağı / otel Wi-Fi'si) ihtiyacı olmasın. Bağlanma tek QR ile olsun.
 > Dosya baytları mümkün olduğunca cihazdan cihaza **doğrudan** aksın, sunucu diskine uğramasın.
 
-Bu doküman mevcut `LocalFilePortal.ps1` (v2) üzerine **eklemeli** bir tasarımdır. HTTP katmanı,
+Bu doküman mevcut `FTPortal.ps1` (v2) üzerine **eklemeli** bir tasarımdır. HTTP katmanı,
 oturum modeli, bundle/ZIP mantığı aynen korunur.
 
 ---
@@ -37,7 +37,7 @@ L0  Taşıyıcı     SoftAP (Mobile Hotspot | Wi-Fi Direct GO) | mevcut Wi-Fi | 
 ```
 
 Kritik tasarım özelliği: **L0 değişikliği üst katmanlara sızmaz.** Windows SoftAP host'a
-`192.168.137.1` verir ve `LocalFilePortal.ps1:1828` zaten `192.168.137.*` adresini tercih ediyor.
+`192.168.137.1` verir ve `FTPortal.ps1:1828` zaten `192.168.137.*` adresini tercih ediyor.
 Yani AP'yi ayağa kaldırmak, geri kalan 2110 satıra dokunmadan çalışır.
 
 ---
@@ -297,7 +297,7 @@ olarak kullanılır:
 - Sunucu tarafı: `$Global:Signals` (synchronized hashtable, `pubId -> Queue`), 60 sn TTL
 
 **Neden SSE/WebSocket değil:** sunucu 32 runspace'lik havuzla çalışıyor
-(`LocalFilePortal.ps1:23`). Kalıcı stream başına bir worker kilitlenir; 8 istemcide sorun
+(`FTPortal.ps1:23`). Kalıcı stream başına bir worker kilitlenir; 8 istemcide sorun
 olmasa da tasarımı kırılgan yapar. Yoklama ile sıfır risk.
 
 **Gecikme:** müzakere sırasında istemci yoklama aralığını 4 sn → 1 sn'ye düşürür, bağlantı
@@ -343,9 +343,30 @@ davranışa döner.
 
 - SoftAP parolası **her oturumda rastgele** üretilir, sabit değildir; yalnızca lobby QR'ında görünür. WPA2 hava linkini şifreler.
 - Mevcut paylaşılan parola ile oturum açma korunur (`$Global:Password`).
-- v2'deki "Wi-Fi subnet dışını reddet" kontrolü (`LocalFilePortal.ps1:2047`) self-AP'de **daha güçlü** hale gelir: yalnız `192.168.137.0/24`. Ethernet/LAN portalı hiç görmez.
+- v2'deki "Wi-Fi subnet dışını reddet" kontrolü v3'te `Test-AllowedClient`'e dönüştü: soru artık "Wi-Fi adaptörü mü" değil, **"ayakta olan bir taşıyıcının subnet'i mi"**. Yalnız self-AP çalışıyorsa bu `192.168.137.0/24` demektir ve kablolu LAN portalı hiç görmez; `lan` taşıyıcısı bilerek açıldığında ise o ağ da kapsama girer - bu bir gevşeme değil, kullanıcının açıkça istediği şey.
 - P2P yükü uçtan uca DTLS ile şifreli — sunucu prensipte bile okuyamaz.
 - Değişmeyen: düz HTTP, güvenilen yerel ağ varsayımı. Portu internete açma.
+
+---
+
+### v3 eklentileri: sunucuyu durdurma ve tek taramayla giriş
+
+**Durdurma yalnızca host'ta.** `/api/shutdown` yalnızca `POST` kabul ediyor (bir bağlantıya
+tıklanarak tetiklenemesin diye) ve loopback ile portalın kendi taşıyıcı adresleri dışındaki
+her kaynağı reddediyor. Aynı AP'deki telefon portala girebiliyor ama sunucuyu kapatamıyor —
+kapatabilseydi transfer ortasındaki herkesi keserdi. Yanıt önce yazılıp sonra dinleyici
+kapatılıyor; sırası ters olsa isteği yapan tarayıcı onay yerine ölü soket görürdü.
+
+**Giriş anahtarını kim alıyor.** Anahtar her taşıyıcıda üretiliyor; değişen, portalın onu
+kime verdiği — ve ayrım, anahtarı taşıyan şeyi kimin görebildiğine dayanıyor:
+
+| Taşıyan | Giriş yapar mı | Neden |
+|---|---|---|
+| **Lobi QR'ı** | **Her zaman** | `/lobby` yalnızca host makinesine sunuluyor. O kodu görebiliyor olmak zaten host ekranının başında durmak demek — herkesin bildiği bir parolayı yazmaktan güçlü bir hareket. |
+| **Captive yönlendirme** | Yalnızca kendi kurduğumuz ağda | O yanıt ağa katılan **herkese** gidiyor. Ödünç alınan bir ağda (station/lan) bunlar yabancılar, dolayısıyla onlara parola sayfası düşüyor. |
+
+Yani ikinci QR artık her taşıyıcıda doğrudan içeri alıyor; portalın kurmadığı bir ağa öylece
+katılan bir cihazın ise hâlâ parolayı bilmesi gerekiyor.
 
 ---
 
@@ -461,6 +482,7 @@ sona 7-bit ASCII — yanlış çözümlenebilecek bayt kalmadı. Aynı hata upSt
 | **2** ✅ | WebRTC P2P veri düzlemi + relay'e düşme | Sunucu diski yazılmaz, çift atlama yok | Orta — mDNS / izolasyon |
 | **3** ✅ | BT-PAN seçilebilir taşıyıcı, USB tether dokümantasyonu | Wi-Fi radyosu tamamen kapalıyken çalışır | Düşük — manuel eşleştirme, 3 Mbps |
 | **4** ✅ | Çoklu taşıyıcı, devretme + bildirim, elle değiştirme, `lan` taşıyıcısı | Tek bir yolun düşmesi kesinti değil, düşüş oluyor; host taşıyıcıyı portaldan seçiyor | Orta — kabul filtresi tek subnet yerine çoklu subnet mantığına geçti |
+| **5** ✅ | Portaldan sunucu durdurma, tek tarama ile giriş her taşıyıcıda | Konsola dönmeye gerek yok; ikinci QR artık her yolda doğrudan içeri alıyor | Düşük — ikisi de yalnızca host'a açık |
 
 Faz 0, 1 ve 2 uygulandı. Faz 1'in yalnızca yarısı hayata geçti: otomatik açılış (tek QR) var,
 `204` ile Android'i "internet var" sanmaya ikna etme yok — ikisi birbirini dışlıyor, çünkü

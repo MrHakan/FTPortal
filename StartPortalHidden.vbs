@@ -1,12 +1,12 @@
-' Launches LocalFilePortal.ps1 hidden in the background - no console window.
+' Launches FTPortal.ps1 hidden in the background - no console window.
 ' Double-click this file (or put a shortcut to it in shell:startup to autorun on login).
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
-ps1Path = scriptDir & "\LocalFilePortal.ps1"
+ps1Path = scriptDir & "\FTPortal.ps1"
 
 If Not fso.FileExists(ps1Path) Then
-    MsgBox "LocalFilePortal.ps1 not found next to this launcher:" & vbCrLf & ps1Path, vbCritical, "Local File Portal"
+    MsgBox "FTPortal.ps1 not found next to this launcher:" & vbCrLf & ps1Path, vbCritical, "FTPortal"
     WScript.Quit 1
 End If
 

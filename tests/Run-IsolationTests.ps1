@@ -28,7 +28,7 @@ function It {
     }
 }
 
-$portal = Join-Path (Split-Path -Parent $PSScriptRoot) 'LocalFilePortal.ps1'
+$portal = Join-Path (Split-Path -Parent $PSScriptRoot) 'FTPortal.ps1'
 $errs = $null; $toks = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($portal, [ref]$toks, [ref]$errs)
 if ($errs -and $errs.Count) { throw ("portal has parse errors; first: {0}" -f $errs[0].Message) }

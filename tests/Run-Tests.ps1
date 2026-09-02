@@ -1,5 +1,5 @@
 # ==============================================================================
-#  Run-Tests.ps1 - tests for LocalFilePortal.ps1
+#  Run-Tests.ps1 - tests for FTPortal.ps1
 #
 #  The portal is one file that starts a server the moment it is dot-sourced, so
 #  these tests do not load it. They parse it, lift out every function definition
@@ -34,8 +34,8 @@ function Should-BeTrue { param($V, [string]$M = 'expected true') if (-not $V) { 
 function Should-BeFalse { param($V, [string]$M = 'expected false') if ($V) { throw $M } }
 
 # ---------------------------------------------------------------- load ------
-$portal = Join-Path (Split-Path -Parent $PSScriptRoot) 'LocalFilePortal.ps1'
-if (-not (Test-Path -LiteralPath $portal)) { throw "LocalFilePortal.ps1 not found next to tests/" }
+$portal = Join-Path (Split-Path -Parent $PSScriptRoot) 'FTPortal.ps1'
+if (-not (Test-Path -LiteralPath $portal)) { throw "FTPortal.ps1 not found next to tests/" }
 
 $errs = $null; $toks = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($portal, [ref]$toks, [ref]$errs)
@@ -43,7 +43,7 @@ if ($errs -and $errs.Count) { throw ("portal has {0} parse error(s); first: {1}"
 
 $fnAsts = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 foreach ($f in $fnAsts) { Invoke-Expression $f.Extent.Text }
-Write-Host ("`n  Loaded {0} functions from LocalFilePortal.ps1`n" -f $fnAsts.Count) -ForegroundColor Cyan
+Write-Host ("`n  Loaded {0} functions from FTPortal.ps1`n" -f $fnAsts.Count) -ForegroundColor Cyan
 
 # ---------------------------------------------------- hardware lockout ------
 # Everything that reaches a radio is replaced HERE, at script scope, before any
@@ -98,6 +98,11 @@ function Reset-World {
     $Global:Transfers   = [hashtable]::Synchronized(@{})
     $Global:Signals     = [hashtable]::Synchronized(@{})
     $Global:SignalLock  = New-Object object
+    # Session minting (the one-scan sign-in path) writes through these.
+    $Global:SessionLock = New-Object object
+    $Global:UploadLock  = New-Object object
+    $Global:SessionFile = Join-Path $Global:MetaFolder 'sessions.dat'
+    if (-not (Test-Path -LiteralPath $Global:MetaFolder)) { New-Item -ItemType Directory -Path $Global:MetaFolder -Force | Out-Null }
     $Global:SignalTTL   = [TimeSpan]::FromSeconds(60)
     $Global:P2P         = $true
     $Global:CaptivePortal = $false
@@ -112,6 +117,8 @@ function Reset-World {
     $Global:Notices     = [hashtable]::Synchronized(@{ Seq = 0; Items = (New-Object System.Collections.ArrayList) })
     $Global:NoticeLock  = New-Object object
     $Global:ApWatch     = [hashtable]::Synchronized(@{ Stop=$false; Restarts=0; Switching=$false })
+    $Global:Shutdown    = [hashtable]::Synchronized(@{ Requested=$false; By='' })
+    $Global:Listener    = $null
     $Global:BearerOrder = @('wifidirect','hotspot','station','lan')
     $Global:MultiConnect= $true
     $Global:StationFallback = $true
@@ -549,6 +556,132 @@ It '/api/lobby is host-only and carries live bearer state for the QR redraw' {
     Should-Be $r.Json.ssid 'FTPHAKAN-AA'
     Should-Be $r.Json.pass 'pw123'
     Should-BeTrue ($r.Json.bearers.Count -eq 5)
+}
+
+# =============================== SHUTDOWN =====================================
+Write-Host '  -- stop server --' -ForegroundColor Yellow
+
+It '/api/shutdown refuses a device that is not the host' {
+    Setup-Routes
+    $r = Invoke-Route (New-Req -Path '/api/shutdown' -Method 'POST' -ClientIp '192.168.137.42' -Cookies $cookie)
+    Should-Be $r.Status 403
+    Should-BeFalse $Global:Shutdown.Requested 'a phone must not be able to kill the portal'
+}
+It '/api/shutdown refuses an unauthenticated request from the host machine' {
+    $r = Invoke-Route (New-Req -Path '/api/shutdown' -Method 'POST' -ClientIp '127.0.0.1')
+    Should-Be $r.Status 401
+    Should-BeFalse $Global:Shutdown.Requested
+}
+It '/api/shutdown rejects GET - it must not be reachable by following a link' {
+    $r = Invoke-Route (New-Req -Path '/api/shutdown' -Method 'GET' -ClientIp '127.0.0.1' -Cookies $cookie)
+    Should-Be $r.Status 405
+    Should-BeFalse $Global:Shutdown.Requested
+}
+It '/api/shutdown accepts a host POST and raises the flag' {
+    Setup-Routes
+    $r = Invoke-Route (New-Req -Path '/api/shutdown' -Method 'POST' -ClientIp '127.0.0.1' -Cookies $cookie)
+    Should-Be $r.Status 200
+    Should-BeTrue $r.Json.ok
+    Should-BeTrue $Global:Shutdown.Requested
+}
+It 'it answers before it tears anything down' {
+    Setup-Routes
+    $r = Invoke-Route (New-Req -Path '/api/shutdown' -Method 'POST' -ClientIp '127.0.0.1' -Cookies $cookie)
+    Should-BeTrue ($r.Body -match '"ok":true') 'the response body actually made it out'
+    Should-BeTrue ($r.Head -match 'HTTP/1.1 200')
+}
+It 'the shutdown is attributed to whoever asked' {
+    Setup-Routes
+    $Global:Sessions['sid-test'].Nick = 'Bridge PC'
+    [void](Invoke-Route (New-Req -Path '/api/shutdown' -Method 'POST' -ClientIp '127.0.0.1' -Cookies $cookie))
+    Should-Be $Global:Shutdown.By 'Bridge PC'
+}
+It 'every device is told, so a phone mid-transfer learns why it died' {
+    Setup-Routes
+    [void](Invoke-Route (New-Req -Path '/api/shutdown' -Method 'POST' -ClientIp '127.0.0.1' -Cookies $cookie))
+    $n = @(Get-NoticesAfter -Since 0 | Where-Object { $_.kind -eq 'shutdown' })
+    Should-Be $n.Count 1
+    Should-Be $n[0].level 'warn'
+}
+It 'a missing listener does not stop the flag being raised' {
+    Setup-Routes
+    $Global:Listener = $null
+    $r = Invoke-Route (New-Req -Path '/api/shutdown' -Method 'POST' -ClientIp '127.0.0.1' -Cookies $cookie)
+    Should-Be $r.Status 200
+    Should-BeTrue $Global:Shutdown.Requested
+}
+
+# ========================= ONE-SCAN SIGN-IN ===================================
+# The key is minted whenever auto-login is on. What is gated is who may be
+# HANDED it: the lobby QR always, the captive redirect only on our own network.
+Write-Host '  -- one-scan sign-in --' -ForegroundColor Yellow
+
+It 'the lobby QR carries a sign-in key on a network we raised' {
+    Reset-World
+    Set-BearerRecord -Kind 'wifidirect' -Ssid 'FTP-AA' -Pass 'pw' -IP '192.168.137.1' -Prefix 24
+    [void](Set-PrimaryBearer -Kind 'wifidirect')
+    $Global:AutoLoginKey = 'key123456789'
+    $page = Get-LobbyPage -Url (Get-PortalUrl)
+    Should-BeTrue ($page -match 'k=key123456789') 'the QR URL signs you in'
+}
+It 'the lobby QR ALSO carries it on a borrowed network - it is host-screen only' {
+    Reset-World
+    Set-BearerRecord -Kind 'lan' -Ssid 'advspring.local' -IP '10.0.7.35' -Prefix 8
+    [void](Set-PrimaryBearer -Kind 'lan')
+    $Global:AutoLoginKey = 'key123456789'
+    $page = Get-LobbyPage -Url (Get-PortalUrl)
+    Should-BeTrue ($page -match 'k=key123456789')
+}
+It 'the captive redirect still withholds it on a borrowed network' {
+    Reset-World
+    Set-BearerRecord -Kind 'lan' -Ssid 'advspring.local' -IP '10.0.7.35' -Prefix 8
+    [void](Set-PrimaryBearer -Kind 'lan')
+    $Global:CaptivePortal = $true; $Global:Bearer.Dns = $true
+    $Global:AutoLoginKey = 'key123456789'
+    $r = Invoke-Route (New-Req -Path '/generate_204' -ClientIp '10.0.7.99' -Headers @{ 'host' = 'connectivitycheck.gstatic.com' })
+    Should-Be $r.Status 302
+    Should-BeFalse ($r.Head -match 'k=key123456789') 'no free session to a stranger on a shared network'
+}
+It 'the captive redirect does carry it on our own AP' {
+    Reset-World
+    Set-BearerRecord -Kind 'wifidirect' -Ssid 'FTP-AA' -Pass 'pw' -IP '192.168.137.1' -Prefix 24
+    [void](Set-PrimaryBearer -Kind 'wifidirect')
+    $Global:CaptivePortal = $true; $Global:Bearer.Dns = $true
+    $Global:AutoLoginKey = 'key123456789'
+    $r = Invoke-Route (New-Req -Path '/generate_204' -ClientIp '192.168.137.42' -Headers @{ 'host' = 'captive.apple.com' })
+    Should-Be $r.Status 302
+    Should-BeTrue ($r.Head -match 'k=key123456789')
+}
+It 'scanning the QR signs you in on a borrowed network too' {
+    Reset-World
+    Set-BearerRecord -Kind 'lan' -Ssid 'advspring.local' -IP '10.0.7.35' -Prefix 8
+    [void](Set-PrimaryBearer -Kind 'lan')
+    $Global:AutoLoginKey = 'key123456789'
+    $r = Invoke-Route (New-Req -Path '/' -Query 'k=key123456789' -ClientIp '10.0.7.99')
+    Should-Be $r.Status 302
+    Should-BeTrue ($r.Head -match 'Location: /dashboard') 'lands in the portal, not on the login page'
+    Should-BeTrue ($r.Head -match 'Set-Cookie') 'and with a session'
+}
+It 'a wrong key still gets the password page, never a session' {
+    $r = Invoke-Route (New-Req -Path '/' -Query 'k=wrongwrongwro' -ClientIp '10.0.7.99')
+    Should-Be $r.Status 200
+    Should-BeFalse ($r.Head -match 'Set-Cookie')
+}
+It 'no key at all still gets the password page' {
+    $r = Invoke-Route (New-Req -Path '/' -ClientIp '10.0.7.99')
+    Should-Be $r.Status 200
+    Should-BeFalse ($r.Head -match 'Set-Cookie')
+}
+It 'auto-login off means no key is minted and no QR can sign anyone in' {
+    Reset-World
+    Set-BearerRecord -Kind 'wifidirect' -Ssid 'FTP-AA' -Pass 'pw' -IP '192.168.137.1' -Prefix 24
+    [void](Set-PrimaryBearer -Kind 'wifidirect')
+    $Global:AutoLogin = $false
+    $Global:AutoLoginKey = ''
+    $page = Get-LobbyPage -Url (Get-PortalUrl)
+    Should-BeFalse ($page -match 'k=key')
+    $r = Invoke-Route (New-Req -Path '/' -Query 'k=' -ClientIp '192.168.137.42')
+    Should-BeFalse ($r.Head -match 'Set-Cookie') 'an empty key must never match'
 }
 
 # ============================ CAPTIVE INTERCEPTION ============================
