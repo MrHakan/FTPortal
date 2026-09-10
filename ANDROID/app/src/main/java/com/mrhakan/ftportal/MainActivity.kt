@@ -2,9 +2,9 @@ package com.mrhakan.ftportal
 
 import android.Manifest
 import android.app.AlertDialog
-import android.content.res.ColorStateList
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.database.Cursor
 import android.graphics.Color
 import android.graphics.Typeface
@@ -31,6 +31,9 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.DateFormat
@@ -69,6 +72,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var homeScreen: View
     private lateinit var nearbyScreen: View
     private lateinit var historyScreen: View
+    private lateinit var headerView: View
+    private lateinit var navigationView: View
     private lateinit var navHome: Button
     private lateinit var navNearby: Button
     private lateinit var navHistory: Button
@@ -163,12 +168,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         ShareRegistry.initialize(applicationContext)
         TransferCenter.initialize(applicationContext)
         requestNotificationPermission()
 
-        window.statusBarColor = UiColors.background
-        window.navigationBarColor = UiColors.background
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = UiColors.surface
         buildUi()
         startPortal()
         refresh()
@@ -192,7 +198,9 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(UiColors.background)
         }
-        root.addView(buildHeader())
+
+        headerView = buildHeader()
+        root.addView(headerView)
 
         val contentHost = FrameLayout(this).apply { setBackgroundColor(UiColors.background) }
         homeScreen = buildHomeScreen()
@@ -202,8 +210,28 @@ class MainActivity : ComponentActivity() {
         contentHost.addView(nearbyScreen)
         contentHost.addView(historyScreen)
         root.addView(contentHost, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        root.addView(buildNavigation())
+
+        navigationView = buildNavigation()
+        root.addView(navigationView)
+
         setContentView(root)
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            headerView.setPadding(
+                dp(20) + bars.left,
+                dp(18) + bars.top,
+                dp(20) + bars.right,
+                dp(12)
+            )
+            navigationView.setPadding(
+                dp(12) + bars.left,
+                dp(8),
+                dp(12) + bars.right,
+                dp(10) + bars.bottom
+            )
+            insets
+        }
+        ViewCompat.requestApplyInsets(root)
         showScreen(PortalScreen.HOME)
     }
 
@@ -223,8 +251,8 @@ class MainActivity : ComponentActivity() {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(12), 0, 0, 0)
-                addView(label("FTPortal", 24f, UiColors.text, bold = true))
-                addView(label("Direct local file transfer", 13f, UiColors.muted))
+                addView(label("FTPortal", if (isCompactScreen()) 21f else 24f, UiColors.text, bold = true))
+                addView(label("Direct local file transfer", if (isCompactScreen()) 12f else 13f, UiColors.muted))
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             hostBadge = label("STARTING", 11f, UiColors.text, bold = true).apply {
                 gravity = Gravity.CENTER
@@ -239,7 +267,7 @@ class MainActivity : ComponentActivity() {
         val content = verticalContent()
 
         val hero = card().apply {
-            addView(label("Share without the cloud", 22f, UiColors.text, bold = true))
+            addView(label("Share without the cloud", if (isCompactScreen()) 19f else 22f, UiColors.text, bold = true))
             addView(label("Pick a file once. Nearby FTPortal apps can join your lobby, while browsers can still use the web fallback.", 14f, UiColors.muted).apply {
                 setPadding(0, dp(7), 0, dp(16))
             })
@@ -328,7 +356,7 @@ class MainActivity : ComponentActivity() {
     private fun buildNearbyScreen(): View {
         val content = verticalContent()
         addCard(content, card().apply {
-            addView(label("Nearby lobbies", 24f, UiColors.text, bold = true))
+            addView(label("Nearby lobbies", if (isCompactScreen()) 21f else 24f, UiColors.text, bold = true))
             addView(label("FTPortal scans the directly connected local network. v2 devices can receive offers; v1 devices still support the original pull flow.", 14f, UiColors.muted).apply {
                 setPadding(0, dp(7), 0, dp(14))
             })
@@ -349,7 +377,7 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER_VERTICAL
                 addView(LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.VERTICAL
-                    addView(label("Transfer history", 24f, UiColors.text, bold = true))
+                    addView(label("Transfer history", if (isCompactScreen()) 21f else 24f, UiColors.text, bold = true))
                     addView(label("Completed and failed sends/receives are stored locally on this device.", 13f, UiColors.muted))
                 }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 addView(textButton("Clear") {
@@ -376,9 +404,9 @@ class MainActivity : ComponentActivity() {
             navHome = navButton("⌂\nHome") { showScreen(PortalScreen.HOME) }
             navNearby = navButton("◎\nNearby") { showScreen(PortalScreen.NEARBY) }
             navHistory = navButton("↺\nHistory") { showScreen(PortalScreen.HISTORY) }
-            addView(navHome, LinearLayout.LayoutParams(0, dp(58), 1f))
-            addView(navNearby, LinearLayout.LayoutParams(0, dp(58), 1f))
-            addView(navHistory, LinearLayout.LayoutParams(0, dp(58), 1f))
+            addView(navHome, LinearLayout.LayoutParams(0, dp(68), 1f))
+            addView(navNearby, LinearLayout.LayoutParams(0, dp(68), 1f))
+            addView(navHistory, LinearLayout.LayoutParams(0, dp(68), 1f))
         }
     }
 
@@ -396,13 +424,14 @@ class MainActivity : ComponentActivity() {
 
     private fun refresh() {
         val running = HostPreferences.isServiceRunning(this)
-        val urls = NetworkUrls.urls(PortalService.PORT)
+        val webPort = PortalService.webPort()
+        val urls = NetworkUrls.urls(webPort)
         hostBadge.text = if (running) "ONLINE" else "OFFLINE"
         hostBadge.setTextColor(if (running) UiColors.success else UiColors.danger)
         statusText.text = when {
             !running -> "Host is stopped. Tap Start to expose your local lobby."
             urls.isEmpty() -> "Host is running, but this phone is not currently reachable on a Wi-Fi/hotspot IPv4 address."
-            else -> "Web fallback:\n${urls.joinToString("\n")}\nNative peer: ${PeerProtocol.VERSION} · TCP ${PeerProtocol.PEER_PORT}"
+            else -> "Web access:\n${urls.joinToString("\n")}\nNative peer: ${PeerProtocol.VERSION} · TCP ${PeerProtocol.PEER_PORT}"
         }
         renderShares()
         refreshIncomingOffers()
@@ -889,10 +918,12 @@ class MainActivity : ComponentActivity() {
         this.text = text
         textSize = 12f
         gravity = Gravity.CENTER
-        setPadding(0, 0, 0, 0)
+        setPadding(0, dp(3), 0, dp(3))
         setTextColor(UiColors.muted)
         background = rounded(Color.TRANSPARENT, radius = 14)
         stateListAnimator = null
+        minHeight = dp(64)
+        minimumHeight = dp(64)
         setOnClickListener { onClick() }
     }
 
@@ -924,6 +955,8 @@ class MainActivity : ComponentActivity() {
         cornerRadius = dp(radius).toFloat()
         stroke?.let { setStroke(dp(1), it) }
     }
+
+    private fun isCompactScreen(): Boolean = resources.configuration.screenWidthDp < 380
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 }
