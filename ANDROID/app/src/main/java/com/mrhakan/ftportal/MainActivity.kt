@@ -2,7 +2,7 @@ package com.mrhakan.ftportal
 
 import android.Manifest
 import android.app.AlertDialog
-import android.content.ColorStateList
+import android.content.res.ColorStateList
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.Cursor
@@ -133,7 +133,7 @@ class MainActivity : ComponentActivity() {
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
             )
         }
-        PeerOfferReceiver.downloadAll(applicationContext, offer, treeUri) { report ->
+        TrackedPeerOfferReceiver.downloadAll(applicationContext, offer, treeUri) { report ->
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 val message = when {
