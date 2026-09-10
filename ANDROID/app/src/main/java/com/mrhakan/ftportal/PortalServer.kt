@@ -16,10 +16,10 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
             session.method == Method.GET && path == "/" -> newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html())
             session.method == Method.GET && path == "/api/state" -> newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", stateJson())
             session.method == Method.GET && path == PeerProtocol.INFO_PATH_V1 -> newFixedLengthResponse(
-                Response.Status.OK, "application/json; charset=utf-8", PeerProtocol.infoJson(context, PortalService.PORT, PeerProtocol.VERSION_V1)
+                Response.Status.OK, "application/json; charset=utf-8", PeerProtocol.infoJson(context, PortalService.webPort(), PeerProtocol.VERSION_V1)
             ).apply { addHeader("X-FTPortal-Protocol", PeerProtocol.VERSION_V1) }
             session.method == Method.GET && path == PeerProtocol.INFO_PATH_V2 -> newFixedLengthResponse(
-                Response.Status.OK, "application/json; charset=utf-8", PeerProtocol.infoJson(context, PortalService.PORT, PeerProtocol.VERSION_V2)
+                Response.Status.OK, "application/json; charset=utf-8", PeerProtocol.infoJson(context, PortalService.webPort(), PeerProtocol.VERSION_V2)
             ).apply { addHeader("X-FTPortal-Protocol", PeerProtocol.VERSION_V2) }
             session.method == Method.POST && path == PeerProtocol.OFFER_PATH_V2 -> receiveOffer(session)
             session.method == Method.GET && path.startsWith(PeerProtocol.TRANSFER_PREFIX_V2) -> offeredDownload(session, path.removePrefix(PeerProtocol.TRANSFER_PREFIX_V2), peer)
