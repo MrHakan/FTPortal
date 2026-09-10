@@ -71,7 +71,9 @@ internal sealed class PortalServer : IAsyncDisposable
         var encoder = HtmlEncoder.Default;
         var rows = string.Join("", _shares.All().Select(file => $"<a class='file' href='/download/{file.Id}'><b>{encoder.Encode(file.Name)}</b><span>{file.Size:N0} bytes</span></a>"));
         if (rows.Length == 0) rows = "<p>No file is currently shared.</p>";
-        return $"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="4"><title>FTPortal Windows</title><style>body{{font-family:Segoe UI,sans-serif;background:#0d1117;color:#e6edf3;max-width:760px;margin:50px auto;padding:20px}}.file{{display:flex;justify-content:space-between;padding:18px;margin:10px 0;border:1px solid #30363d;border-radius:12px;color:#58a6ff;text-decoration:none;background:#161b22}}.file span,p{{color:#8b949e}}</style></head><body><h1>FTPortal</h1><p>Windows one-shot host · completed downloads consume the share.</p>{rows}</body></html>""";
+        return "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='4'><title>FTPortal Windows</title>" +
+               "<style>body{font-family:Segoe UI,sans-serif;background:#0d1117;color:#e6edf3;max-width:760px;margin:50px auto;padding:20px}.file{display:flex;justify-content:space-between;padding:18px;margin:10px 0;border:1px solid #30363d;border-radius:12px;color:#58a6ff;text-decoration:none;background:#161b22}.file span,p{color:#8b949e}</style>" +
+               "</head><body><h1>FTPortal</h1><p>Windows one-shot host · completed downloads consume the share.</p>" + rows + "</body></html>";
     }
 
     public async ValueTask DisposeAsync()

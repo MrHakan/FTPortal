@@ -67,7 +67,8 @@ final class PortalServer {
         let rows = PortalStore.shared.all().map { file in
             "<a class='file' href='/download/\(file.id)'><b>\(html(file.name))</b><span>\(file.size >= 0 ? "\(file.size) bytes" : "stream")</span></a>"
         }.joined()
-        let body = """<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='4'><title>FTPortal iOS</title><style>body{font-family:-apple-system;background:#0d1117;color:#e6edf3;max-width:720px;margin:50px auto;padding:20px}.file{display:flex;justify-content:space-between;padding:18px;margin:10px 0;border:1px solid #30363d;border-radius:12px;color:#58a6ff;text-decoration:none;background:#161b22}.file span,p{color:#8b949e}</style></head><body><h1>FTPortal</h1><p>iOS one-shot host · a completed download consumes the share.</p>\(rows.isEmpty ? "<p>No file is currently shared.</p>" : rows)</body></html>"""
+        let content = rows.isEmpty ? "<p>No file is currently shared.</p>" : rows
+        let body = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='4'><title>FTPortal iOS</title><style>body{font-family:-apple-system;background:#0d1117;color:#e6edf3;max-width:720px;margin:50px auto;padding:20px}.file{display:flex;justify-content:space-between;padding:18px;margin:10px 0;border:1px solid #30363d;border-radius:12px;color:#58a6ff;text-decoration:none;background:#161b22}.file span,p{color:#8b949e}</style></head><body><h1>FTPortal</h1><p>iOS one-shot host · a completed download consumes the share.</p>\(content)</body></html>"
         sendResponse(connection, status: "200 OK", contentType: "text/html; charset=utf-8", data: Data(body.utf8))
     }
 
