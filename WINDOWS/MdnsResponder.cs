@@ -6,27 +6,36 @@ namespace FTPortal.Windows;
 
 internal sealed class MdnsResponder : IAsyncDisposable
 {
+    private static readonly IPAddress MulticastAddress = IPAddress.Parse("224.0.0.251");
     private readonly Func<IPAddress?> _address;
     private readonly CancellationTokenSource _stop = new();
     private UdpClient? _udp;
     private Task? _loop;
 
+    public bool IsRunning => _udp is not null && _loop is not null && !_loop.IsCompleted;
+    public string? LastError { get; private set; }
+
     public MdnsResponder(Func<IPAddress?> address) => _address = address;
 
     public void Start()
     {
+        if (_udp is not null) return;
         try
         {
-            _udp = new UdpClient(AddressFamily.InterNetwork);
-            _udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            _udp.Client.Bind(new IPEndPoint(IPAddress.Any, 5353));
-            _udp.JoinMulticastGroup(IPAddress.Parse("224.0.0.251"));
+            var udp = new UdpClient(AddressFamily.InterNetwork);
+            udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            udp.Client.Bind(new IPEndPoint(IPAddress.Any, 5353));
+            udp.JoinMulticastGroup(MulticastAddress);
+            _udp = udp;
+            LastError = null;
             _loop = Task.Run(RunAsync);
         }
-        catch
+        catch (Exception ex)
         {
+            LastError = ex.Message;
             _udp?.Dispose();
             _udp = null;
+            _loop = null;
         }
     }
 
@@ -40,12 +49,25 @@ internal sealed class MdnsResponder : IAsyncDisposable
                 var result = await _udp.ReceiveAsync(_stop.Token);
                 if (!ContainsQuestion(result.Buffer, "ftphakan.local")) continue;
                 var ip = _address();
-                if (ip is null) continue;
+                if (ip is null || ip.AddressFamily != AddressFamily.InterNetwork) continue;
                 var response = BuildAResponse("ftphakan.local", ip);
-                await _udp.SendAsync(response, new IPEndPoint(IPAddress.Parse("224.0.0.251"), 5353), _stop.Token);
+                await _udp.SendAsync(response, new IPEndPoint(MulticastAddress, 5353), _stop.Token);
+                LastError = null;
             }
-            catch (OperationCanceledException) { break; }
-            catch { }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ObjectDisposedException) when (_stop.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                try { await Task.Delay(250, _stop.Token); }
+                catch (OperationCanceledException) { break; }
+            }
         }
     }
 
@@ -59,11 +81,12 @@ internal sealed class MdnsResponder : IAsyncDisposable
             var labels = new List<string>();
             while (offset < packet.Length && packet[offset] != 0)
             {
-                var len = packet[offset++];
-                if ((len & 0xC0) != 0 || offset + len > packet.Length) return false;
-                labels.Add(Encoding.UTF8.GetString(packet, offset, len));
-                offset += len;
+                var length = packet[offset++];
+                if ((length & 0xC0) != 0 || length == 0 || offset + length > packet.Length) return false;
+                labels.Add(Encoding.UTF8.GetString(packet, offset, length));
+                offset += length;
             }
+            if (offset >= packet.Length) return false;
             offset++;
             if (offset + 4 > packet.Length) return false;
             var name = string.Join('.', labels);
@@ -76,23 +99,52 @@ internal sealed class MdnsResponder : IAsyncDisposable
 
     private static byte[] BuildAResponse(string name, IPAddress address)
     {
-        using var ms = new MemoryStream();
-        void U16(ushort n) { ms.WriteByte((byte)(n >> 8)); ms.WriteByte((byte)n); }
-        void U32(uint n) { ms.WriteByte((byte)(n >> 24)); ms.WriteByte((byte)(n >> 16)); ms.WriteByte((byte)(n >> 8)); ms.WriteByte((byte)n); }
-        U16(0); U16(0x8400); U16(0); U16(1); U16(0); U16(0);
+        using var stream = new MemoryStream();
+        void U16(ushort value)
+        {
+            stream.WriteByte((byte)(value >> 8));
+            stream.WriteByte((byte)value);
+        }
+        void U32(uint value)
+        {
+            stream.WriteByte((byte)(value >> 24));
+            stream.WriteByte((byte)(value >> 16));
+            stream.WriteByte((byte)(value >> 8));
+            stream.WriteByte((byte)value);
+        }
+
+        U16(0);
+        U16(0x8400);
+        U16(0);
+        U16(1);
+        U16(0);
+        U16(0);
         foreach (var label in name.Split('.'))
         {
-            var bytes = Encoding.UTF8.GetBytes(label); ms.WriteByte((byte)bytes.Length); ms.Write(bytes);
+            var bytes = Encoding.UTF8.GetBytes(label);
+            stream.WriteByte((byte)bytes.Length);
+            stream.Write(bytes);
         }
-        ms.WriteByte(0); U16(1); U16(0x8001); U32(120); U16(4); ms.Write(address.GetAddressBytes());
-        return ms.ToArray();
+        stream.WriteByte(0);
+        U16(1);
+        U16(0x8001);
+        U32(120);
+        U16(4);
+        stream.Write(address.GetAddressBytes());
+        return stream.ToArray();
     }
 
     public async ValueTask DisposeAsync()
     {
         _stop.Cancel();
         _udp?.Dispose();
-        if (_loop is not null) { try { await _loop; } catch { } }
+        if (_loop is not null)
+        {
+            try { await _loop; }
+            catch (OperationCanceledException) { }
+        }
+        _udp = null;
+        _loop = null;
         _stop.Dispose();
     }
 }

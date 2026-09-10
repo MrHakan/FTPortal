@@ -19,6 +19,7 @@ struct FTPortalApp: App {
 final class AppModel: ObservableObject {
     @Published var status = "Starting host…"
     @Published var files: [SharedFile] = []
+
     let server = PortalServer()
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
@@ -36,14 +37,21 @@ final class AppModel: ObservableObject {
         refresh()
     }
 
+    func clearPending() {
+        PortalStore.shared.clearPending()
+        refresh()
+    }
+
     func refresh() {
         files = PortalStore.shared.all()
         let urls = PortalServer.localIPv4().map { "http://\($0):\(PortalServer.port)" }
-        status = urls.isEmpty ? "Connect this iPhone/iPad to a local network." : urls.joined(separator: "\n") + "\nBonjour: FTPortal._http._tcp.local"
+        status = urls.isEmpty
+            ? "Connect this iPhone/iPad to Wi-Fi or a local hotspot."
+            : urls.joined(separator: "\n") + "\nBonjour: FTPortal._http._tcp.local"
     }
 
     func keepCurrentTransferAliveBriefly() {
-        guard backgroundTask == .invalid else { return }
+        guard PortalStore.shared.hasActiveTransfers, backgroundTask == .invalid else { return }
         backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "FTPortalTransfer") { [weak self] in
             self?.endBackgroundAllowance()
         }
@@ -59,6 +67,7 @@ final class AppModel: ObservableObject {
 struct ContentView: View {
     @ObservedObject var model: AppModel
     @State private var importing = false
+    @State private var confirmClear = false
     private let timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -67,24 +76,44 @@ struct ContentView: View {
                 Section("Host") {
                     Text(model.status).font(.system(.body, design: .monospaced))
                     Text("Keep FTPortal active for reliable hosting. iOS may suspend a general-purpose local server after the app is backgrounded; an active transfer gets a short background completion window.")
-                        .font(.footnote).foregroundStyle(.secondary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
+
                 Section("One-shot shares") {
                     Button("Share a file") { importing = true }
+                    Button("Clear pending shares", role: .destructive) { confirmClear = true }
+                        .disabled(model.files.isEmpty)
+
                     if model.files.isEmpty {
-                        Text("Nothing pending. FTPortal does not make a persistent copy.").foregroundStyle(.secondary)
+                        Text("Nothing pending. FTPortal does not make a persistent copy.")
+                            .foregroundStyle(.secondary)
                     }
                     ForEach(model.files) { file in
                         VStack(alignment: .leading) {
                             Text(file.name)
-                            Text(file.size >= 0 ? "\(file.size) bytes" : "Streaming source").font(.caption).foregroundStyle(.secondary)
+                            Text(file.size >= 0 ? "\(file.size) bytes" : "Streaming source")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
             }
             .navigationTitle("FTPortal")
             .fileImporter(isPresented: $importing, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
-                if case .success(let urls) = result, let url = urls.first { model.add(url) }
+                switch result {
+                case .success(let urls):
+                    if let url = urls.first { model.add(url) }
+                case .failure(let error):
+                    model.status = "File selection failed: \(error.localizedDescription)"
+                }
+            }
+            .confirmationDialog(
+                "Clear all pending share links? Original files will not be deleted.",
+                isPresented: $confirmClear,
+                titleVisibility: .visible
+            ) {
+                Button("Clear pending shares", role: .destructive) { model.clearPending() }
             }
             .onReceive(timer) { _ in model.refresh() }
         }
