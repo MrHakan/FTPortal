@@ -23,12 +23,18 @@ import fi.iki.elonen.NanoHTTPD
 
 class PortalService : Service() {
     companion object {
-        const val PORT = 8080
+        const val PRIMARY_WEB_PORT = 80
+        const val FALLBACK_WEB_PORT = 8080
         const val ACTION_STOP = "com.mrhakan.ftportal.STOP_HOST"
         const val ACTION_REFRESH = "com.mrhakan.ftportal.REFRESH_HOST"
         private const val CHANNEL = "ftportal-host"
         private const val NOTIFICATION_ID = 41
         private const val TAG = "FTPortalService"
+
+        @Volatile
+        private var boundWebPort: Int = FALLBACK_WEB_PORT
+
+        fun webPort(): Int = boundWebPort
     }
 
     private var legacyServer: PortalServer? = null
@@ -47,12 +53,8 @@ class PortalService : Service() {
         createChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
-        runCatching {
-            legacyServer = PortalServer(applicationContext, PORT).also {
-                it.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-            }
-        }.onFailure {
-            Log.e(TAG, "Unable to start legacy local host", it)
+        if (!startWebHost()) {
+            Log.e(TAG, "Unable to start local web host on ports $PRIMARY_WEB_PORT or $FALLBACK_WEB_PORT")
             stopSelf()
             return
         }
@@ -62,7 +64,7 @@ class PortalService : Service() {
                 it.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             }
         }.onFailure {
-            Log.w(TAG, "Peer protocol port unavailable; legacy web host remains active", it)
+            Log.w(TAG, "Peer protocol port unavailable; web host remains active", it)
         }
 
         registerNsd()
@@ -97,11 +99,33 @@ class PortalService : Service() {
         peerServer = null
         legacyServer?.stop()
         legacyServer = null
+        boundWebPort = FALLBACK_WEB_PORT
         HostPreferences.setServiceRunning(applicationContext, false)
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startWebHost(): Boolean {
+        val candidates = intArrayOf(PRIMARY_WEB_PORT, FALLBACK_WEB_PORT)
+        for (port in candidates) {
+            val server = PortalServer(applicationContext, port)
+            val started = runCatching {
+                server.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+            }
+            if (started.isSuccess) {
+                legacyServer = server
+                boundWebPort = port
+                Log.i(TAG, "Local web host listening on TCP/$port")
+                return true
+            }
+
+            runCatching { server.stop() }
+            val reason = started.exceptionOrNull()?.message ?: started.exceptionOrNull()?.javaClass?.simpleName ?: "unknown error"
+            Log.w(TAG, "Could not bind local web host to TCP/$port: $reason")
+        }
+        return false
+    }
 
     private fun createChannel() {
         val manager = getSystemService(NotificationManager::class.java)
