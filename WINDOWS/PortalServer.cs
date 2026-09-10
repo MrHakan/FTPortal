@@ -2,12 +2,14 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using System.Net.Sockets;
+using System.Text;
 using System.Text.Encodings.Web;
 
 namespace FTPortal.Windows;
 
 internal sealed class PortalServer : IAsyncDisposable
 {
+    private const int MaximumOfferBytes = 128 * 1024;
     private readonly ShareRegistry _shares;
     private WebApplication? _legacyApp;
     private WebApplication? _peerApp;
@@ -85,9 +87,28 @@ internal sealed class PortalServer : IAsyncDisposable
             await next();
         });
 
-        app.MapGet(PeerProtocol.InfoPath, () => Results.Json(PeerProtocol.CreateInfo(_shares, Port)));
-        app.MapGet(PeerProtocol.DownloadPrefix + "{id}", async (HttpContext context, string id) =>
-            await SendOneShotAsync(context, id, nativePeer: true));
+        app.MapGet(PeerProtocol.InfoPathV1, () => Results.Json(PeerProtocol.CreateInfo(_shares, Port, PeerProtocol.VersionV1)));
+        app.MapGet(PeerProtocol.InfoPathV2, () => Results.Json(PeerProtocol.CreateInfo(_shares, Port, PeerProtocol.VersionV2)));
+        app.MapPost(PeerProtocol.OfferPathV2, ReceiveOfferAsync);
+        app.MapGet(PeerProtocol.TransferPrefixV2 + "{offerId}/{id}", async (HttpContext context, string offerId, string id) =>
+        {
+            var authorization = context.Request.Headers["Authorization"].ToString();
+            if (!PeerOfferStore.AuthorizeOutgoing(offerId, id, authorization))
+            {
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                context.Response.Headers["WWW-Authenticate"] = "Bearer";
+                await context.Response.WriteAsync("Offer authorization failed", context.RequestAborted);
+                return;
+            }
+            await SendOneShotAsync(
+                context,
+                id,
+                protocolVersion: PeerProtocol.VersionV2,
+                onCompleted: () => PeerOfferStore.CompleteOutgoingFile(offerId, id)
+            );
+        });
+        app.MapGet(PeerProtocol.DownloadPrefixV1 + "{id}", async (HttpContext context, string id) =>
+            await SendOneShotAsync(context, id, protocolVersion: PeerProtocol.VersionV1));
 
         if (!legacySurface) return;
 
@@ -103,8 +124,51 @@ internal sealed class PortalServer : IAsyncDisposable
                 await SendHeadAsync(context, id);
                 return;
             }
-            await SendOneShotAsync(context, id, nativePeer: false);
+            await SendOneShotAsync(context, id, protocolVersion: null);
         });
+    }
+
+    private async Task ReceiveOfferAsync(HttpContext context)
+    {
+        if (context.Request.ContentLength is null or <= 0)
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await context.Response.WriteAsync("Offer body required", context.RequestAborted);
+            return;
+        }
+        if (context.Request.ContentLength > MaximumOfferBytes)
+        {
+            context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+            await context.Response.WriteAsync("Offer payload too large", context.RequestAborted);
+            return;
+        }
+
+        using var reader = new StreamReader(context.Request.Body, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
+        var json = await reader.ReadToEndAsync(context.RequestAborted);
+        if (Encoding.UTF8.GetByteCount(json) > MaximumOfferBytes)
+        {
+            context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+            await context.Response.WriteAsync("Offer payload too large", context.RequestAborted);
+            return;
+        }
+
+        var remote = context.Connection.RemoteIpAddress;
+        if (remote?.IsIPv4MappedToIPv6 == true) remote = remote.MapToIPv4();
+        var offer = PeerOfferStore.ReceiveIncoming(remote?.ToString() ?? string.Empty, json);
+        if (offer is null)
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await context.Response.WriteAsync("Invalid or expired offer", context.RequestAborted);
+            return;
+        }
+
+        context.Response.Headers["X-FTPortal-Protocol"] = PeerProtocol.VersionV2;
+        await context.Response.WriteAsJsonAsync(new
+        {
+            offerId = offer.OfferId,
+            status = "pending",
+            expiresAt = offer.ExpiresAt
+        }, cancellationToken: context.RequestAborted);
     }
 
     private async Task SendHeadAsync(HttpContext context, string id)
@@ -126,15 +190,20 @@ internal sealed class PortalServer : IAsyncDisposable
             context.Response.StatusCode = StatusCodes.Status410Gone;
             return;
         }
-        SetDownloadHeaders(context, available, new FileInfo(available.Path).Length, nativePeer: false);
+        SetDownloadHeaders(context, available, new FileInfo(available.Path).Length, protocolVersion: null);
+        await Task.CompletedTask;
     }
 
-    private async Task SendOneShotAsync(HttpContext context, string id, bool nativePeer)
+    private async Task SendOneShotAsync(
+        HttpContext context,
+        string id,
+        string? protocolVersion,
+        Action? onCompleted = null)
     {
         if (!ValidId(id))
         {
             context.Response.StatusCode = StatusCodes.Status400BadRequest;
-            await context.Response.WriteAsync("Invalid share id");
+            await context.Response.WriteAsync("Invalid share id", context.RequestAborted);
             return;
         }
 
@@ -142,24 +211,31 @@ internal sealed class PortalServer : IAsyncDisposable
         if (file is null)
         {
             context.Response.StatusCode = StatusCodes.Status410Gone;
-            await context.Response.WriteAsync("Share already consumed, busy, or unavailable");
+            await context.Response.WriteAsync("Share already consumed, busy, or unavailable", context.RequestAborted);
             return;
         }
         if (!File.Exists(file.Path))
         {
             _shares.Consume(id);
             context.Response.StatusCode = StatusCodes.Status410Gone;
-            await context.Response.WriteAsync("Source file unavailable");
+            await context.Response.WriteAsync("Source file unavailable", context.RequestAborted);
             return;
         }
 
         try
         {
             var currentSize = new FileInfo(file.Path).Length;
-            SetDownloadHeaders(context, file, currentSize, nativePeer);
+            SetDownloadHeaders(context, file, currentSize, protocolVersion);
             await context.Response.SendFileAsync(file.Path, context.RequestAborted);
-            if (context.RequestAborted.IsCancellationRequested) _shares.Release(id);
-            else _shares.Consume(id);
+            if (context.RequestAborted.IsCancellationRequested)
+            {
+                _shares.Release(id);
+            }
+            else
+            {
+                _shares.Consume(id);
+                onCompleted?.Invoke();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -171,7 +247,7 @@ internal sealed class PortalServer : IAsyncDisposable
             if (!context.Response.HasStarted)
             {
                 context.Response.StatusCode = StatusCodes.Status500InternalServerError;
-                await context.Response.WriteAsync("Transfer failed");
+                await context.Response.WriteAsync("Transfer failed", context.RequestAborted);
             }
         }
     }
@@ -179,13 +255,13 @@ internal sealed class PortalServer : IAsyncDisposable
     private static bool ValidId(string id) =>
         !string.IsNullOrWhiteSpace(id) && id.Length <= 64 && id.All(Uri.IsHexDigit);
 
-    private static void SetDownloadHeaders(HttpContext context, SharedFile file, long length, bool nativePeer)
+    private static void SetDownloadHeaders(HttpContext context, SharedFile file, long length, string? protocolVersion)
     {
         context.Response.ContentType = file.Mime;
         context.Response.ContentLength = length;
         context.Response.Headers["Content-Disposition"] = $"attachment; filename=\"download\"; filename*=UTF-8''{Uri.EscapeDataString(file.Name)}";
         context.Response.Headers["X-FTPortal-One-Shot"] = "true";
-        if (nativePeer) context.Response.Headers["X-FTPortal-Protocol"] = PeerProtocol.Version;
+        if (!string.IsNullOrWhiteSpace(protocolVersion)) context.Response.Headers["X-FTPortal-Protocol"] = protocolVersion;
     }
 
     private string Html()

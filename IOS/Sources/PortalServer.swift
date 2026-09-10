@@ -10,6 +10,8 @@ final class PortalServer {
     private var peerListener: NWListener?
     private let queue = DispatchQueue(label: "ftportal.listener")
     private let maximumHeaderBytes = 64 * 1024
+    private let maximumBodyBytes = 256 * 1024
+    private let headerSeparator = Data("\r\n\r\n".utf8)
 
     func start() throws {
         if legacyListener != nil || peerListener != nil { return }
@@ -49,34 +51,70 @@ final class PortalServer {
 
     private func accept(_ connection: NWConnection) {
         connection.start(queue: queue)
-        receiveHeader(connection, buffer: Data())
+        receiveRequest(connection, buffer: Data())
     }
 
-    private func receiveHeader(_ connection: NWConnection, buffer: Data) {
+    private func receiveRequest(_ connection: NWConnection, buffer: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, complete, error in
             guard let self else { connection.cancel(); return }
             var next = buffer
             if let data { next.append(data) }
 
-            if next.range(of: Data("\r\n\r\n".utf8)) != nil {
-                self.route(connection, request: next)
+            if let headerRange = next.range(of: self.headerSeparator) {
+                let headerLength = headerRange.lowerBound
+                if headerLength > self.maximumHeaderBytes {
+                    self.sendText(connection, status: "431 Request Header Fields Too Large", body: "Header too large")
+                    return
+                }
+                let headerData = Data(next.prefix(headerLength))
+                let bodyLength = self.contentLength(in: headerData)
+                guard bodyLength >= 0, bodyLength <= self.maximumBodyBytes else {
+                    self.sendText(connection, status: "413 Payload Too Large", body: "Request body too large")
+                    return
+                }
+                let required = headerRange.upperBound + bodyLength
+                if next.count >= required {
+                    self.route(connection, request: Data(next.prefix(required)))
+                    return
+                }
+            } else if next.count >= self.maximumHeaderBytes {
+                self.sendText(connection, status: "431 Request Header Fields Too Large", body: "Header too large")
                 return
             }
-            if next.count >= self.maximumHeaderBytes {
-                self.sendText(connection, status: "431 Request Header Fields Too Large", body: "Header too large")
+
+            if next.count > self.maximumHeaderBytes + self.maximumBodyBytes + self.headerSeparator.count {
+                self.sendText(connection, status: "413 Payload Too Large", body: "Request too large")
                 return
             }
             if error != nil || complete {
                 connection.cancel()
                 return
             }
-            self.receiveHeader(connection, buffer: next)
+            self.receiveRequest(connection, buffer: next)
         }
     }
 
+    private func contentLength(in headerData: Data) -> Int {
+        guard let text = String(data: headerData, encoding: .utf8) else { return -1 }
+        for line in text.components(separatedBy: "\r\n").dropFirst() {
+            let pair = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2 else { continue }
+            if pair[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" {
+                return Int(pair[1].trimmingCharacters(in: .whitespaces)) ?? -1
+            }
+        }
+        return 0
+    }
+
     private func route(_ connection: NWConnection, request: Data) {
+        guard let headerRange = request.range(of: headerSeparator) else {
+            sendText(connection, status: "400 Bad Request", body: "Bad request")
+            return
+        }
+        let headerData = Data(request.prefix(headerRange.lowerBound))
+        let body = Data(request.suffix(from: headerRange.upperBound))
         guard
-            let text = String(data: request, encoding: .utf8),
+            let text = String(data: headerData, encoding: .utf8),
             let first = text.components(separatedBy: "\r\n").first
         else {
             sendText(connection, status: "400 Bad Request", body: "Bad request")
@@ -88,33 +126,111 @@ final class PortalServer {
             sendText(connection, status: "400 Bad Request", body: "Bad request line")
             return
         }
-        guard parts[0] == "GET" else {
-            sendText(connection, status: "405 Method Not Allowed", body: "GET only", extraHeaders: ["Allow": "GET"])
-            return
-        }
-
+        let method = String(parts[0]).uppercased()
+        let headers = parseHeaders(text)
         let rawTarget = String(parts[1])
         let rawPath = String(rawTarget.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)[0])
         let path = rawPath.removingPercentEncoding ?? rawPath
 
-        if path == "/" {
+        if method == "GET" && path == "/" {
             sendHtml(connection)
-        } else if path == "/api/state" {
+        } else if method == "GET" && path == "/api/state" {
             sendState(connection)
-        } else if path == PeerProtocol.infoPath {
+        } else if method == "GET" && path == PeerProtocol.infoPathV1 {
             sendResponse(
                 connection,
                 status: "200 OK",
                 contentType: "application/json; charset=utf-8",
-                data: PeerProtocol.infoData(legacyPort: Int(Self.legacyPort)),
-                extraHeaders: ["X-FTPortal-Protocol": PeerProtocol.version]
+                data: PeerProtocol.infoData(legacyPort: Int(Self.legacyPort), version: PeerProtocol.versionV1),
+                extraHeaders: ["X-FTPortal-Protocol": PeerProtocol.versionV1]
             )
-        } else if path.hasPrefix(PeerProtocol.downloadPrefix) {
-            sendFile(connection, id: String(path.dropFirst(PeerProtocol.downloadPrefix.count)), nativePeer: true)
-        } else if path.hasPrefix("/download/") {
-            sendFile(connection, id: String(path.dropFirst("/download/".count)), nativePeer: false)
+        } else if method == "GET" && path == PeerProtocol.infoPathV2 {
+            sendResponse(
+                connection,
+                status: "200 OK",
+                contentType: "application/json; charset=utf-8",
+                data: PeerProtocol.infoData(legacyPort: Int(Self.legacyPort), version: PeerProtocol.versionV2),
+                extraHeaders: ["X-FTPortal-Protocol": PeerProtocol.versionV2]
+            )
+        } else if method == "POST" && path == PeerProtocol.offerPathV2 {
+            receiveOffer(connection, body: body)
+        } else if method == "GET" && path.hasPrefix(PeerProtocol.transferPrefixV2) {
+            sendOfferedFile(connection, path: path, authorization: headers["authorization"])
+        } else if method == "GET" && path.hasPrefix(PeerProtocol.downloadPrefixV1) {
+            sendFile(
+                connection,
+                id: String(path.dropFirst(PeerProtocol.downloadPrefixV1.count)),
+                protocolVersion: PeerProtocol.versionV1
+            )
+        } else if method == "GET" && path.hasPrefix("/download/") {
+            sendFile(connection, id: String(path.dropFirst("/download/".count)), protocolVersion: nil)
+        } else if method != "GET" && method != "POST" {
+            sendText(connection, status: "405 Method Not Allowed", body: "GET or POST only", extraHeaders: ["Allow": "GET, POST"])
         } else {
             sendText(connection, status: "404 Not Found", body: "Not found")
+        }
+    }
+
+    private func receiveOffer(_ connection: NWConnection, body: Data) {
+        let host = remoteHost(connection)
+        guard !host.isEmpty, let offer = PeerOfferStore.shared.receiveIncoming(remoteHost: host, data: body) else {
+            sendText(connection, status: "400 Bad Request", body: "Invalid or expired offer")
+            return
+        }
+        let response: [String: Any] = [
+            "offerId": offer.offerId,
+            "status": "pending",
+            "expiresAt": offer.expiresAt
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: response)) ?? Data("{}".utf8)
+        sendResponse(
+            connection,
+            status: "200 OK",
+            contentType: "application/json; charset=utf-8",
+            data: data,
+            extraHeaders: ["X-FTPortal-Protocol": PeerProtocol.versionV2]
+        )
+    }
+
+    private func sendOfferedFile(_ connection: NWConnection, path: String, authorization: String?) {
+        let remainder = String(path.dropFirst(PeerProtocol.transferPrefixV2.count))
+        let parts = remainder.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: true)
+        guard parts.count == 2 else {
+            sendText(connection, status: "400 Bad Request", body: "Invalid transfer path")
+            return
+        }
+        let offerId = String(parts[0])
+        let fileId = String(parts[1])
+        guard PeerOfferStore.shared.authorizeOutgoing(offerId: offerId, fileId: fileId, authorization: authorization) else {
+            sendText(connection, status: "401 Unauthorized", body: "Offer authorization failed", extraHeaders: ["WWW-Authenticate": "Bearer"])
+            return
+        }
+        sendFile(
+            connection,
+            id: fileId,
+            protocolVersion: PeerProtocol.versionV2,
+            onCompleted: { PeerOfferStore.shared.completeOutgoingFile(offerId: offerId, fileId: fileId) }
+        )
+    }
+
+    private func parseHeaders(_ headerText: String) -> [String: String] {
+        var headers: [String: String] = [:]
+        for line in headerText.components(separatedBy: "\r\n").dropFirst() {
+            let pair = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2 else { continue }
+            let name = pair[0].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = pair[1].trimmingCharacters(in: .whitespaces)
+            if !name.isEmpty { headers[name] = value }
+        }
+        return headers
+    }
+
+    private func remoteHost(_ connection: NWConnection) -> String {
+        switch connection.endpoint {
+        case .hostPort(let host, _):
+            return String(describing: host).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        default:
+            return ""
         }
     }
 
@@ -133,7 +249,12 @@ final class PortalServer {
         sendResponse(connection, status: "200 OK", contentType: "application/json; charset=utf-8", data: data)
     }
 
-    private func sendFile(_ connection: NWConnection, id: String, nativePeer: Bool) {
+    private func sendFile(
+        _ connection: NWConnection,
+        id: String,
+        protocolVersion: String?,
+        onCompleted: (() -> Void)? = nil
+    ) {
         guard !id.isEmpty, id.count <= 64, id.allSatisfy({ $0.isHexDigit }) else {
             sendText(connection, status: "400 Bad Request", body: "Invalid share id")
             return
@@ -163,7 +284,7 @@ final class PortalServer {
             "Content-Disposition: \(attachmentDisposition(meta.name))\r\n" +
             securityHeaders() +
             "X-FTPortal-One-Shot: true\r\n"
-        if nativePeer { header += "X-FTPortal-Protocol: \(PeerProtocol.version)\r\n" }
+        if let protocolVersion { header += "X-FTPortal-Protocol: \(protocolVersion)\r\n" }
         header += "Connection: close\r\n\r\n"
 
         connection.send(content: Data(header.utf8), completion: .contentProcessed { [weak self] error in
@@ -173,16 +294,17 @@ final class PortalServer {
                 connection.cancel()
                 return
             }
-            self?.sendChunk(connection, handle: handle, id: id)
+            self?.sendChunk(connection, handle: handle, id: id, onCompleted: onCompleted)
         })
     }
 
-    private func sendChunk(_ connection: NWConnection, handle: FileHandle, id: String) {
+    private func sendChunk(_ connection: NWConnection, handle: FileHandle, id: String, onCompleted: (() -> Void)?) {
         do {
             let chunk = try handle.read(upToCount: 256 * 1024) ?? Data()
             if chunk.isEmpty {
                 try? handle.close()
                 PortalStore.shared.consume(id)
+                onCompleted?()
                 connection.cancel()
                 return
             }
@@ -193,7 +315,7 @@ final class PortalServer {
                     connection.cancel()
                     return
                 }
-                self?.sendChunk(connection, handle: handle, id: id)
+                self?.sendChunk(connection, handle: handle, id: id, onCompleted: onCompleted)
             })
         } catch {
             try? handle.close()

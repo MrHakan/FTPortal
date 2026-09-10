@@ -19,10 +19,12 @@ struct PeerInfo: Codable {
     let lobbyActive: Bool
     let fileCount: Int
     let files: [PeerRemoteFile]
+    let compatible: [String]?
+    let capabilities: [String]?
 
     enum CodingKeys: String, CodingKey {
         case protocolName = "protocol"
-        case deviceId, lobbyId, alias, platform, peerPort, legacyPort, lobbyActive, fileCount, files
+        case deviceId, lobbyId, alias, platform, peerPort, legacyPort, lobbyActive, fileCount, files, compatible, capabilities
     }
 }
 
@@ -36,6 +38,12 @@ struct PeerLobby: Identifiable, Hashable {
     let peerPort: Int
     let legacyPort: Int
     let files: [PeerRemoteFile]
+    let protocolVersion: String
+    let capabilities: Set<String>
+
+    var supportsOffers: Bool {
+        protocolVersion == PeerProtocol.versionV2 && capabilities.contains(PeerProtocol.capOffers)
+    }
 }
 
 enum PeerIdentity {
@@ -57,12 +65,28 @@ enum PeerIdentity {
 }
 
 enum PeerProtocol {
-    static let version = "ftportal/1"
+    static let versionV1 = "ftportal/1"
+    static let versionV2 = "ftportal/2"
+    static let version = versionV2
     static let peerPort = 47_171
-    static let infoPath = "/api/ftportal/v1/info"
-    static let downloadPrefix = "/api/ftportal/v1/download/"
 
-    static func infoData(legacyPort: Int) -> Data {
+    static let infoPathV1 = "/api/ftportal/v1/info"
+    static let downloadPrefixV1 = "/api/ftportal/v1/download/"
+    static let infoPathV2 = "/api/ftportal/v2/info"
+    static let offerPathV2 = "/api/ftportal/v2/offers"
+    static let transferPrefixV2 = "/api/ftportal/v2/transfers/"
+
+    // Compatibility aliases for the established direct-pull UI.
+    static let infoPath = infoPathV1
+    static let downloadPrefix = downloadPrefixV1
+
+    static let capOffers = "offers"
+    static let capAcceptDecline = "accept-decline"
+    static let capBearerToken = "bearer-token"
+    static let capVerificationCode = "verification-code"
+    static let capabilitiesV2 = ["lobbies", capOffers, capAcceptDecline, capBearerToken, capVerificationCode]
+
+    static func infoData(legacyPort: Int, version: String = versionV2) -> Data {
         let files = PortalStore.shared.all().map {
             PeerRemoteFile(id: $0.id, name: $0.name, size: $0.size, mime: $0.mime)
         }
@@ -77,9 +101,11 @@ enum PeerProtocol {
             legacyPort: legacyPort,
             lobbyActive: !files.isEmpty,
             fileCount: files.count,
-            files: files
+            files: files,
+            compatible: version == versionV2 ? [versionV1] : nil,
+            capabilities: version == versionV2 ? capabilitiesV2 : nil
         )
-        return (try? JSONEncoder().encode(info)) ?? Data("{\"protocol\":\"ftportal/1\",\"lobbyActive\":false,\"files\":[]}".utf8)
+        return (try? JSONEncoder().encode(info)) ?? Data("{\"protocol\":\"\(version)\",\"lobbyActive\":false,\"files\":[]}".utf8)
     }
 }
 
@@ -102,7 +128,7 @@ enum PeerDiscovery {
 
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 0.8
-        configuration.timeoutIntervalForResource = 1.2
+        configuration.timeoutIntervalForResource = 1.4
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
@@ -134,20 +160,44 @@ enum PeerDiscovery {
     }
 
     private static func probe(host: String, session: URLSession, ownId: String) async -> PeerLobby? {
-        guard let url = URL(string: "http://\(host):\(PeerProtocol.peerPort)\(PeerProtocol.infoPath)") else { return nil }
+        if let v2 = await probeVersion(
+            host: host,
+            path: PeerProtocol.infoPathV2,
+            clientVersion: PeerProtocol.versionV2,
+            session: session,
+            ownId: ownId
+        ) { return v2 }
+
+        return await probeVersion(
+            host: host,
+            path: PeerProtocol.infoPathV1,
+            clientVersion: PeerProtocol.versionV1,
+            session: session,
+            ownId: ownId
+        )
+    }
+
+    private static func probeVersion(
+        host: String,
+        path: String,
+        clientVersion: String,
+        session: URLSession,
+        ownId: String
+    ) async -> PeerLobby? {
+        guard let url = URL(string: "http://\(host):\(PeerProtocol.peerPort)\(path)") else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 0.8
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue(PeerProtocol.version, forHTTPHeaderField: "X-FTPortal-Client")
+        request.setValue(clientVersion, forHTTPHeaderField: "X-FTPortal-Client")
 
         do {
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
             let info = try JSONDecoder().decode(PeerInfo.self, from: data)
             guard
-                info.protocolName == PeerProtocol.version,
+                (info.protocolName == PeerProtocol.versionV2 || info.protocolName == PeerProtocol.versionV1),
                 info.deviceId != ownId,
                 info.lobbyActive,
                 !info.files.isEmpty
@@ -159,9 +209,11 @@ enum PeerDiscovery {
                 alias: info.alias,
                 platform: info.platform,
                 host: host,
-                peerPort: info.peerPort,
+                peerPort: (1...65_535).contains(info.peerPort) ? info.peerPort : PeerProtocol.peerPort,
                 legacyPort: info.legacyPort,
-                files: info.files
+                files: info.files,
+                protocolVersion: info.protocolName,
+                capabilities: Set(info.capabilities ?? [])
             )
         } catch {
             return nil

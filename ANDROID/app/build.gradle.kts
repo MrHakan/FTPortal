@@ -11,8 +11,8 @@ android {
         applicationId = "com.mrhakan.ftportal"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "4.0.0"
+        versionCode = 2
+        versionName = "4.1.0"
     }
 
     buildTypes {
@@ -33,5 +33,6 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-ktx:1.10.0")
+    implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
 }

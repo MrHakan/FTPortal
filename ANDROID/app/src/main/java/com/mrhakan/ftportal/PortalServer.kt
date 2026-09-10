@@ -10,29 +10,101 @@ import java.io.InputStream
 
 class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
     override fun serve(session: IHTTPSession): Response {
-        if (session.method != Method.GET) {
-            return commonHeaders(
-                newFixedLengthResponse(Response.Status.METHOD_NOT_ALLOWED, "text/plain; charset=utf-8", "GET only")
-            ).apply { addHeader("Allow", "GET") }
-        }
-
         val path = runCatching { Uri.decode(session.uri) }.getOrDefault(session.uri)
         val response = when {
-            path == "/" -> newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html())
-            path == "/api/state" -> newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", stateJson())
-            path == PeerProtocol.INFO_PATH -> newFixedLengthResponse(
-                Response.Status.OK,
-                "application/json; charset=utf-8",
-                PeerProtocol.infoJson(context, PortalService.PORT)
-            ).apply { addHeader("X-FTPortal-Protocol", PeerProtocol.VERSION) }
-            path.startsWith(PeerProtocol.DOWNLOAD_PREFIX) -> download(path.removePrefix(PeerProtocol.DOWNLOAD_PREFIX), nativePeer = true)
-            path.startsWith("/download/") -> download(path.removePrefix("/download/"), nativePeer = false)
+            session.method == Method.GET && path == "/" ->
+                newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html())
+
+            session.method == Method.GET && path == "/api/state" ->
+                newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", stateJson())
+
+            session.method == Method.GET && path == PeerProtocol.INFO_PATH_V1 ->
+                newFixedLengthResponse(
+                    Response.Status.OK,
+                    "application/json; charset=utf-8",
+                    PeerProtocol.infoJson(context, PortalService.PORT, PeerProtocol.VERSION_V1)
+                ).apply { addHeader("X-FTPortal-Protocol", PeerProtocol.VERSION_V1) }
+
+            session.method == Method.GET && path == PeerProtocol.INFO_PATH_V2 ->
+                newFixedLengthResponse(
+                    Response.Status.OK,
+                    "application/json; charset=utf-8",
+                    PeerProtocol.infoJson(context, PortalService.PORT, PeerProtocol.VERSION_V2)
+                ).apply { addHeader("X-FTPortal-Protocol", PeerProtocol.VERSION_V2) }
+
+            session.method == Method.POST && path == PeerProtocol.OFFER_PATH_V2 -> receiveOffer(session)
+
+            session.method == Method.GET && path.startsWith(PeerProtocol.TRANSFER_PREFIX_V2) ->
+                offeredDownload(session, path.removePrefix(PeerProtocol.TRANSFER_PREFIX_V2))
+
+            session.method == Method.GET && path.startsWith(PeerProtocol.DOWNLOAD_PREFIX_V1) ->
+                download(
+                    path.removePrefix(PeerProtocol.DOWNLOAD_PREFIX_V1),
+                    protocolHeader = PeerProtocol.VERSION_V1
+                )
+
+            session.method == Method.GET && path.startsWith("/download/") ->
+                download(path.removePrefix("/download/"), protocolHeader = null)
+
+            session.method != Method.GET && session.method != Method.POST ->
+                newFixedLengthResponse(Response.Status.METHOD_NOT_ALLOWED, "text/plain; charset=utf-8", "GET or POST only")
+                    .apply { addHeader("Allow", "GET, POST") }
+
             else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain; charset=utf-8", "Not found")
         }
         return commonHeaders(response)
     }
 
-    private fun download(id: String, nativePeer: Boolean): Response {
+    private fun receiveOffer(session: IHTTPSession): Response {
+        val contentLength = session.headers["content-length"]?.toLongOrNull() ?: 0L
+        if (contentLength > 128 * 1024) {
+            return newFixedLengthResponse(Response.Status.PAYLOAD_TOO_LARGE, "text/plain; charset=utf-8", "Offer payload too large")
+        }
+
+        val bodyFiles = HashMap<String, String>()
+        val parsed = runCatching {
+            session.parseBody(bodyFiles)
+            bodyFiles["postData"].orEmpty()
+        }.getOrNull()
+            ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain; charset=utf-8", "Could not parse offer")
+
+        if (parsed.length > 128 * 1024) {
+            return newFixedLengthResponse(Response.Status.PAYLOAD_TOO_LARGE, "text/plain; charset=utf-8", "Offer payload too large")
+        }
+
+        val remoteHost = session.remoteIpAddress.orEmpty()
+        val offer = PeerOfferStore.receiveIncoming(context, remoteHost, parsed)
+            ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain; charset=utf-8", "Invalid or expired offer")
+
+        val result = JSONObject()
+            .put("offerId", offer.offerId)
+            .put("status", "pending")
+            .put("expiresAt", offer.expiresAt)
+            .toString()
+        return newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", result)
+            .apply { addHeader("X-FTPortal-Protocol", PeerProtocol.VERSION_V2) }
+    }
+
+    private fun offeredDownload(session: IHTTPSession, remainder: String): Response {
+        val parts = remainder.split('/', limit = 2)
+        if (parts.size != 2) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain; charset=utf-8", "Invalid transfer path")
+        }
+        val offerId = parts[0]
+        val fileId = parts[1]
+        val authorization = session.headers["authorization"]
+        if (!PeerOfferStore.authorizeOutgoing(offerId, fileId, authorization)) {
+            return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain; charset=utf-8", "Offer authorization failed")
+                .apply { addHeader("WWW-Authenticate", "Bearer") }
+        }
+        return download(
+            fileId,
+            protocolHeader = PeerProtocol.VERSION_V2,
+            onCompleted = { PeerOfferStore.completeOutgoingFile(offerId, fileId) }
+        )
+    }
+
+    private fun download(id: String, protocolHeader: String?, onCompleted: (() -> Unit)? = null): Response {
         if (id.isBlank() || id.length > 64 || id.any { !it.isLetterOrDigit() }) {
             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain; charset=utf-8", "Invalid share id")
         }
@@ -49,7 +121,10 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
         val tracked = CompletionInputStream(
             source = source,
             expected = entry.size,
-            completed = { ShareRegistry.consume(entry.id) },
+            completed = {
+                ShareRegistry.consume(entry.id)
+                onCompleted?.invoke()
+            },
             interrupted = { ShareRegistry.release(entry.id) }
         )
         val response = if (entry.size >= 0) {
@@ -62,7 +137,7 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
             "attachment; filename=\"download\"; filename*=UTF-8''${Uri.encode(entry.name)}"
         )
         response.addHeader("X-FTPortal-One-Shot", "true")
-        if (nativePeer) response.addHeader("X-FTPortal-Protocol", PeerProtocol.VERSION)
+        if (protocolHeader != null) response.addHeader("X-FTPortal-Protocol", protocolHeader)
         return response
     }
 

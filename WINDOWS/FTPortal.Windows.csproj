@@ -7,7 +7,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>FTPortal</AssemblyName>
     <RootNamespace>FTPortal.Windows</RootNamespace>
-    <Version>4.0.0</Version>
+    <Version>4.1.0</Version>
+    <AssemblyVersion>4.1.0.0</AssemblyVersion>
+    <FileVersion>4.1.0.0</FileVersion>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>

@@ -22,10 +22,12 @@ internal sealed class MainForm : Form
     private readonly Label _notice = new() { AutoSize = true, ForeColor = Color.DimGray };
     private readonly ListBox _files = new() { Dock = DockStyle.Fill, SelectionMode = SelectionMode.MultiExtended };
     private readonly ListBox _lobbies = new() { Dock = DockStyle.Fill, SelectionMode = SelectionMode.One };
+    private readonly ListBox _incoming = new() { Dock = DockStyle.Fill, SelectionMode = SelectionMode.One };
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 3000 };
     private readonly NotifyIcon _tray = new();
     private IReadOnlyList<SharedFile> _visibleShares = [];
     private IReadOnlyList<PeerLobby> _visibleLobbies = [];
+    private IReadOnlyList<IncomingPeerOffer> _visibleOffers = [];
     private bool _allowExit;
     private bool _scanInProgress;
     private DateTime _lastLobbyScan = DateTime.MinValue;
@@ -35,9 +37,9 @@ internal sealed class MainForm : Form
     public MainForm()
     {
         Text = "FTPortal · Windows";
-        Width = 900;
-        Height = 650;
-        MinimumSize = new Size(720, 500);
+        Width = 940;
+        Height = 720;
+        MinimumSize = new Size(760, 560);
         StartPosition = FormStartPosition.CenterScreen;
         _server = new PortalServer(_shares);
 
@@ -51,6 +53,10 @@ internal sealed class MainForm : Form
         refreshLobbies.Click += async (_, _) => await RefreshLobbiesAsync(force: true);
         var joinLobby = new Button { Text = "Join selected lobby", AutoSize = true };
         joinLobby.Click += (_, _) => JoinSelectedLobby();
+        var acceptIncoming = new Button { Text = "Accept incoming", AutoSize = true };
+        acceptIncoming.Click += async (_, _) => await AcceptSelectedOfferAsync();
+        var declineIncoming = new Button { Text = "Decline incoming", AutoSize = true };
+        declineIncoming.Click += (_, _) => DeclineSelectedOffer();
         var browser = new Button { Text = "Open browser dashboard", AutoSize = true };
         browser.Click += (_, _) => OpenDashboard();
         var hotspot = new Button { Text = "Start hotspot fallback", AutoSize = true };
@@ -65,7 +71,9 @@ internal sealed class MainForm : Form
             WrapContents = true,
             Padding = new Padding(0, 8, 0, 8)
         };
-        buttons.Controls.AddRange([add, cancel, clear, refreshLobbies, joinLobby, browser, hotspot, stopHotspot]);
+        buttons.Controls.AddRange([
+            add, cancel, clear, refreshLobbies, joinLobby, acceptIncoming, declineIncoming, browser, hotspot, stopHotspot
+        ]);
 
         var header = new FlowLayoutPanel
         {
@@ -87,19 +95,24 @@ internal sealed class MainForm : Form
         mySharesGroup.Controls.Add(_files);
         var lobbiesGroup = new GroupBox { Text = "Nearby FTPortal lobbies", Dock = DockStyle.Fill, Padding = new Padding(8) };
         lobbiesGroup.Controls.Add(_lobbies);
+        var incomingGroup = new GroupBox { Text = "Incoming v2 offers · Accept / Decline", Dock = DockStyle.Fill, Padding = new Padding(8) };
+        incomingGroup.Controls.Add(_incoming);
         _lobbies.DoubleClick += (_, _) => JoinSelectedLobby();
+        _incoming.DoubleClick += async (_, _) => await AcceptSelectedOfferAsync();
 
         var lists = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            RowCount = 2,
+            RowCount = 3,
             ColumnCount = 1,
             Padding = new Padding(12, 0, 12, 12)
         };
-        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 52));
-        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 48));
+        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 38));
+        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 36));
+        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 26));
         lists.Controls.Add(mySharesGroup, 0, 0);
         lists.Controls.Add(lobbiesGroup, 0, 1);
+        lists.Controls.Add(incomingGroup, 0, 2);
 
         Controls.Add(lists);
         Controls.Add(header);
@@ -208,7 +221,7 @@ internal sealed class MainForm : Form
         }
 
         var peerText = _server.PeerAvailable
-            ? $"Peer protocol: {PeerProtocol.Version} on TCP {PeerProtocol.Port}"
+            ? $"Peer protocol: {PeerProtocol.Version} (v1 compatible) on TCP {PeerProtocol.Port}"
             : $"Peer protocol unavailable on TCP {PeerProtocol.Port}";
         var mdnsText = _mdns switch
         {
@@ -224,6 +237,20 @@ internal sealed class MainForm : Form
         _files.Items.Clear();
         _files.Items.AddRange(items);
         _files.EndUpdate();
+
+        RefreshIncomingOffers();
+    }
+
+    private void RefreshIncomingOffers()
+    {
+        _visibleOffers = PeerOfferStore.Incoming();
+        var items = _visibleOffers.Select(offer =>
+            $"{offer.SenderAlias}  ·  {offer.SenderPlatform}  ·  {offer.Files.Count} file{(offer.Files.Count == 1 ? "" : "s")}  ·  code {offer.VerificationCode}"
+        ).ToArray();
+        _incoming.BeginUpdate();
+        _incoming.Items.Clear();
+        _incoming.Items.AddRange(items);
+        _incoming.EndUpdate();
     }
 
     private async Task RefreshLobbiesAsync(bool force)
@@ -241,7 +268,7 @@ internal sealed class MainForm : Form
             _lobbies.BeginUpdate();
             _lobbies.Items.Clear();
             _lobbies.Items.AddRange(_visibleLobbies.Select(lobby =>
-                $"{lobby.Alias}  ·  {lobby.Platform}  ·  {lobby.Files.Count} file{(lobby.Files.Count == 1 ? "" : "s")}  ·  {lobby.Host}"
+                $"{lobby.Alias}  ·  {lobby.Platform}  ·  {lobby.Files.Count} file{(lobby.Files.Count == 1 ? "" : "s")}  ·  {(lobby.SupportsOffers ? "v2" : "v1")}  ·  {lobby.Host}"
             ).ToArray());
             _lobbies.EndUpdate();
             _notice.Text = _visibleLobbies.Count == 0
@@ -270,9 +297,9 @@ internal sealed class MainForm : Form
         using var dialog = new Form
         {
             Text = $"FTPortal Lobby · {lobby.Alias}",
-            Width = 650,
-            Height = 430,
-            MinimumSize = new Size(520, 330),
+            Width = 680,
+            Height = 470,
+            MinimumSize = new Size(540, 350),
             StartPosition = FormStartPosition.CenterParent
         };
         var info = new Label
@@ -280,13 +307,24 @@ internal sealed class MainForm : Form
             Dock = DockStyle.Top,
             AutoSize = true,
             Padding = new Padding(10),
-            Text = $"{lobby.Platform} · {lobby.Host}:{lobby.PeerPort} · {PeerProtocol.Version}\nChoose a one-shot file to receive directly from this device."
+            Text = $"{lobby.Platform} · {lobby.Host}:{lobby.PeerPort} · {lobby.ProtocolVersion}\n" +
+                   "Choose a one-shot file to pull as before." +
+                   (lobby.SupportsOffers ? " You can also send all of your pending files as a v2 offer." : "")
         };
         var list = new ListBox { Dock = DockStyle.Fill };
         list.Items.AddRange(lobby.Files.Select(file =>
             $"{file.Name}  ·  {(file.Size >= 0 ? $"{file.Size:N0} bytes" : "stream")}"
         ).ToArray());
-        var download = new Button { Text = "Receive selected file", Dock = DockStyle.Bottom, Height = 42 };
+
+        var actions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 50,
+            FlowDirection = FlowDirection.LeftToRight,
+            Padding = new Padding(8),
+            WrapContents = false
+        };
+        var download = new Button { Text = "Receive selected file", AutoSize = true };
         download.Click += async (_, _) =>
         {
             var selected = list.SelectedIndex;
@@ -306,16 +344,116 @@ internal sealed class MainForm : Form
                 if (!dialog.IsDisposed) download.Enabled = true;
             }
         };
-        list.DoubleClick += async (_, _) =>
+        actions.Controls.Add(download);
+
+        if (lobby.SupportsOffers)
+        {
+            var send = new Button { Text = "Send my pending files", AutoSize = true };
+            send.Enabled = _shares.All().Count > 0;
+            send.Click += async (_, _) =>
+            {
+                send.Enabled = false;
+                try { await SendOfferAsync(lobby); }
+                finally { if (!dialog.IsDisposed) send.Enabled = _shares.All().Count > 0; }
+            };
+            actions.Controls.Add(send);
+        }
+
+        list.DoubleClick += (_, _) =>
         {
             if (download.Enabled && list.SelectedIndex >= 0) download.PerformClick();
-            await Task.CompletedTask;
         };
 
         dialog.Controls.Add(list);
-        dialog.Controls.Add(download);
+        dialog.Controls.Add(actions);
         dialog.Controls.Add(info);
         dialog.ShowDialog(this);
+    }
+
+    private async Task SendOfferAsync(PeerLobby lobby)
+    {
+        var files = _shares.All();
+        if (files.Count == 0)
+        {
+            MessageBox.Show(this, "Add at least one pending share first.", "FTPortal", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            var offer = await PeerOfferClient.SendAsync(lobby, files);
+            MessageBox.Show(
+                this,
+                $"Offer sent to {lobby.Alias}.\n\nVerification code: {offer.VerificationCode}\n\n" +
+                "The code should match on both devices. The receiver must Accept within 5 minutes.",
+                "FTPortal v2 offer",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information
+            );
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "Offer failed: " + ex.Message, "FTPortal", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private async Task AcceptSelectedOfferAsync()
+    {
+        var index = _incoming.SelectedIndex;
+        if (index < 0 || index >= _visibleOffers.Count) return;
+        var offer = _visibleOffers[index];
+        var files = string.Join(Environment.NewLine, offer.Files.Select(file =>
+            $"• {file.Name}{(file.Size >= 0 ? $" · {file.Size:N0} bytes" : "")}"
+        ));
+        var answer = MessageBox.Show(
+            this,
+            $"Incoming from {offer.SenderAlias} ({offer.SenderPlatform})\n" +
+            $"Verification code: {offer.VerificationCode}\n\n{files}\n\nAccept this transfer?",
+            "FTPortal incoming transfer",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question
+        );
+        if (answer != DialogResult.Yes) return;
+
+        using var folder = new FolderBrowserDialog
+        {
+            Description = "Choose one folder for the incoming FTPortal files",
+            UseDescriptionForTitle = true,
+            SelectedPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+        };
+        var downloads = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        if (Directory.Exists(downloads)) folder.SelectedPath = downloads;
+        if (folder.ShowDialog(this) != DialogResult.OK) return;
+
+        _notice.Text = $"Receiving {offer.Files.Count} file{(offer.Files.Count == 1 ? "" : "s")} from {offer.SenderAlias}…";
+        var result = await PeerOfferReceiver.ReceiveAllAsync(offer, folder.SelectedPath);
+        RefreshIncomingOffers();
+        RefreshDashboard();
+        await RefreshLobbiesAsync(force: true);
+
+        var message = result.Failures.Count == 0
+            ? $"Received {result.Completed.Count} file{(result.Completed.Count == 1 ? "" : "s")} into:\n{folder.SelectedPath}"
+            : result.Completed.Count == 0
+                ? "Transfer failed:\n" + string.Join(Environment.NewLine, result.Failures)
+                : $"Received {result.Completed.Count} file{(result.Completed.Count == 1 ? "" : "s")}; {result.Failures.Count} failed.\n" +
+                  "Remaining files stay in the offer while it is valid.\n\n" + string.Join(Environment.NewLine, result.Failures);
+        MessageBox.Show(
+            this,
+            message,
+            "FTPortal transfer status",
+            MessageBoxButtons.OK,
+            result.Failures.Count == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning
+        );
+    }
+
+    private void DeclineSelectedOffer()
+    {
+        var index = _incoming.SelectedIndex;
+        if (index < 0 || index >= _visibleOffers.Count) return;
+        var offer = _visibleOffers[index];
+        PeerOfferStore.Decline(offer.OfferId);
+        _notice.Text = $"Declined offer from {offer.SenderAlias}.";
+        RefreshIncomingOffers();
     }
 
     private async Task<bool> DownloadPeerFileAsync(PeerLobby lobby, PeerRemoteFile file)
@@ -335,9 +473,9 @@ internal sealed class MainForm : Form
         {
             using var request = new HttpRequestMessage(
                 HttpMethod.Get,
-                $"http://{lobby.Host}:{lobby.PeerPort}{PeerProtocol.DownloadPrefix}{file.Id}"
+                $"http://{lobby.Host}:{lobby.PeerPort}{PeerProtocol.DownloadPrefixV1}{file.Id}"
             );
-            request.Headers.TryAddWithoutValidation("X-FTPortal-Client", PeerProtocol.Version);
+            request.Headers.TryAddWithoutValidation("X-FTPortal-Client", PeerProtocol.VersionV1);
             using var response = await PeerTransferClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
             if (!response.IsSuccessStatusCode)
                 throw new IOException($"Peer returned HTTP {(int)response.StatusCode} {response.ReasonPhrase}");
@@ -348,6 +486,10 @@ internal sealed class MainForm : Form
                 await source.CopyToAsync(destination, 128 * 1024);
                 await destination.FlushAsync();
             }
+
+            var received = new FileInfo(temp).Length;
+            if (file.Size >= 0 && received != file.Size)
+                throw new IOException($"Expected {file.Size:N0} bytes, received {received:N0}");
 
             File.Move(temp, target, overwrite: true);
             MessageBox.Show(this, $"Received {file.Name}", "FTPortal", MessageBoxButtons.OK, MessageBoxIcon.Information);

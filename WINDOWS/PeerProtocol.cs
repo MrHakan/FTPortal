@@ -17,7 +17,9 @@ internal sealed record PeerInfo(
     int LegacyPort,
     bool LobbyActive,
     int FileCount,
-    IReadOnlyList<PeerRemoteFile> Files
+    IReadOnlyList<PeerRemoteFile> Files,
+    IReadOnlyList<string>? Compatible,
+    IReadOnlyList<string>? Capabilities
 );
 
 internal sealed record PeerLobby(
@@ -28,8 +30,15 @@ internal sealed record PeerLobby(
     string Host,
     int PeerPort,
     int LegacyPort,
-    IReadOnlyList<PeerRemoteFile> Files
-);
+    IReadOnlyList<PeerRemoteFile> Files,
+    string ProtocolVersion,
+    IReadOnlyList<string> Capabilities
+)
+{
+    public bool SupportsOffers =>
+        string.Equals(ProtocolVersion, PeerProtocol.VersionV2, StringComparison.Ordinal) &&
+        Capabilities.Contains(PeerProtocol.CapOffers, StringComparer.OrdinalIgnoreCase);
+}
 
 internal static class PeerIdentity
 {
@@ -66,24 +75,41 @@ internal static class PeerIdentity
 
 internal static class PeerProtocol
 {
-    public const string Version = "ftportal/1";
+    public const string VersionV1 = "ftportal/1";
+    public const string VersionV2 = "ftportal/2";
+    public const string Version = VersionV2;
     public const int Port = 47171;
-    public const string InfoPath = "/api/ftportal/v1/info";
-    public const string DownloadPrefix = "/api/ftportal/v1/download/";
+
+    public const string InfoPathV1 = "/api/ftportal/v1/info";
+    public const string DownloadPrefixV1 = "/api/ftportal/v1/download/";
+    public const string InfoPathV2 = "/api/ftportal/v2/info";
+    public const string OfferPathV2 = "/api/ftportal/v2/offers";
+    public const string TransferPrefixV2 = "/api/ftportal/v2/transfers/";
+
+    // Compatibility aliases for the original direct-pull path.
+    public const string InfoPath = InfoPathV1;
+    public const string DownloadPrefix = DownloadPrefixV1;
+
+    public const string CapOffers = "offers";
+    public const string CapAcceptDecline = "accept-decline";
+    public const string CapBearerToken = "bearer-token";
+    public const string CapVerificationCode = "verification-code";
+    public static readonly IReadOnlyList<string> CapabilitiesV2 =
+        ["lobbies", CapOffers, CapAcceptDecline, CapBearerToken, CapVerificationCode];
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true
     };
 
-    public static PeerInfo CreateInfo(ShareRegistry shares, int legacyPort)
+    public static PeerInfo CreateInfo(ShareRegistry shares, int legacyPort, string version = VersionV2)
     {
         var files = shares.All()
             .Select(file => new PeerRemoteFile(file.Id, file.Name, file.Size, file.Mime))
             .ToArray();
         var id = PeerIdentity.DeviceId();
         return new PeerInfo(
-            Version,
+            version,
             id,
             $"lobby-{id}",
             PeerIdentity.Alias(),
@@ -92,7 +118,9 @@ internal static class PeerProtocol
             legacyPort,
             files.Length > 0,
             files.Length,
-            files
+            files,
+            version == VersionV2 ? [VersionV1] : null,
+            version == VersionV2 ? CapabilitiesV2 : null
         );
     }
 
@@ -102,7 +130,7 @@ internal static class PeerProtocol
         {
             var info = JsonSerializer.Deserialize<PeerInfo>(json, JsonOptions);
             if (info is null ||
-                info.Protocol != Version ||
+                (info.Protocol != VersionV2 && info.Protocol != VersionV1) ||
                 !info.LobbyActive ||
                 info.Files.Count == 0 ||
                 string.IsNullOrWhiteSpace(info.DeviceId)) return null;
@@ -115,7 +143,9 @@ internal static class PeerProtocol
                 host,
                 info.PeerPort is > 0 and <= 65535 ? info.PeerPort : Port,
                 info.LegacyPort,
-                info.Files
+                info.Files,
+                info.Protocol,
+                info.Capabilities ?? []
             );
         }
         catch (JsonException)
@@ -186,13 +216,21 @@ internal static class PeerDiscovery
 
     private static async Task<PeerLobby?> ProbeAsync(string host, CancellationToken cancellationToken)
     {
+        var v2 = await ProbeVersionAsync(host, PeerProtocol.InfoPathV2, PeerProtocol.VersionV2, cancellationToken);
+        if (v2 is not null) return v2;
+        return await ProbeVersionAsync(host, PeerProtocol.InfoPathV1, PeerProtocol.VersionV1, cancellationToken);
+    }
+
+    private static async Task<PeerLobby?> ProbeVersionAsync(
+        string host,
+        string path,
+        string clientVersion,
+        CancellationToken cancellationToken)
+    {
         try
         {
-            using var request = new HttpRequestMessage(
-                HttpMethod.Get,
-                $"http://{host}:{PeerProtocol.Port}{PeerProtocol.InfoPath}"
-            );
-            request.Headers.TryAddWithoutValidation("X-FTPortal-Client", PeerProtocol.Version);
+            using var request = new HttpRequestMessage(HttpMethod.Get, $"http://{host}:{PeerProtocol.Port}{path}");
+            request.Headers.TryAddWithoutValidation("X-FTPortal-Client", clientVersion);
             request.Headers.Accept.ParseAdd("application/json");
             using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             if (response.StatusCode != HttpStatusCode.OK) return null;

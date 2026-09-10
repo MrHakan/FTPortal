@@ -21,6 +21,7 @@ final class AppModel: ObservableObject {
     @Published var status = "Starting host…"
     @Published var files: [SharedFile] = []
     @Published var lobbies: [PeerLobby] = []
+    @Published var incomingOffers: [IncomingPeerOffer] = []
     @Published var isScanning = false
 
     let server = PortalServer()
@@ -47,10 +48,11 @@ final class AppModel: ObservableObject {
 
     func refresh() {
         files = PortalStore.shared.all()
+        incomingOffers = PeerOfferStore.shared.incoming()
         let urls = PortalServer.localIPv4().map { "http://\($0):\(PortalServer.legacyPort)" }
         status = urls.isEmpty
             ? "Connect this iPhone/iPad to Wi-Fi or a local hotspot."
-            : "Web fallback:\n" + urls.joined(separator: "\n") + "\nPeer protocol: \(PeerProtocol.version) on TCP \(PeerProtocol.peerPort)"
+            : "Web fallback:\n" + urls.joined(separator: "\n") + "\nPeer protocol: \(PeerProtocol.version) (v1 compatible) on TCP \(PeerProtocol.peerPort)"
     }
 
     func discoverLobbies() {
@@ -93,6 +95,28 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                Section("Incoming transfers") {
+                    if model.incomingOffers.isEmpty {
+                        Text("No incoming v2 offers.")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(model.incomingOffers) { offer in
+                        NavigationLink {
+                            IncomingOfferView(offer: offer) {
+                                model.refresh()
+                                model.discoverLobbies()
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(offer.senderAlias)
+                                Text("\(offer.senderPlatform) · \(offer.files.count) file\(offer.files.count == 1 ? "" : "s") · code \(offer.verificationCode)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
                 Section("Lobbies") {
                     Button(model.isScanning ? "Scanning…" : "Refresh lobbies") {
                         model.discoverLobbies()
@@ -108,11 +132,14 @@ struct ContentView: View {
 
                     ForEach(model.lobbies) { lobby in
                         NavigationLink {
-                            LobbyView(lobby: lobby, onFinished: { model.discoverLobbies() })
+                            LobbyView(lobby: lobby, onFinished: {
+                                model.refresh()
+                                model.discoverLobbies()
+                            })
                         } label: {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(lobby.alias)
-                                Text("\(lobby.platform) · \(lobby.files.count) file\(lobby.files.count == 1 ? "" : "s") · \(lobby.host)")
+                                Text("\(lobby.platform) · \(lobby.files.count) file\(lobby.files.count == 1 ? "" : "s") · \(lobby.supportsOffers ? "v2" : "v1") · \(lobby.host)")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -166,7 +193,9 @@ struct ContentView: View {
 
 private struct RemoteExport: Identifiable {
     let id = UUID()
-    let url: URL
+    let urls: [URL]
+    let directory: URL
+    let completionMessage: String?
 }
 
 struct LobbyView: View {
@@ -174,15 +203,29 @@ struct LobbyView: View {
     let onFinished: () -> Void
 
     @State private var downloadingId: String?
+    @State private var sendingOffer = false
     @State private var export: RemoteExport?
     @State private var errorMessage: String?
+    @State private var offerMessage: String?
 
     var body: some View {
         List {
             Section {
-                Text("Connected directly to \(lobby.host):\(lobby.peerPort) using \(PeerProtocol.version).")
+                Text("Connected directly to \(lobby.host):\(lobby.peerPort) using \(lobby.protocolVersion). The original v1 pull path remains available.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+            }
+
+            if lobby.supportsOffers {
+                Section("Send") {
+                    Button(sendingOffer ? "Sending offer…" : "Send my pending files") {
+                        Task { await sendOffer() }
+                    }
+                    .disabled(sendingOffer || PortalStore.shared.all().isEmpty)
+                    Text("The receiver must Accept. FTPortal then transfers only the offered one-shot shares using a short-lived token.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Files") {
@@ -207,19 +250,46 @@ struct LobbyView: View {
         }
         .navigationTitle(lobby.alias)
         .sheet(item: $export) { item in
-            ShareSheet(url: item.url) {
-                try? FileManager.default.removeItem(at: item.url.deletingLastPathComponent())
+            ShareSheet(urls: item.urls) {
+                try? FileManager.default.removeItem(at: item.directory)
                 export = nil
+                if let message = item.completionMessage { errorMessage = message }
                 onFinished()
             }
         }
-        .alert("Transfer failed", isPresented: Binding(
-            get: { errorMessage != nil },
-            set: { if !$0 { errorMessage = nil } }
+        .alert("FTPortal", isPresented: Binding(
+            get: { errorMessage != nil || offerMessage != nil },
+            set: {
+                if !$0 {
+                    errorMessage = nil
+                    offerMessage = nil
+                }
+            }
         )) {
-            Button("OK", role: .cancel) { errorMessage = nil }
+            Button("OK", role: .cancel) {
+                errorMessage = nil
+                offerMessage = nil
+            }
         } message: {
-            Text(errorMessage ?? "Unknown error")
+            Text(offerMessage ?? errorMessage ?? "Unknown status")
+        }
+    }
+
+    @MainActor
+    private func sendOffer() async {
+        guard !sendingOffer else { return }
+        let files = PortalStore.shared.all()
+        guard !files.isEmpty else {
+            errorMessage = "Add at least one pending share first."
+            return
+        }
+        sendingOffer = true
+        defer { sendingOffer = false }
+        do {
+            let offer = try await PeerOfferClient.send(lobby: lobby, files: files)
+            offerMessage = "Offer sent. \(lobby.alias) must Accept. Verification code: \(offer.verificationCode). The offer expires in 5 minutes."
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -229,13 +299,13 @@ struct LobbyView: View {
         downloadingId = file.id
         defer { downloadingId = nil }
 
-        guard let url = URL(string: "http://\(lobby.host):\(lobby.peerPort)\(PeerProtocol.downloadPrefix)\(file.id)") else {
+        guard let url = URL(string: "http://\(lobby.host):\(lobby.peerPort)\(PeerProtocol.downloadPrefixV1)\(file.id)") else {
             errorMessage = "Invalid peer URL"
             return
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 3600
-        request.setValue(PeerProtocol.version, forHTTPHeaderField: "X-FTPortal-Client")
+        request.setValue(PeerProtocol.versionV1, forHTTPHeaderField: "X-FTPortal-Client")
 
         do {
             let (temporary, response) = try await URLSession.shared.download(for: request)
@@ -248,7 +318,14 @@ struct LobbyView: View {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let destination = directory.appendingPathComponent(safeFileName(file.name))
             try FileManager.default.moveItem(at: temporary, to: destination)
-            export = RemoteExport(url: destination)
+            if file.size >= 0 {
+                let attributes = try FileManager.default.attributesOfItem(atPath: destination.path)
+                let received = (attributes[.size] as? NSNumber)?.int64Value ?? -1
+                guard received == file.size else {
+                    throw NSError(domain: "FTPortal", code: 3, userInfo: [NSLocalizedDescriptionKey: "Expected \(file.size) bytes, received \(received)."])
+                }
+            }
+            export = RemoteExport(urls: [destination], directory: directory, completionMessage: nil)
         } catch {
             errorMessage = error.localizedDescription
             onFinished()
@@ -263,12 +340,97 @@ struct LobbyView: View {
     }
 }
 
+struct IncomingOfferView: View {
+    let offer: IncomingPeerOffer
+    let onFinished: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var receiving = false
+    @State private var export: RemoteExport?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        List {
+            Section("Sender") {
+                Text(offer.senderAlias)
+                Text("\(offer.senderPlatform) · \(offer.host):\(offer.peerPort)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                LabeledContent("Verification code", value: offer.verificationCode)
+            }
+
+            Section("Offered files") {
+                ForEach(offer.files) { file in
+                    VStack(alignment: .leading) {
+                        Text(file.name)
+                        Text(file.size >= 0 ? "\(file.size) bytes" : "Streaming source")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Section {
+                Button(receiving ? "Receiving…" : "Accept and receive") {
+                    Task { await accept() }
+                }
+                .disabled(receiving)
+                Button("Decline", role: .destructive) {
+                    PeerOfferStore.shared.decline(offer.offerId)
+                    onFinished()
+                    dismiss()
+                }
+                .disabled(receiving)
+            } footer: {
+                Text("Compare the six-digit code with the sender if you want to verify you are accepting the intended offer. The offer expires automatically.")
+            }
+        }
+        .navigationTitle("Incoming transfer")
+        .sheet(item: $export) { item in
+            ShareSheet(urls: item.urls) {
+                try? FileManager.default.removeItem(at: item.directory)
+                export = nil
+                if let message = item.completionMessage { errorMessage = message }
+                onFinished()
+            }
+        }
+        .alert("Transfer status", isPresented: Binding(
+            get: { errorMessage != nil },
+            set: { if !$0 { errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown status")
+        }
+    }
+
+    @MainActor
+    private func accept() async {
+        guard !receiving else { return }
+        receiving = true
+        defer { receiving = false }
+
+        let result = await PeerOfferReceiver.receiveAll(offer)
+        if result.urls.isEmpty {
+            errorMessage = result.failures.first ?? "No files were received."
+            onFinished()
+            return
+        }
+        let partialMessage = result.failures.isEmpty
+            ? nil
+            : "Received \(result.urls.count) file\(result.urls.count == 1 ? "" : "s"); \(result.failures.count) failed and can be retried while the offer remains active."
+        if let directory = result.directory {
+            export = RemoteExport(urls: result.urls, directory: directory, completionMessage: partialMessage)
+        }
+    }
+}
+
 struct ShareSheet: UIViewControllerRepresentable {
-    let url: URL
+    let urls: [URL]
     let onComplete: () -> Void
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        let controller = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        let controller = UIActivityViewController(activityItems: urls, applicationActivities: nil)
         controller.completionWithItemsHandler = { _, _, _, _ in
             DispatchQueue.main.async { onComplete() }
         }
