@@ -17,10 +17,18 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import java.net.HttpURLConnection
+import java.net.URL
+
+private data class RemoteSelection(val lobby: PeerLobby, val file: PeerRemoteFile)
 
 class MainActivity : ComponentActivity() {
     private lateinit var status: TextView
     private lateinit var shares: TextView
+    private lateinit var scanStatus: TextView
+    private lateinit var lobbiesContainer: LinearLayout
+    private var pendingRemote: RemoteSelection? = null
+    private var scanning = false
 
     private val picker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@registerForActivityResult
@@ -47,6 +55,13 @@ class MainActivity : ComponentActivity() {
         ShareRegistry.add(uri, name, contentResolver.getType(uri) ?: "application/octet-stream", size)
         startPortal()
         refresh()
+        refreshLobbies()
+    }
+
+    private val saveRemote = registerForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { destination ->
+        val selection = pendingRemote
+        pendingRemote = null
+        if (destination != null && selection != null) downloadRemote(selection, destination)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -56,6 +71,10 @@ class MainActivity : ComponentActivity() {
 
         status = TextView(this).apply { textSize = 16f }
         shares = TextView(this).apply { textSize = 15f }
+        scanStatus = TextView(this).apply { textSize = 14f }
+        lobbiesContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
 
         val start = Button(this).apply {
             text = "Start host"
@@ -76,6 +95,7 @@ class MainActivity : ComponentActivity() {
                     .setPositiveButton("Clear") { _, _ ->
                         ShareRegistry.clearPending()
                         refresh()
+                        refreshLobbies()
                     }
                     .show()
             }
@@ -86,6 +106,10 @@ class MainActivity : ComponentActivity() {
                 stopService(Intent(this@MainActivity, PortalService::class.java))
                 status.text = "Host stopped"
             }
+        }
+        val refreshPeers = Button(this).apply {
+            text = "Refresh lobbies"
+            setOnClickListener { refreshLobbies() }
         }
 
         val content = LinearLayout(this).apply {
@@ -101,12 +125,30 @@ class MainActivity : ComponentActivity() {
             addView(add)
             addView(clear)
             addView(stop)
+            addView(TextView(this@MainActivity).apply {
+                text = "Lobbies"
+                textSize = 22f
+                setPadding(0, 32, 0, 4)
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = "FTPortal apps on the same LAN appear here automatically. Web users keep using the address above."
+                textSize = 14f
+            })
+            addView(refreshPeers)
+            addView(scanStatus)
+            addView(lobbiesContainer)
+            addView(TextView(this@MainActivity).apply {
+                text = "My one-shot shares"
+                textSize = 20f
+                setPadding(0, 28, 0, 4)
+            })
             addView(shares)
         }
         setContentView(ScrollView(this).apply { addView(content) })
 
         startPortal()
         refresh()
+        refreshLobbies()
     }
 
     override fun onResume() {
@@ -124,18 +166,118 @@ class MainActivity : ComponentActivity() {
         status.text = if (urls.isEmpty()) {
             "Connect this phone to Wi-Fi or a hotspot to host files."
         } else {
-            "Open on the same network:\n" + urls.joinToString("\n") + "\nBonjour/NSD: FTPortal._http._tcp"
+            "Web fallback:\n" + urls.joinToString("\n") +
+                "\nPeer protocol: ${PeerProtocol.VERSION} on TCP ${PeerProtocol.PEER_PORT}"
         }
 
         val list = ShareRegistry.all()
         shares.text = if (list.isEmpty()) {
-            "\nNo pending shares. Files are never copied into FTPortal storage."
+            "\nNo pending shares. Add a file to make this device appear as a lobby."
         } else {
             "\nPending one-shot shares:\n" + list.joinToString("\n") { file ->
                 val sizeText = if (file.size >= 0) " · ${file.size} bytes" else ""
                 "• ${file.name}$sizeText"
             }
         }
+    }
+
+    private fun refreshLobbies() {
+        if (scanning) return
+        scanning = true
+        scanStatus.text = "Scanning the local network…"
+        PeerDiscovery.discover(applicationContext) { lobbies ->
+            runOnUiThread {
+                scanning = false
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                renderLobbies(lobbies)
+            }
+        }
+    }
+
+    private fun renderLobbies(lobbies: List<PeerLobby>) {
+        lobbiesContainer.removeAllViews()
+        if (lobbies.isEmpty()) {
+            scanStatus.text = "No active FTPortal lobbies found."
+            return
+        }
+
+        scanStatus.text = "${lobbies.size} active ${if (lobbies.size == 1) "lobby" else "lobbies"} found."
+        lobbies.forEach { lobby ->
+            lobbiesContainer.addView(Button(this).apply {
+                isAllCaps = false
+                text = "Join · ${lobby.alias} (${lobby.platform}) · ${lobby.files.size} file${if (lobby.files.size == 1) "" else "s"}"
+                setOnClickListener { showLobby(lobby) }
+            })
+        }
+    }
+
+    private fun showLobby(lobby: PeerLobby) {
+        val labels = lobby.files.map { file ->
+            if (file.size >= 0) "${file.name} · ${file.size} bytes" else file.name
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("${lobby.alias} · ${lobby.platform}")
+            .setMessage("Choose a one-shot file. FTPortal streams it directly from ${lobby.host}; the sender consumes the share after a complete transfer.")
+            .setItems(labels) { _, index ->
+                val file = lobby.files[index]
+                pendingRemote = RemoteSelection(lobby, file)
+                saveRemote.launch(safeFileName(file.name))
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun downloadRemote(selection: RemoteSelection, destination: android.net.Uri) {
+        Toast.makeText(this, "Receiving ${selection.file.name}…", Toast.LENGTH_SHORT).show()
+        Thread {
+            var connection: HttpURLConnection? = null
+            var success = false
+            var errorMessage: String? = null
+            try {
+                val url = URL(
+                    "http://${selection.lobby.host}:${selection.lobby.peerPort}" +
+                        "${PeerProtocol.DOWNLOAD_PREFIX}${selection.file.id}"
+                )
+                connection = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 3000
+                    readTimeout = 60_000
+                    instanceFollowRedirects = false
+                    useCaches = false
+                    setRequestProperty("X-FTPortal-Client", PeerProtocol.VERSION)
+                }
+                val code = connection.responseCode
+                if (code != HttpURLConnection.HTTP_OK) {
+                    error("Peer returned HTTP $code")
+                }
+
+                val output = contentResolver.openOutputStream(destination, "w")
+                    ?: error("Could not open the selected destination")
+                connection.inputStream.use { input ->
+                    output.use { out -> input.copyTo(out, 128 * 1024) }
+                }
+                success = true
+            } catch (error: Exception) {
+                errorMessage = error.message ?: error.javaClass.simpleName
+                runCatching { contentResolver.delete(destination, null, null) }
+            } finally {
+                connection?.disconnect()
+            }
+
+            runOnUiThread {
+                if (success) {
+                    Toast.makeText(this, "Received ${selection.file.name}", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(this, "Transfer failed: ${errorMessage ?: "unknown error"}", Toast.LENGTH_LONG).show()
+                }
+                refreshLobbies()
+            }
+        }.start()
+    }
+
+    private fun safeFileName(name: String): String {
+        val leaf = name.substringAfterLast('/').substringAfterLast('\\').trim()
+        return leaf.replace(Regex("[\\r\\n]"), "_").ifBlank { "FTPortal-download" }
     }
 
     private fun requestNotificationPermission() {

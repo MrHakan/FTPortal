@@ -20,6 +20,9 @@ targets:
       properties:
         CFBundleDisplayName: FTPortal
         UILaunchScreen: {}
-        NSLocalNetworkUsageDescription: FTPortal hosts one-shot file transfers for devices on your local network.
+        NSLocalNetworkUsageDescription: FTPortal discovers nearby FTPortal lobbies and hosts one-shot peer file transfers on your local network.
         NSBonjourServices:
           - _http._tcp.
+          - _ftportal._tcp.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true

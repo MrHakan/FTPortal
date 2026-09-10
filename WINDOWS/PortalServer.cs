@@ -9,15 +9,17 @@ namespace FTPortal.Windows;
 internal sealed class PortalServer : IAsyncDisposable
 {
     private readonly ShareRegistry _shares;
-    private WebApplication? _app;
+    private WebApplication? _legacyApp;
+    private WebApplication? _peerApp;
 
     public int Port { get; private set; }
+    public bool PeerAvailable => _peerApp is not null;
 
     public PortalServer(ShareRegistry shares) => _shares = shares;
 
     public async Task<int> StartAsync(params int[] ports)
     {
-        if (_app is not null) return Port;
+        if (_legacyApp is not null) return Port;
 
         Exception? last = null;
         foreach (var port in ports.Distinct().Where(port => port is > 0 and <= 65535))
@@ -25,14 +27,11 @@ internal sealed class PortalServer : IAsyncDisposable
             WebApplication? candidate = null;
             try
             {
-                var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = Array.Empty<string>() });
-                builder.WebHost.ConfigureKestrel(options => options.ListenAnyIP(port));
-                candidate = builder.Build();
-                Configure(candidate);
+                candidate = BuildApp(port, legacySurface: true);
                 await candidate.StartAsync();
-                _app = candidate;
+                _legacyApp = candidate;
                 Port = port;
-                return port;
+                break;
             }
             catch (Exception ex) when (ex is IOException or SocketException)
             {
@@ -41,10 +40,40 @@ internal sealed class PortalServer : IAsyncDisposable
             }
         }
 
-        throw new IOException("No FTPortal port could be opened.", last);
+        if (_legacyApp is null)
+            throw new IOException("No FTPortal legacy web port could be opened.", last);
+
+        await TryStartPeerAsync();
+        return Port;
     }
 
-    private void Configure(WebApplication app)
+    private async Task TryStartPeerAsync()
+    {
+        if (_peerApp is not null) return;
+        WebApplication? candidate = null;
+        try
+        {
+            candidate = BuildApp(PeerProtocol.Port, legacySurface: false);
+            await candidate.StartAsync();
+            _peerApp = candidate;
+        }
+        catch
+        {
+            if (candidate is not null) await candidate.DisposeAsync();
+            _peerApp = null;
+        }
+    }
+
+    private WebApplication BuildApp(int port, bool legacySurface)
+    {
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = Array.Empty<string>() });
+        builder.WebHost.ConfigureKestrel(options => options.ListenAnyIP(port));
+        var app = builder.Build();
+        Configure(app, legacySurface);
+        return app;
+    }
+
+    private void Configure(WebApplication app, bool legacySurface)
     {
         app.Use(async (context, next) =>
         {
@@ -56,86 +85,107 @@ internal sealed class PortalServer : IAsyncDisposable
             await next();
         });
 
+        app.MapGet(PeerProtocol.InfoPath, () => Results.Json(PeerProtocol.CreateInfo(_shares, Port)));
+        app.MapGet(PeerProtocol.DownloadPrefix + "{id}", async (HttpContext context, string id) =>
+            await SendOneShotAsync(context, id, nativePeer: true));
+
+        if (!legacySurface) return;
+
         app.MapGet("/", () => Results.Content(Html(), "text/html; charset=utf-8"));
         app.MapGet("/api/state", () => Results.Json(new
         {
             files = _shares.All().Select(file => new { file.Id, file.Name, file.Size, file.Mime })
         }));
-
         app.MapMethods("/download/{id}", [HttpMethods.Get, HttpMethods.Head], async (HttpContext context, string id) =>
         {
-            if (string.IsNullOrWhiteSpace(id) || id.Length > 64 || id.Any(c => !Uri.IsHexDigit(c)))
-            {
-                context.Response.StatusCode = StatusCodes.Status400BadRequest;
-                await context.Response.WriteAsync("Invalid share id");
-                return;
-            }
-
             if (HttpMethods.IsHead(context.Request.Method))
             {
-                var available = _shares.Available(id);
-                if (available is null)
-                {
-                    context.Response.StatusCode = StatusCodes.Status410Gone;
-                    return;
-                }
-                if (!File.Exists(available.Path))
-                {
-                    _shares.Remove(id);
-                    context.Response.StatusCode = StatusCodes.Status410Gone;
-                    return;
-                }
-
-                SetDownloadHeaders(context, available, new FileInfo(available.Path).Length);
+                await SendHeadAsync(context, id);
                 return;
             }
-
-            var file = _shares.Claim(id);
-            if (file is null)
-            {
-                context.Response.StatusCode = StatusCodes.Status410Gone;
-                await context.Response.WriteAsync("Share already consumed, busy, or unavailable");
-                return;
-            }
-
-            if (!File.Exists(file.Path))
-            {
-                _shares.Consume(id);
-                context.Response.StatusCode = StatusCodes.Status410Gone;
-                await context.Response.WriteAsync("Source file unavailable");
-                return;
-            }
-
-            try
-            {
-                var currentSize = new FileInfo(file.Path).Length;
-                SetDownloadHeaders(context, file, currentSize);
-                await context.Response.SendFileAsync(file.Path, context.RequestAborted);
-                if (context.RequestAborted.IsCancellationRequested) _shares.Release(id);
-                else _shares.Consume(id);
-            }
-            catch (OperationCanceledException)
-            {
-                _shares.Release(id);
-            }
-            catch
-            {
-                _shares.Release(id);
-                if (!context.Response.HasStarted)
-                {
-                    context.Response.StatusCode = StatusCodes.Status500InternalServerError;
-                    await context.Response.WriteAsync("Transfer failed");
-                }
-            }
+            await SendOneShotAsync(context, id, nativePeer: false);
         });
     }
 
-    private static void SetDownloadHeaders(HttpContext context, SharedFile file, long length)
+    private async Task SendHeadAsync(HttpContext context, string id)
+    {
+        if (!ValidId(id))
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return;
+        }
+        var available = _shares.Available(id);
+        if (available is null)
+        {
+            context.Response.StatusCode = StatusCodes.Status410Gone;
+            return;
+        }
+        if (!File.Exists(available.Path))
+        {
+            _shares.Remove(id);
+            context.Response.StatusCode = StatusCodes.Status410Gone;
+            return;
+        }
+        SetDownloadHeaders(context, available, new FileInfo(available.Path).Length, nativePeer: false);
+    }
+
+    private async Task SendOneShotAsync(HttpContext context, string id, bool nativePeer)
+    {
+        if (!ValidId(id))
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await context.Response.WriteAsync("Invalid share id");
+            return;
+        }
+
+        var file = _shares.Claim(id);
+        if (file is null)
+        {
+            context.Response.StatusCode = StatusCodes.Status410Gone;
+            await context.Response.WriteAsync("Share already consumed, busy, or unavailable");
+            return;
+        }
+        if (!File.Exists(file.Path))
+        {
+            _shares.Consume(id);
+            context.Response.StatusCode = StatusCodes.Status410Gone;
+            await context.Response.WriteAsync("Source file unavailable");
+            return;
+        }
+
+        try
+        {
+            var currentSize = new FileInfo(file.Path).Length;
+            SetDownloadHeaders(context, file, currentSize, nativePeer);
+            await context.Response.SendFileAsync(file.Path, context.RequestAborted);
+            if (context.RequestAborted.IsCancellationRequested) _shares.Release(id);
+            else _shares.Consume(id);
+        }
+        catch (OperationCanceledException)
+        {
+            _shares.Release(id);
+        }
+        catch
+        {
+            _shares.Release(id);
+            if (!context.Response.HasStarted)
+            {
+                context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                await context.Response.WriteAsync("Transfer failed");
+            }
+        }
+    }
+
+    private static bool ValidId(string id) =>
+        !string.IsNullOrWhiteSpace(id) && id.Length <= 64 && id.All(Uri.IsHexDigit);
+
+    private static void SetDownloadHeaders(HttpContext context, SharedFile file, long length, bool nativePeer)
     {
         context.Response.ContentType = file.Mime;
         context.Response.ContentLength = length;
         context.Response.Headers["Content-Disposition"] = $"attachment; filename=\"download\"; filename*=UTF-8''{Uri.EscapeDataString(file.Name)}";
         context.Response.Headers["X-FTPortal-One-Shot"] = "true";
+        if (nativePeer) context.Response.Headers["X-FTPortal-Protocol"] = PeerProtocol.Version;
     }
 
     private string Html()
@@ -152,11 +202,20 @@ internal sealed class PortalServer : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (_app is null) return;
-        var app = _app;
-        _app = null;
-        Port = 0;
-        await app.StopAsync();
-        await app.DisposeAsync();
+        if (_peerApp is not null)
+        {
+            var peer = _peerApp;
+            _peerApp = null;
+            await peer.StopAsync();
+            await peer.DisposeAsync();
+        }
+        if (_legacyApp is not null)
+        {
+            var legacy = _legacyApp;
+            _legacyApp = null;
+            Port = 0;
+            await legacy.StopAsync();
+            await legacy.DisposeAsync();
+        }
     }
 }

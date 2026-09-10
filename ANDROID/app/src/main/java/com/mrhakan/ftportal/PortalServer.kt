@@ -20,13 +20,23 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
         val response = when {
             path == "/" -> newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html())
             path == "/api/state" -> newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", stateJson())
-            path.startsWith("/download/") -> download(path.removePrefix("/download/"))
+            path == PeerProtocol.INFO_PATH -> newFixedLengthResponse(
+                Response.Status.OK,
+                "application/json; charset=utf-8",
+                PeerProtocol.infoJson(context, PortalService.PORT)
+            ).apply { addHeader("X-FTPortal-Protocol", PeerProtocol.VERSION) }
+            path.startsWith(PeerProtocol.DOWNLOAD_PREFIX) -> download(path.removePrefix(PeerProtocol.DOWNLOAD_PREFIX), nativePeer = true)
+            path.startsWith("/download/") -> download(path.removePrefix("/download/"), nativePeer = false)
             else -> newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain; charset=utf-8", "Not found")
         }
         return commonHeaders(response)
     }
 
-    private fun download(id: String): Response {
+    private fun download(id: String, nativePeer: Boolean): Response {
+        if (id.isBlank() || id.length > 64 || id.any { !it.isLetterOrDigit() }) {
+            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain; charset=utf-8", "Invalid share id")
+        }
+
         val entry = ShareRegistry.claim(id)
             ?: return newFixedLengthResponse(Response.Status.GONE, "text/plain; charset=utf-8", "Share already consumed, busy, or unavailable")
 
@@ -52,6 +62,7 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
             "attachment; filename=\"download\"; filename*=UTF-8''${Uri.encode(entry.name)}"
         )
         response.addHeader("X-FTPortal-One-Shot", "true")
+        if (nativePeer) response.addHeader("X-FTPortal-Protocol", PeerProtocol.VERSION)
         return response
     }
 
@@ -103,9 +114,8 @@ private class CompletionInputStream(
 
     override fun read(): Int {
         val value = super.read()
-        if (value >= 0) {
-            transferred++
-        } else {
+        if (value >= 0) transferred++
+        else {
             reachedEof = true
             settleIfComplete()
         }
@@ -114,9 +124,8 @@ private class CompletionInputStream(
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         val count = super.read(buffer, offset, length)
-        if (count > 0) {
-            transferred += count
-        } else if (count < 0) {
+        if (count > 0) transferred += count
+        else if (count < 0) {
             reachedEof = true
             settleIfComplete()
         }

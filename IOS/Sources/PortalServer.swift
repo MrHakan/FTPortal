@@ -3,30 +3,48 @@ import Network
 import Darwin
 
 final class PortalServer {
-    static let port: UInt16 = 8080
+    static let legacyPort: UInt16 = 8080
+    static let peerPort: UInt16 = UInt16(PeerProtocol.peerPort)
 
-    private var listener: NWListener?
+    private var legacyListener: NWListener?
+    private var peerListener: NWListener?
     private let queue = DispatchQueue(label: "ftportal.listener")
     private let maximumHeaderBytes = 64 * 1024
 
     func start() throws {
-        if listener != nil { return }
-        guard let port = NWEndpoint.Port(rawValue: Self.port) else {
-            throw NSError(domain: "FTPortal", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid server port"])
+        if legacyListener != nil || peerListener != nil { return }
+
+        let legacy = try makeListener(port: Self.legacyPort, serviceType: "_http._tcp")
+        legacyListener = legacy
+        legacy.start(queue: queue)
+
+        do {
+            let peer = try makeListener(port: Self.peerPort, serviceType: "_ftportal._tcp")
+            peerListener = peer
+            peer.start(queue: queue)
+        } catch {
+            print("FTPortal peer listener could not start: \(error)")
         }
-        let newListener = try NWListener(using: .tcp, on: port)
-        newListener.service = NWListener.Service(name: "FTPortal", type: "_http._tcp")
-        newListener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
-        newListener.stateUpdateHandler = { state in
-            if case .failed(let error) = state { print("FTPortal listener failed: \(error)") }
-        }
-        newListener.start(queue: queue)
-        listener = newListener
     }
 
     func stop() {
-        listener?.cancel()
-        listener = nil
+        peerListener?.cancel()
+        peerListener = nil
+        legacyListener?.cancel()
+        legacyListener = nil
+    }
+
+    private func makeListener(port: UInt16, serviceType: String) throws -> NWListener {
+        guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
+            throw NSError(domain: "FTPortal", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid server port"])
+        }
+        let listener = try NWListener(using: .tcp, on: endpointPort)
+        listener.service = NWListener.Service(name: "FTPortal-\(PeerIdentity.alias())", type: serviceType)
+        listener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
+        listener.stateUpdateHandler = { state in
+            if case .failed(let error) = state { print("FTPortal listener \(port) failed: \(error)") }
+        }
+        return listener
     }
 
     private func accept(_ connection: NWConnection) {
@@ -83,8 +101,18 @@ final class PortalServer {
             sendHtml(connection)
         } else if path == "/api/state" {
             sendState(connection)
+        } else if path == PeerProtocol.infoPath {
+            sendResponse(
+                connection,
+                status: "200 OK",
+                contentType: "application/json; charset=utf-8",
+                data: PeerProtocol.infoData(legacyPort: Int(Self.legacyPort)),
+                extraHeaders: ["X-FTPortal-Protocol": PeerProtocol.version]
+            )
+        } else if path.hasPrefix(PeerProtocol.downloadPrefix) {
+            sendFile(connection, id: String(path.dropFirst(PeerProtocol.downloadPrefix.count)), nativePeer: true)
         } else if path.hasPrefix("/download/") {
-            sendFile(connection, id: String(path.dropFirst("/download/".count)))
+            sendFile(connection, id: String(path.dropFirst("/download/".count)), nativePeer: false)
         } else {
             sendText(connection, status: "404 Not Found", body: "Not found")
         }
@@ -105,8 +133,8 @@ final class PortalServer {
         sendResponse(connection, status: "200 OK", contentType: "application/json; charset=utf-8", data: data)
     }
 
-    private func sendFile(_ connection: NWConnection, id: String) {
-        guard !id.isEmpty, id.allSatisfy({ $0.isHexDigit }) else {
+    private func sendFile(_ connection: NWConnection, id: String, nativePeer: Bool) {
+        guard !id.isEmpty, id.count <= 64, id.allSatisfy({ $0.isHexDigit }) else {
             sendText(connection, status: "400 Bad Request", body: "Invalid share id")
             return
         }
@@ -129,13 +157,14 @@ final class PortalServer {
             return
         }
 
-        let header = "HTTP/1.1 200 OK\r\n" +
+        var header = "HTTP/1.1 200 OK\r\n" +
             "Content-Type: \(meta.mime)\r\n" +
             "Content-Length: \(size)\r\n" +
             "Content-Disposition: \(attachmentDisposition(meta.name))\r\n" +
             securityHeaders() +
-            "X-FTPortal-One-Shot: true\r\n" +
-            "Connection: close\r\n\r\n"
+            "X-FTPortal-One-Shot: true\r\n"
+        if nativePeer { header += "X-FTPortal-Protocol: \(PeerProtocol.version)\r\n" }
+        header += "Connection: close\r\n\r\n"
 
         connection.send(content: Data(header.utf8), completion: .contentProcessed { [weak self] error in
             guard error == nil else {
