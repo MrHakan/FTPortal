@@ -111,8 +111,10 @@ final class PeerOfferStore {
         guard wire.peerPort > 0, wire.peerPort <= 65_535, !remoteHost.isEmpty else { return nil }
         guard !wire.files.isEmpty, wire.files.count <= maximumFilesPerOffer else { return nil }
 
-        let files = wire.files.filter {
-            !$0.id.isEmpty && $0.id.count <= 64 && $0.id.allSatisfy(\.isLetterOrNumber) && !$0.name.isEmpty && $0.name.count <= 255
+        let files = wire.files.filter { file in
+            !file.id.isEmpty && file.id.count <= 64 && file.id.allSatisfy { character in
+                character.isLetter || character.isNumber
+            } && !file.name.isEmpty && file.name.count <= 255
         }
         guard !files.isEmpty else { return nil }
 
