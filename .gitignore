@@ -1,2 +1,26 @@
-portal.pid
-ap-restore.json
+# PowerShell runtime
+POWERSHELL/.meta/
+POWERSHELL/ap-restore.json
+POWERSHELL/portal.pid
+
+# Android
+ANDROID/.gradle/
+ANDROID/local.properties
+ANDROID/**/build/
+
+# iOS
+IOS/FTPortal.xcodeproj/
+IOS/build/
+IOS/DerivedData/
+
+# Windows
+WINDOWS/bin/
+WINDOWS/obj/
+WINDOWS/publish/
+
+# IDE / OS
+.vs/
+.idea/
+.DS_Store
+*.user
+*.suo

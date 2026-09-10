@@ -1,0 +1,111 @@
+name: Build and Release All FTPortal Editions
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run PowerShell tests
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\POWERSHELL\tests\Run-Tests.ps1
+          powershell -ExecutionPolicy Bypass -File .\POWERSHELL\tests\Run-IsolationTests.ps1
+      - name: Package PowerShell edition
+        shell: powershell
+        run: Compress-Archive -Path .\POWERSHELL\* -DestinationPath .\FTPortal-PowerShell.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: powershell
+          path: FTPortal-PowerShell.zip
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build APK
+        run: gradle -p ANDROID :app:assembleRelease --stacktrace
+      - name: Name APK
+        run: cp ANDROID/app/build/outputs/apk/release/app-release.apk FTPortal-Android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: FTPortal-Android.apk
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        working-directory: IOS
+        run: xcodegen generate
+      - name: Build unsigned device app
+        working-directory: IOS
+        run: xcodebuild -project FTPortal.xcodeproj -scheme FTPortal -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Package unsigned IPA
+        working-directory: IOS
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP"
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry "$GITHUB_WORKSPACE/FTPortal-iOS-unsigned.ipa" Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: FTPortal-iOS-unsigned.ipa
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Publish Windows x64
+        shell: powershell
+        run: |
+          dotnet publish .\WINDOWS\FTPortal.Windows.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o .\WINDOWS\publish
+          Compress-Archive -Path .\WINDOWS\publish\* -DestinationPath .\FTPortal-Windows-x64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: FTPortal-Windows-x64.zip
+
+  release:
+    needs: [powershell, android, ios, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish collective release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
+          name: FTPortal Multi-Platform ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: release-assets/*

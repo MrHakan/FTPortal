@@ -1,0 +1,25 @@
+name: FTPortal
+options:
+  bundleIdPrefix: com.mrhakan
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  FTPortal:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mrhakan.ftportal
+        PRODUCT_NAME: FTPortal
+        SWIFT_VERSION: 5.0
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: FTPortal
+        UILaunchScreen: {}
+        NSLocalNetworkUsageDescription: FTPortal hosts one-shot file transfers for devices on your local network.
+        NSBonjourServices:
+          - _http._tcp.
