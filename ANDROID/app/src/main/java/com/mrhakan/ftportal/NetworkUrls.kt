@@ -15,5 +15,7 @@ object NetworkUrls {
             .distinct()
     }.getOrDefault(emptyList())
 
-    fun urls(port: Int): List<String> = ipv4Addresses().map { "http://$it:$port" }
+    fun urls(port: Int): List<String> = ipv4Addresses().map { address ->
+        if (port == 80) "http://$address" else "http://$address:$port"
+    }
 }
