@@ -47,6 +47,7 @@ class PortalService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        HostPreferences.prepareForVersion(applicationContext, BuildConfig.VERSION_CODE)
         ShareRegistry.initialize(applicationContext)
         TransferCenter.initialize(applicationContext)
         HostPreferences.setServiceRunning(applicationContext, true)
