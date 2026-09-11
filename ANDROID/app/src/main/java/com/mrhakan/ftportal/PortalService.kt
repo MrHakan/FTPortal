@@ -11,6 +11,7 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
@@ -47,7 +48,7 @@ class PortalService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        HostPreferences.prepareForVersion(applicationContext, BuildConfig.VERSION_CODE)
+        HostPreferences.prepareForVersion(applicationContext, appVersionCode())
         ShareRegistry.initialize(applicationContext)
         TransferCenter.initialize(applicationContext)
         HostPreferences.setServiceRunning(applicationContext, true)
@@ -108,6 +109,14 @@ class PortalService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun appVersionCode(): Int {
+        val info = packageManager.getPackageInfo(packageName, 0)
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) info.longVersionCode.toInt() else {
+            @Suppress("DEPRECATION")
+            info.versionCode
+        }
+    }
 
     private fun startWebHost(): Boolean {
         val candidates = intArrayOf(PRIMARY_WEB_PORT, FALLBACK_WEB_PORT)
