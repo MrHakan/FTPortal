@@ -32,9 +32,9 @@ class PortalService : Service() {
         private const val TAG = "FTPortalService"
 
         @Volatile
-        private var boundWebPort: Int = FALLBACK_WEB_PORT
+        private var boundWebPort: Int = 0
 
-        fun webPort(): Int = boundWebPort
+        fun webPort(): Int = boundWebPort.takeIf { it > 0 } ?: PRIMARY_WEB_PORT
     }
 
     private var legacyServer: PortalServer? = null
@@ -50,6 +50,7 @@ class PortalService : Service() {
         ShareRegistry.initialize(applicationContext)
         TransferCenter.initialize(applicationContext)
         HostPreferences.setServiceRunning(applicationContext, true)
+        HostPreferences.setBoundWebPort(applicationContext, 0)
         createChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
@@ -99,7 +100,8 @@ class PortalService : Service() {
         peerServer = null
         legacyServer?.stop()
         legacyServer = null
-        boundWebPort = FALLBACK_WEB_PORT
+        boundWebPort = 0
+        HostPreferences.setBoundWebPort(applicationContext, 0)
         HostPreferences.setServiceRunning(applicationContext, false)
         super.onDestroy()
     }
@@ -116,6 +118,7 @@ class PortalService : Service() {
             if (started.isSuccess) {
                 legacyServer = server
                 boundWebPort = port
+                HostPreferences.setBoundWebPort(applicationContext, port)
                 Log.i(TAG, "Local web host listening on TCP/$port")
                 return true
             }
