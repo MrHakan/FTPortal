@@ -49,7 +49,9 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
 
     private fun receiveBrowserUpload(session: IHTTPSession, peer: String): Response {
         val announcedLength = session.headers["content-length"]?.toLongOrNull() ?: -1L
-        if (announcedLength > MAX_UPLOAD_BYTES) {
+        // Content-Length also includes the multipart envelope; the uploaded
+        // file itself is still checked against MAX_UPLOAD_BYTES below.
+        if (announcedLength > MAX_UPLOAD_BYTES + 1024 * 1024) {
             return jsonError(Response.Status.PAYLOAD_TOO_LARGE, "File is too large for this portal")
         }
 
@@ -228,33 +230,17 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
         }
 
         return """<!doctype html>
-<html lang='en'>
-<head>
-<meta charset='utf-8'>
+<html lang='en'><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>
-<meta name='theme-color' content='#07111f'>
-<title>FTPortal</title>
-<style>
-:root{--bg:#050b13;--surface:rgba(11,24,40,.86);--line:rgba(91,149,218,.26);--blue:#58a6ff;--cyan:#3de2ff;--text:#eef6ff;--muted:#8da3bb;--ok:#46e6a6}
-*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-apple-system,sans-serif}body{min-height:100vh;overflow-x:hidden}.grid-bg{position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(60,139,226,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(60,139,226,.055) 1px,transparent 1px),radial-gradient(circle at 50% -10%,rgba(33,119,255,.2),transparent 40%);background-size:38px 38px,38px 38px,100% 100%;mask-image:linear-gradient(to bottom,#000,transparent 80%)}
-.shell{position:relative;z-index:1;width:min(920px,100%);margin:0 auto;padding:max(28px,env(safe-area-inset-top)) 20px max(32px,env(safe-area-inset-bottom))}.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:42px}.brand{display:flex;gap:13px;align-items:center}.mark{width:48px;height:48px;border:1px solid rgba(83,174,255,.55);border-radius:15px;display:grid;place-items:center;font-size:24px;font-weight:800;background:linear-gradient(145deg,rgba(45,100,255,.3),rgba(14,212,255,.12));box-shadow:0 0 32px rgba(26,134,255,.16)}.brand h1{font-size:24px;margin:0;letter-spacing:-.5px}.brand small{display:block;color:var(--muted);font-size:12px;letter-spacing:.14em;margin-top:2px}.status{display:flex;align-items:center;gap:7px;padding:8px 11px;border:1px solid rgba(70,230,166,.22);border-radius:999px;background:rgba(34,167,118,.08);color:#95f3cf;font-size:12px;font-weight:700}.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 12px var(--ok)}
-.intro{text-align:center;margin:0 auto 34px;max-width:650px}.eyebrow{color:var(--cyan);font-size:11px;letter-spacing:.24em;font-weight:800}.intro h2{font-size:clamp(34px,7vw,58px);line-height:1;margin:10px 0 13px;letter-spacing:-2px}.intro p{margin:0;color:var(--muted);font-size:15px}.portal-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.panel{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:24px;padding:22px;background:linear-gradient(145deg,var(--surface),rgba(7,15,26,.88));box-shadow:0 18px 60px rgba(0,0,0,.25)}.panel:before{content:'';position:absolute;inset:0 0 auto;height:1px;background:linear-gradient(90deg,transparent,rgba(77,181,255,.8),transparent)}.panel-title{display:flex;align-items:center;gap:12px;margin-bottom:7px}.panel-icon{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;background:rgba(52,126,255,.12);border:1px solid rgba(88,166,255,.2);color:var(--blue);font-size:21px;font-weight:800}.panel h3{margin:0;font-size:19px;letter-spacing:.03em}.panel-sub{margin:0 0 20px;color:var(--muted);font-size:13px;line-height:1.5}.file-list{display:grid;gap:10px}.file-row{display:flex;align-items:center;gap:12px;padding:13px;border:1px solid rgba(100,139,185,.18);border-radius:16px;background:rgba(255,255,255,.025)}.file-copy{min-width:0;flex:1}.file-copy strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}.file-copy span{display:block;color:var(--muted);font-size:10px;letter-spacing:.08em;margin-top:5px}.receive-button,.tx-button{border:0;text-decoration:none;border-radius:12px;padding:11px 13px;font-size:11px;letter-spacing:.08em;font-weight:800;cursor:pointer}.receive-button{color:#cce5ff;border:1px solid rgba(88,166,255,.32);background:rgba(57,131,255,.12)}.empty-state{min-height:154px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;border:1px dashed rgba(120,156,197,.22);border-radius:17px;color:var(--muted);padding:18px}.empty-state strong{color:#c7d7e8;font-size:14px;margin:5px 0}.empty-state span{font-size:12px;line-height:1.4;max-width:250px}.empty-icon{font-size:28px;color:#5f87b4}
-.drop-zone{min-height:154px;border:1px dashed rgba(61,226,255,.35);border-radius:17px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:18px;cursor:pointer;background:rgba(35,180,255,.035);transition:.18s ease}.drop-zone.active{border-color:var(--cyan);background:rgba(35,180,255,.09);transform:translateY(-1px)}.drop-zone .arrow{font-size:30px;color:var(--cyan);margin-bottom:6px}.drop-zone strong{font-size:14px}.drop-zone span{color:var(--muted);font-size:12px;margin-top:5px;max-width:270px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tx-button{width:100%;margin-top:12px;padding:14px;color:#00111a;background:linear-gradient(90deg,#55a5ff,#3de2ff);box-shadow:0 8px 28px rgba(42,170,255,.16)}.tx-button:disabled{opacity:.38;cursor:not-allowed}.progress-wrap{display:none;margin-top:14px}.progress-line{height:7px;border-radius:999px;background:#132235;overflow:hidden}.progress-bar{height:100%;width:0;background:linear-gradient(90deg,var(--blue),var(--cyan));transition:width .12s linear}.progress-meta{display:flex;justify-content:space-between;color:var(--muted);font-size:11px;margin-top:7px}.result{min-height:18px;color:#9ed7ff;font-size:12px;margin-top:10px}.foot{text-align:center;color:#526a83;font-size:10px;letter-spacing:.17em;margin-top:28px}
-@media(max-width:680px){.shell{padding-left:15px;padding-right:15px}.topbar{margin-bottom:34px}.brand small{display:none}.status{padding:7px 9px}.portal-grid{grid-template-columns:1fr}.panel{padding:18px;border-radius:20px}.intro{text-align:left;margin-bottom:25px}.intro h2{letter-spacing:-1.4px}.intro p{font-size:14px}}
-</style>
-</head>
-<body>
-<div class='grid-bg'></div>
-<main class='shell'>
-  <header class='topbar'>
-    <div class='brand'><div class='mark'>⇄</div><div><h1>FTPortal</h1><small>LOCAL TRANSFER</small></div></div>
-    <div class='status'><span class='dot'></span>ONLINE</div>
-  </header>
-  <section class='intro'><div class='eyebrow'>DIRECT · LOCAL · SIMPLE</div><h2>Move files. No cloud.</h2><p>Two actions, one local portal.</p></section>
-  <section class='portal-grid'>
+<meta name='theme-color' content='#0d0f12'><title>FTPortal</title><style>
+:root{--bg:#0d0f12;--card:#141720;--border:#1e2330;--accent:#4f8ef7;--accent2:#8e6cf7;--text:#e8ecf5;--muted:#5a6480;--ok:#4ff78e;--err:#f74f6a}
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}header{position:sticky;top:0;z-index:2;background:rgba(20,23,32,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}.brand{display:flex;align-items:center;gap:11px}.brand .icon{font-size:24px}.brand h1{font-size:16px;letter-spacing:.5px}.host-chip{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--border);padding:6px 12px;border-radius:20px;font-size:13px;color:var(--muted)}.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}main{max-width:1100px;margin:0 auto;padding:24px}.portal-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;overflow:hidden}.panel-title{display:flex;align-items:center;gap:10px;margin-bottom:8px}.panel-icon{width:32px;height:32px;display:grid;place-items:center;border-radius:9px;background:rgba(79,142,247,.15);color:var(--accent);font-size:18px;font-weight:700}.panel h3{font-size:13px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted)}.panel-sub{margin:0 0 16px;color:var(--muted);font-size:13px;line-height:1.5}.file-list{display:flex;flex-direction:column;gap:8px}.file-row{display:flex;align-items:center;gap:12px;padding:10px 13px;background:var(--bg);border:1px solid var(--border);border-radius:10px}.file-copy{min-width:0;flex:1}.file-copy strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.file-copy span{display:block;color:var(--muted);font-size:11px;margin-top:4px}.receive-button,.tx-button{border:0;text-decoration:none;border-radius:9px;padding:10px 13px;font-size:12px;font-weight:600;cursor:pointer}.receive-button{color:var(--accent);border:1px solid var(--border);background:transparent}.receive-button:hover{border-color:var(--accent)}.empty-state{min-height:146px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;border:2px dashed var(--border);border-radius:12px;color:var(--muted);padding:18px}.empty-state strong{color:var(--text);font-size:14px;margin:6px 0}.empty-state span{font-size:12px;line-height:1.45;max-width:270px}.empty-icon{font-size:26px;color:var(--muted)}.drop-zone{min-height:146px;border:2px dashed var(--border);border-radius:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:18px;cursor:pointer;color:var(--muted);transition:all .2s}.drop-zone.active{border-color:var(--accent);background:rgba(79,142,247,.06);color:var(--text)}.drop-zone .arrow{font-size:28px;color:var(--accent);margin-bottom:7px}.drop-zone strong{font-size:14px;color:var(--text)}.drop-zone span{font-size:12px;margin-top:5px;max-width:270px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tx-button{width:100%;margin-top:12px;padding:12px 16px;color:#fff;background:var(--accent)}.tx-button:hover{filter:brightness(1.1)}.tx-button:disabled{opacity:.5;cursor:not-allowed}.progress-wrap{display:none;margin-top:14px}.progress-line{height:8px;border-radius:30px;background:var(--bg);border:1px solid var(--border);overflow:hidden}.progress-bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .12s}.progress-meta{display:flex;justify-content:space-between;color:var(--muted);font-size:11px;margin-top:7px}.result{min-height:18px;color:var(--ok);font-size:12px;margin-top:10px}.foot{text-align:center;color:var(--muted);font-size:11px;margin-top:22px}@media(max-width:680px){header{padding:12px 14px}main{padding:14px}.portal-grid{grid-template-columns:1fr}.panel{padding:16px}}
+</style></head><body>
+<header><div class='brand'><span class='icon'>📁</span><h1>LOCAL FILE PORTAL</h1></div><div class='host-chip'><span class='dot'></span><b>Android host</b></div></header>
+<main><section class='portal-grid'>
     <article class='panel'>
       <div class='panel-title'><div class='panel-icon'>↓</div><h3>RECEIVE FILE</h3></div>
-      <p class='panel-sub'>Files waiting on the Android host.</p>
+      <p class='panel-sub'>Choose a one-shot file shared by this Android host.</p>
       <div class='file-list'>$receiveRows</div>
     </article>
     <article class='panel'>
@@ -266,9 +252,7 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
       <div id='progressWrap' class='progress-wrap'><div class='progress-line'><div id='progressBar' class='progress-bar'></div></div><div class='progress-meta'><span id='progressText'>0%</span><span id='progressSize'></span></div></div>
       <div id='result' class='result'></div>
     </article>
-  </section>
-  <div class='foot'>FTPORTAL · PRIVATE LAN TRANSFER</div>
-</main>
+  </section><div class='foot'>LOCAL NETWORK · NO CLOUD · ONE-SHOT LINKS</div></main>
 <script>
 (function(){
   var input=document.getElementById('txFile');
