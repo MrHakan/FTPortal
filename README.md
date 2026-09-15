@@ -71,6 +71,6 @@ FTPortal is designed for **trusted local networks**. It does not expose a cloud 
 
 Peer Protocol v2 adds explicit Accept/Decline, expiring per-offer authorization tokens, file scoping and a human verification code. These controls prevent an ordinary v2 offer from becoming an unrestricted receive endpoint, but they do **not** encrypt the local connection. Native peer traffic still uses local HTTP; do not forward TCP `47171` or the browser host to the public Internet when files are sensitive.
 
-The native HTTP hosts send `no-store`, MIME-sniffing, referrer and content-security headers. Download filenames use encoded `filename*` metadata rather than injecting raw filenames into HTTP headers.
+The native HTTP hosts send `no-store`, MIME-sniffing, referrer and content-security headers. Windows, Android and iOS also perform a private-address/current-subnet admission check before routing HTTP or peer requests. Download filenames use encoded `filename*` metadata rather than injecting raw filenames into HTTP headers.
 
 For the mature PowerShell feature set and its transport/security details, see [`POWERSHELL/README.md`](POWERSHELL/README.md).

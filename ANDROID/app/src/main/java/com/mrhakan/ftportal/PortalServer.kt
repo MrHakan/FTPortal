@@ -24,6 +24,9 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
     override fun serve(session: IHTTPSession): Response {
         val path = runCatching { Uri.decode(session.uri) }.getOrDefault(session.uri)
         val peer = session.remoteIpAddress.orEmpty().ifBlank { "Web/local peer" }
+        if (!LocalNetworkGuard.isAllowed(session.remoteIpAddress.orEmpty())) {
+            return commonHeaders(jsonError(Response.Status.FORBIDDEN, "Client is outside the active local network"))
+        }
         val response = when {
             session.method == Method.GET && path == "/" -> newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html())
             session.method == Method.GET && path == "/api/state" -> newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", stateJson())

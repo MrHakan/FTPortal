@@ -16,9 +16,13 @@ The original PowerShell edition remains feature-richer and keeps its existing AP
 
 The Android app starts `PortalService` as a foreground service of type `connectedDevice`. `NanoHTTPD` listens on TCP/8080. Android NSD advertises `_http._tcp.`. Files are referenced by Storage Access Framework content URIs and read via `ContentResolver` only when a peer requests them.
 
+The Android host rejects public and known VPN-interface clients before routing and checks the remote private IPv4 against an active local interface prefix. Its web port is selected in the order 80 → 8080 and the actual bound port is persisted and advertised.
+
 ## iOS
 
 The iOS app uses `NWListener` and Bonjour. Selected files remain security-scoped URLs. A custom streaming HTTP responder reads 256 KiB chunks from the source file. iOS does not permit a general-purpose third-party app to run an arbitrary local TCP server indefinitely after suspension; the app uses a background task to let an active transfer finish, but reliable hosting requires the app to remain active. This is an operating-system limitation, not a storage limitation.
+
+Selected URLs are persisted as security-scoped bookmarks and restored when possible; stale or unavailable bookmarks are discarded without blocking app startup. Requests are admitted only from loopback or the active local private `/24` fallback.
 
 ## Windows
 

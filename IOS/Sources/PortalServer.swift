@@ -132,6 +132,11 @@ final class PortalServer {
         let rawPath = String(rawTarget.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)[0])
         let path = rawPath.removingPercentEncoding ?? rawPath
 
+        guard LocalNetworkGuard.isAllowed(remoteHost(connection)) else {
+            sendText(connection, status: "403 Forbidden", body: "Client is outside the active local network")
+            return
+        }
+
         if method == "GET" && path == "/" {
             sendHtml(connection)
         } else if method == "GET" && path == "/api/state" {
