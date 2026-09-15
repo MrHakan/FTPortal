@@ -325,10 +325,10 @@ internal sealed class PortalServer : IAsyncDisposable
             _shares.Release(id);
             if (transferId.Length > 0)
                 _transfers.Finish(transferId, success: false, detail: TransferError(ex), finalBytes: transferred);
-            if (!context.Response.HasStarted)
+            if (!context.Response.HasStarted && !context.RequestAborted.IsCancellationRequested)
             {
                 context.Response.StatusCode = StatusCodes.Status500InternalServerError;
-                await context.Response.WriteAsync("Transfer failed", context.RequestAborted);
+                await context.Response.WriteAsync("Transfer failed", CancellationToken.None);
             }
         }
     }

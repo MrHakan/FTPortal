@@ -19,7 +19,7 @@ enum LocalNetworkGuard {
     private static func octets(_ value: String) -> [UInt8]? {
         let pieces = value.split(separator: ".")
         guard pieces.count == 4 else { return nil }
-        let result = pieces.compactMap { UInt8($0) }
+        let result = pieces.compactMap { UInt8(String($0)) }
         return result.count == 4 ? result : nil
     }
 
