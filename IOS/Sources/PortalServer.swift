@@ -291,40 +291,68 @@ final class PortalServer {
             "X-FTPortal-One-Shot: true\r\n"
         if let protocolVersion { header += "X-FTPortal-Protocol: \(protocolVersion)\r\n" }
         header += "Connection: close\r\n\r\n"
+        let transferId = TransferCenter.shared.begin(
+            direction: .send,
+            fileName: meta.name,
+            peer: remoteHost(connection),
+            totalBytes: size
+        )
 
         connection.send(content: Data(header.utf8), completion: .contentProcessed { [weak self] error in
             guard error == nil else {
                 try? handle.close()
                 PortalStore.shared.release(id)
+                TransferCenter.shared.finish(id: transferId, success: false, detail: "Connection interrupted")
                 connection.cancel()
                 return
             }
-            self?.sendChunk(connection, handle: handle, id: id, onCompleted: onCompleted)
+            self?.sendChunk(connection, handle: handle, id: id, transferId: transferId, expected: size, transferred: 0, onCompleted: onCompleted)
         })
     }
 
-    private func sendChunk(_ connection: NWConnection, handle: FileHandle, id: String, onCompleted: (() -> Void)?) {
+    private func sendChunk(
+        _ connection: NWConnection,
+        handle: FileHandle,
+        id: String,
+        transferId: String,
+        expected: Int64,
+        transferred: Int64,
+        onCompleted: (() -> Void)?
+    ) {
         do {
-            let chunk = try handle.read(upToCount: 256 * 1024) ?? Data()
+            let remaining = expected >= 0 ? max(0, expected - transferred) : Int64(256 * 1024)
+            let readSize = Int(min(Int64(256 * 1024), remaining))
+            let chunk = readSize == 0 ? Data() : (try handle.read(upToCount: readSize) ?? Data())
             if chunk.isEmpty {
                 try? handle.close()
+                guard expected < 0 || transferred == expected else {
+                    PortalStore.shared.release(id)
+                    TransferCenter.shared.finish(id: transferId, success: false, detail: "Source changed during transfer")
+                    connection.cancel()
+                    return
+                }
                 PortalStore.shared.consume(id)
                 onCompleted?()
+                TransferCenter.shared.finish(id: transferId, success: true)
                 connection.cancel()
                 return
             }
+            let nextTransferred = transferred + Int64(chunk.count)
+            TransferCenter.shared.update(id: transferId, bytes: nextTransferred)
             connection.send(content: chunk, completion: .contentProcessed { [weak self] error in
                 guard error == nil else {
                     try? handle.close()
                     PortalStore.shared.release(id)
+                    TransferCenter.shared.finish(id: transferId, success: false, detail: "Connection interrupted")
                     connection.cancel()
                     return
                 }
-                self?.sendChunk(connection, handle: handle, id: id, onCompleted: onCompleted)
+                self?.sendChunk(connection, handle: handle, id: id, transferId: transferId, expected: expected, transferred: nextTransferred, onCompleted: onCompleted)
             })
         } catch {
             try? handle.close()
             PortalStore.shared.release(id)
+            TransferCenter.shared.finish(id: transferId, success: false, detail: "Source I/O error")
             connection.cancel()
         }
     }
