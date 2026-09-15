@@ -29,4 +29,8 @@ The Windows executable is a WinForms shell around an ASP.NET Core/Kestrel host. 
 3. Mobile Hotspot / virtual local adapter
 4. Other operational private IPv4 interfaces
 
-When no useful Wi-Fi/LAN interface exists, the dashboard can request Windows Mobile Hotspot through `NetworkOperatorTetheringManager`. The mDNS responder answers A-record requests for `ftphakan.local` with the current preferred local IPv4 address. Port 80 is preferred so the hostname works without an explicit port; 8080 and 8787 are fallback ports.
+When no useful Wi-Fi/LAN interface exists, the dashboard and the transport supervisor can request Windows Mobile Hotspot through `NetworkOperatorTetheringManager`. Automatic attempts are serialized and backed off, and a manual stop temporarily suppresses automatic re-arming. Port 80 is preferred so the hostname works without an explicit port; 8080 and 8787 are fallback ports.
+
+Windows HTTP and peer requests pass an active-bearer admission check before routing. Loopback is allowed for local diagnostics; remote clients must be private IPv4 addresses on a current, non-VPN subnet. Virtual host-only adapters are excluded unless Windows identifies them as a Wi-Fi Direct or Mobile Hotspot transport. Discovery uses the adapter's subnet mask where the host count is bounded, and falls back to a bounded `/24` probe for very large networks.
+
+The native Windows dashboard tracks active send/receive byte counts, smoothed throughput, estimated progress and a bounded metadata-only history. A cancellation releases the one-shot claim and removes any `.part` destination; a successful stream consumes the share only after the response is flushed.

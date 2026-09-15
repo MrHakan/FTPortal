@@ -4,6 +4,8 @@ on:
   push:
     branches: [ main ]
     tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -108,6 +110,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: github.event_name != 'pull_request'
     needs: [powershell, android, ios, windows]
     runs-on: ubuntu-latest
     permissions:

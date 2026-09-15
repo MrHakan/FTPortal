@@ -54,7 +54,7 @@ The PowerShell edition also remains on its mature existing lobby/router flow rat
 
 ## Build + collective releases
 
-`.github/workflows/multiplatform-release.yml` builds all four editions in parallel. A push to `main`, a `v*` tag, or a manual workflow run produces one GitHub Release containing:
+`.github/workflows/multiplatform-release.yml` builds all four editions in parallel. Pull requests run the same platform build/test jobs without publishing a release. A push to `main`, a `v*` tag, or a manual workflow run produces one GitHub Release containing:
 
 - `FTPortal-PowerShell.zip`
 - `FTPortal-Android.apk`

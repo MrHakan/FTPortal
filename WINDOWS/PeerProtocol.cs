@@ -132,8 +132,19 @@ internal static class PeerProtocol
             if (info is null ||
                 (info.Protocol != VersionV2 && info.Protocol != VersionV1) ||
                 !info.LobbyActive ||
+                info.Files is null ||
                 info.Files.Count == 0 ||
                 string.IsNullOrWhiteSpace(info.DeviceId)) return null;
+
+            var files = info.Files
+                .Where(file => file is not null &&
+                               !string.IsNullOrWhiteSpace(file.Id) &&
+                               file.Id.Length <= 64 &&
+                               file.Id.All(char.IsLetterOrDigit) &&
+                               !string.IsNullOrWhiteSpace(file.Name) &&
+                               file.Name.Length <= 255)
+                .ToArray();
+            if (files.Length == 0) return null;
 
             return new PeerLobby(
                 info.DeviceId,
@@ -143,7 +154,7 @@ internal static class PeerProtocol
                 host,
                 info.PeerPort is > 0 and <= 65535 ? info.PeerPort : Port,
                 info.LegacyPort,
-                info.Files,
+                files,
                 info.Protocol,
                 info.Capabilities ?? []
             );
@@ -157,6 +168,8 @@ internal static class PeerProtocol
 
 internal static class PeerDiscovery
 {
+    private const uint MaximumHostsPerSubnet = 4096;
+    private static readonly IPAddress FallbackSubnetMask = IPAddress.Parse("255.255.255.0");
     private static readonly HttpClient Client = new(new SocketsHttpHandler
     {
         ConnectTimeout = TimeSpan.FromMilliseconds(350),
@@ -170,18 +183,30 @@ internal static class PeerDiscovery
         IEnumerable<IPAddress> localAddresses,
         CancellationToken cancellationToken = default)
     {
-        var own = localAddresses
+        var transports = localAddresses
             .Where(address => address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-            .Select(address => address.ToString())
+            .Select(address => new TransportAddress("Other", "unknown", address, 3, FallbackSubnetMask))
+            .ToArray();
+        return await DiscoverAsync(transports, cancellationToken);
+    }
+
+    public static async Task<IReadOnlyList<PeerLobby>> DiscoverAsync(
+        IEnumerable<TransportAddress> localTransports,
+        CancellationToken cancellationToken = default)
+    {
+        var transports = localTransports
+            .Where(transport => transport.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            .ToArray();
+        var own = transports
+            .Select(transport => transport.Address.ToString())
             .ToHashSet(StringComparer.Ordinal);
         var candidates = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var address in own)
+        foreach (var transport in transports)
         {
-            var bytes = IPAddress.Parse(address).GetAddressBytes();
-            for (var last = 1; last <= 254; last++)
+            var mask = transport.SubnetMask ?? FallbackSubnetMask;
+            foreach (var candidate in EnumerateCandidates(transport.Address, mask))
             {
-                var candidate = $"{bytes[0]}.{bytes[1]}.{bytes[2]}.{last}";
                 if (!own.Contains(candidate)) candidates.Add(candidate);
             }
         }
@@ -213,6 +238,49 @@ internal static class PeerDiscovery
             .OrderBy(lobby => lobby.Alias, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
+
+    private static IEnumerable<string> EnumerateCandidates(IPAddress address, IPAddress mask)
+    {
+        var ip = ToUInt32(address);
+        var maskValue = ToUInt32(mask);
+        var network = ip & maskValue;
+        var broadcast = network | ~maskValue;
+        var hostCount = broadcast > network && broadcast - network > 1
+            ? broadcast - network - 1
+            : 0;
+
+        // Scanning a /8 or a large corporate /16 is not a safe background
+        // operation. Keep discovery useful by probing the local /24 as a
+        // bounded fallback, while correctly scanning normal hotspot/LAN masks.
+        if (hostCount > MaximumHostsPerSubnet)
+        {
+            maskValue = ToUInt32(FallbackSubnetMask);
+            network = ip & maskValue;
+            broadcast = network | ~maskValue;
+        }
+
+        if (broadcast <= network || broadcast - network <= 1) yield break;
+
+        for (var value = network + 1; value < broadcast; value++)
+            yield return FromUInt32(value).ToString();
+    }
+
+    private static uint ToUInt32(IPAddress address)
+    {
+        var bytes = address.GetAddressBytes();
+        if (bytes.Length != 4) return 0;
+        return ((uint)bytes[0] << 24) |
+            ((uint)bytes[1] << 16) |
+            ((uint)bytes[2] << 8) |
+            bytes[3];
+    }
+
+    private static IPAddress FromUInt32(uint value) => new IPAddress([
+        (byte)(value >> 24),
+        (byte)(value >> 16),
+        (byte)(value >> 8),
+        (byte)value
+    ]);
 
     private static async Task<PeerLobby?> ProbeAsync(string host, CancellationToken cancellationToken)
     {

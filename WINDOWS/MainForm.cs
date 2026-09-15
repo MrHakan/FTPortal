@@ -6,19 +6,26 @@ namespace FTPortal.Windows;
 
 internal sealed class MainForm : Form
 {
-    private static readonly HttpClient PeerTransferClient = new(new SocketsHttpHandler { UseProxy = false })
+    private static readonly HttpClient PeerTransferClient = new(new SocketsHttpHandler
+    {
+        ConnectTimeout = TimeSpan.FromSeconds(3),
+        UseProxy = false
+    })
     {
         Timeout = Timeout.InfiniteTimeSpan
     };
 
     private readonly ShareRegistry _shares = new();
+    private readonly TransferCenter _transfers = new();
     private readonly NetworkTransportManager _network = new();
+    private readonly TransportSupervisor _transportSupervisor;
     private readonly PortalServer _server;
     private MdnsResponder? _mdns;
 
     private readonly Label _address = new() { AutoSize = true, Font = new Font("Segoe UI", 11, FontStyle.Bold) };
     private readonly Label _transport = new() { AutoSize = true };
     private readonly Label _discovery = new() { AutoSize = true, ForeColor = Color.DimGray };
+    private readonly Label _transferStatus = new() { AutoSize = true, ForeColor = Color.DimGray };
     private readonly Label _notice = new() { AutoSize = true, ForeColor = Color.DimGray };
     private readonly ListBox _files = new() { Dock = DockStyle.Fill, SelectionMode = SelectionMode.MultiExtended };
     private readonly ListBox _lobbies = new() { Dock = DockStyle.Fill, SelectionMode = SelectionMode.One };
@@ -30,6 +37,7 @@ internal sealed class MainForm : Form
     private IReadOnlyList<IncomingPeerOffer> _visibleOffers = [];
     private bool _allowExit;
     private bool _scanInProgress;
+    private int _networkChanged;
     private DateTime _lastLobbyScan = DateTime.MinValue;
     private readonly string _ssid = "FTPHAKAN-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(2));
     private readonly string _pass = Convert.ToHexString(RandomNumberGenerator.GetBytes(6));
@@ -41,12 +49,22 @@ internal sealed class MainForm : Form
         Height = 720;
         MinimumSize = new Size(760, 560);
         StartPosition = FormStartPosition.CenterScreen;
-        _server = new PortalServer(_shares);
+        _transportSupervisor = new TransportSupervisor(_network, _ssid, _pass);
+        _server = new PortalServer(_shares, _transfers, _network);
+        _network.NetworkChanged += (_, _) => Interlocked.Exchange(ref _networkChanged, 1);
 
         var add = new Button { Text = "Share file", AutoSize = true };
         add.Click += (_, _) => AddFile();
         var cancel = new Button { Text = "Cancel selected share", AutoSize = true };
         cancel.Click += (_, _) => CancelSelectedShares();
+        var cancelTransfers = new Button { Text = "Cancel active transfers", AutoSize = true };
+        cancelTransfers.Click += (_, _) =>
+        {
+            var count = _transfers.CancelAll();
+            _notice.Text = count == 0 ? "No active transfers." : $"Cancelled {count} active transfer{(count == 1 ? "" : "s")}.";
+        };
+        var history = new Button { Text = "Transfer history", AutoSize = true };
+        history.Click += (_, _) => ShowTransferHistory();
         var clear = new Button { Text = "Clear pending shares", AutoSize = true };
         clear.Click += (_, _) => ClearPendingShares();
         var refreshLobbies = new Button { Text = "Refresh lobbies", AutoSize = true };
@@ -60,9 +78,17 @@ internal sealed class MainForm : Form
         var browser = new Button { Text = "Open browser dashboard", AutoSize = true };
         browser.Click += (_, _) => OpenDashboard();
         var hotspot = new Button { Text = "Start hotspot fallback", AutoSize = true };
-        hotspot.Click += async (_, _) => _notice.Text = await _network.StartHotspotAsync(_ssid, _pass);
+        hotspot.Click += async (_, _) =>
+        {
+            _notice.Text = await _transportSupervisor.StartManualFallbackAsync();
+            RefreshDashboard();
+        };
         var stopHotspot = new Button { Text = "Stop hotspot", AutoSize = true };
-        stopHotspot.Click += async (_, _) => _notice.Text = await _network.StopHotspotAsync();
+        stopHotspot.Click += async (_, _) =>
+        {
+            _notice.Text = await _transportSupervisor.StopManualFallbackAsync();
+            RefreshDashboard();
+        };
 
         var buttons = new FlowLayoutPanel
         {
@@ -72,7 +98,7 @@ internal sealed class MainForm : Form
             Padding = new Padding(0, 8, 0, 8)
         };
         buttons.Controls.AddRange([
-            add, cancel, clear, refreshLobbies, joinLobby, acceptIncoming, declineIncoming, browser, hotspot, stopHotspot
+            add, cancel, clear, cancelTransfers, history, refreshLobbies, joinLobby, acceptIncoming, declineIncoming, browser, hotspot, stopHotspot
         ]);
 
         var header = new FlowLayoutPanel
@@ -87,6 +113,7 @@ internal sealed class MainForm : Form
         header.Controls.Add(_address);
         header.Controls.Add(_transport);
         header.Controls.Add(_discovery);
+        header.Controls.Add(_transferStatus);
         header.Controls.Add(new Label { Text = $"Hotspot fallback: SSID {_ssid} · password {_pass}", AutoSize = true });
         header.Controls.Add(_notice);
         header.Controls.Add(buttons);
@@ -132,8 +159,11 @@ internal sealed class MainForm : Form
         Shown += async (_, _) => await StartAsync();
         _timer.Tick += async (_, _) =>
         {
+            var networkChanged = Interlocked.Exchange(ref _networkChanged, 0) == 1;
             RefreshDashboard();
-            await RefreshLobbiesAsync(force: false);
+            var fallbackNotice = await _transportSupervisor.EnsureFallbackAsync();
+            if (!string.IsNullOrWhiteSpace(fallbackNotice)) _notice.Text = fallbackNotice;
+            await RefreshLobbiesAsync(force: networkChanged);
         };
         _timer.Start();
     }
@@ -143,14 +173,13 @@ internal sealed class MainForm : Form
         try
         {
             await _server.StartAsync(80, 8080, 8787);
-            _mdns = new MdnsResponder(() => _network.Primary()?.Address);
+            _mdns = new MdnsResponder(client => _network.AddressForClient(client));
             _mdns.Start();
             RefreshDashboard();
             await RefreshLobbiesAsync(force: true);
 
-            var transports = _network.Snapshot();
-            if (transports.Count == 0 || transports.All(x => x.Priority >= 2))
-                _notice.Text = await _network.StartHotspotAsync(_ssid, _pass);
+            var fallbackNotice = await _transportSupervisor.EnsureFallbackAsync(force: true);
+            if (!string.IsNullOrWhiteSpace(fallbackNotice)) _notice.Text = fallbackNotice;
         }
         catch (Exception ex)
         {
@@ -222,7 +251,8 @@ internal sealed class MainForm : Form
 
         var peerText = _server.PeerAvailable
             ? $"Peer protocol: {PeerProtocol.Version} (v1 compatible) on TCP {PeerProtocol.Port}"
-            : $"Peer protocol unavailable on TCP {PeerProtocol.Port}";
+            : $"Peer protocol unavailable on TCP {PeerProtocol.Port}" +
+              (string.IsNullOrWhiteSpace(_server.PeerError) ? "" : $": {_server.PeerError}");
         var mdnsText = _mdns switch
         {
             null => "mDNS has not started",
@@ -238,7 +268,93 @@ internal sealed class MainForm : Form
         _files.Items.AddRange(items);
         _files.EndUpdate();
 
+        var activeTransfers = _transfers.Active();
+        var historyCount = _transfers.History().Count;
+        _transferStatus.Text = activeTransfers.Count == 0
+            ? $"Transfers: idle · history: {historyCount}"
+            : $"Transfers: {activeTransfers.Count} active · {string.Join(" · ", activeTransfers.Take(2).Select(FormatTransfer))}";
+
         RefreshIncomingOffers();
+    }
+
+    private static string FormatTransfer(TransferSnapshot transfer)
+    {
+        var progress = transfer.ProgressPercent.HasValue
+            ? $"{transfer.ProgressPercent}%"
+            : FormatBytes(transfer.BytesTransferred);
+        var speed = transfer.BytesPerSecond > 0 ? $" · {FormatBytes((long)transfer.BytesPerSecond)}/s" : "";
+        return $"{(transfer.Direction == TransferDirection.Send ? "↑" : "↓")} {transfer.FileName} {progress}{speed}";
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        var value = Math.Max(0L, bytes);
+        var units = new[] { "B", "KB", "MB", "GB", "TB" };
+        var index = 0;
+        var amount = (double)value;
+        while (amount >= 1024 && index < units.Length - 1)
+        {
+            amount /= 1024;
+            index++;
+        }
+        return $"{amount:0.#} {units[index]}";
+    }
+
+    private void ShowTransferHistory()
+    {
+        using var dialog = new Form
+        {
+            Text = "FTPortal transfer history",
+            Width = 760,
+            Height = 470,
+            MinimumSize = new Size(560, 320),
+            StartPosition = FormStartPosition.CenterParent
+        };
+        var list = new ListBox { Dock = DockStyle.Fill };
+        var clear = new Button { Text = "Clear history", AutoSize = true };
+        var close = new Button { Text = "Close", AutoSize = true };
+        var actions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 48,
+            Padding = new Padding(8),
+            FlowDirection = FlowDirection.RightToLeft
+        };
+        actions.Controls.Add(close);
+        actions.Controls.Add(clear);
+
+        void Reload()
+        {
+            var entries = _transfers.History();
+            list.BeginUpdate();
+            list.Items.Clear();
+            if (entries.Count == 0)
+            {
+                list.Items.Add("No completed or failed transfers yet.");
+            }
+            else
+            {
+                list.Items.AddRange(entries.Select(entry =>
+                    $"{entry.FinishedAt.ToLocalTime():g}  ·  {(entry.Direction == TransferDirection.Send ? "↑" : "↓")} " +
+                    $"{entry.FileName}  ·  {entry.BytesTransferred:N0}/{(entry.TotalBytes >= 0 ? entry.TotalBytes.ToString("N0") : "?")} bytes  ·  " +
+                    $"{(entry.Success ? "completed" : "failed")}  ·  {entry.Peer}" +
+                    (string.IsNullOrWhiteSpace(entry.Detail) ? "" : $"  ·  {entry.Detail}")
+                ).ToArray());
+            }
+            list.EndUpdate();
+        }
+
+        clear.Click += (_, _) =>
+        {
+            _transfers.ClearHistory();
+            Reload();
+            RefreshDashboard();
+        };
+        close.Click += (_, _) => dialog.Close();
+        dialog.Controls.Add(list);
+        dialog.Controls.Add(actions);
+        Reload();
+        dialog.ShowDialog(this);
     }
 
     private void RefreshIncomingOffers()
@@ -263,8 +379,8 @@ internal sealed class MainForm : Form
         try
         {
             _notice.Text = "Scanning for FTPortal lobbies…";
-            var addresses = _network.Snapshot().Select(item => item.Address).Distinct().ToArray();
-            _visibleLobbies = await PeerDiscovery.DiscoverAsync(addresses);
+            var transports = _network.Snapshot();
+            _visibleLobbies = await PeerDiscovery.DiscoverAsync(transports);
             _lobbies.BeginUpdate();
             _lobbies.Items.Clear();
             _lobbies.Items.AddRange(_visibleLobbies.Select(lobby =>
@@ -325,14 +441,19 @@ internal sealed class MainForm : Form
             WrapContents = false
         };
         var download = new Button { Text = "Receive selected file", AutoSize = true };
+        var cancelTransfer = new Button { Text = "Cancel transfer", AutoSize = true, Enabled = false };
+        CancellationTokenSource? activeCancellation = null;
         download.Click += async (_, _) =>
         {
             var selected = list.SelectedIndex;
             if (selected < 0 || selected >= lobby.Files.Count) return;
             download.Enabled = false;
+            cancelTransfer.Enabled = true;
+            var cancellation = new CancellationTokenSource();
+            activeCancellation = cancellation;
             try
             {
-                var completed = await DownloadPeerFileAsync(lobby, lobby.Files[selected]);
+                var completed = await DownloadPeerFileAsync(lobby, lobby.Files[selected], cancellation.Token);
                 if (completed)
                 {
                     dialog.Close();
@@ -341,10 +462,15 @@ internal sealed class MainForm : Form
             }
             finally
             {
+                if (ReferenceEquals(activeCancellation, cancellation)) activeCancellation = null;
+                cancellation.Dispose();
+                cancelTransfer.Enabled = false;
                 if (!dialog.IsDisposed) download.Enabled = true;
             }
         };
+        cancelTransfer.Click += (_, _) => activeCancellation?.Cancel();
         actions.Controls.Add(download);
+        actions.Controls.Add(cancelTransfer);
 
         if (lobby.SupportsOffers)
         {
@@ -426,7 +552,7 @@ internal sealed class MainForm : Form
         if (folder.ShowDialog(this) != DialogResult.OK) return;
 
         _notice.Text = $"Receiving {offer.Files.Count} file{(offer.Files.Count == 1 ? "" : "s")} from {offer.SenderAlias}…";
-        var result = await PeerOfferReceiver.ReceiveAllAsync(offer, folder.SelectedPath);
+        var result = await PeerOfferReceiver.ReceiveAllAsync(offer, folder.SelectedPath, _transfers);
         RefreshIncomingOffers();
         RefreshDashboard();
         await RefreshLobbiesAsync(force: true);
@@ -456,7 +582,10 @@ internal sealed class MainForm : Form
         RefreshIncomingOffers();
     }
 
-    private async Task<bool> DownloadPeerFileAsync(PeerLobby lobby, PeerRemoteFile file)
+    private async Task<bool> DownloadPeerFileAsync(
+        PeerLobby lobby,
+        PeerRemoteFile file,
+        CancellationToken cancellationToken = default)
     {
         using var save = new SaveFileDialog
         {
@@ -469,6 +598,13 @@ internal sealed class MainForm : Form
 
         var target = save.FileName;
         var temp = target + $".ftportal-{Guid.NewGuid():N}.part";
+        var transferId = _transfers.Begin(
+            TransferDirection.Receive,
+            file.Name,
+            $"{lobby.Alias} ({lobby.Host})",
+            file.Size
+        );
+        var received = 0L;
         try
         {
             using var request = new HttpRequestMessage(
@@ -476,32 +612,58 @@ internal sealed class MainForm : Form
                 $"http://{lobby.Host}:{lobby.PeerPort}{PeerProtocol.DownloadPrefixV1}{file.Id}"
             );
             request.Headers.TryAddWithoutValidation("X-FTPortal-Client", PeerProtocol.VersionV1);
-            using var response = await PeerTransferClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            using var response = await PeerTransferClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken
+            );
             if (!response.IsSuccessStatusCode)
                 throw new IOException($"Peer returned HTTP {(int)response.StatusCode} {response.ReasonPhrase}");
 
-            await using (var source = await response.Content.ReadAsStreamAsync())
+            await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken))
             await using (var destination = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, useAsync: true))
             {
-                await source.CopyToAsync(destination, 128 * 1024);
-                await destination.FlushAsync();
+                var buffer = new byte[128 * 1024];
+                while (true)
+                {
+                    var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken);
+                    if (read == 0) break;
+                    await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                    received += read;
+                    _transfers.Update(transferId, received);
+                }
+                await destination.FlushAsync(cancellationToken);
             }
 
-            var received = new FileInfo(temp).Length;
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (file.Size >= 0 && received != file.Size)
                 throw new IOException($"Expected {file.Size:N0} bytes, received {received:N0}");
 
             File.Move(temp, target, overwrite: true);
+            _transfers.Finish(transferId, success: true, finalBytes: received);
             MessageBox.Show(this, $"Received {file.Name}", "FTPortal", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return true;
         }
         catch (Exception ex)
         {
             try { if (File.Exists(temp)) File.Delete(temp); } catch { }
-            MessageBox.Show(this, "Transfer failed: " + ex.Message, "FTPortal", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            var detail = TransferError(ex);
+            _transfers.Finish(transferId, success: false, detail: detail, finalBytes: received);
+            MessageBox.Show(this, "Transfer failed: " + detail, "FTPortal", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
     }
+
+    private static string TransferError(Exception error) => error switch
+    {
+        OperationCanceledException => "Transfer cancelled",
+        HttpRequestException => "Peer connection failed",
+        UnauthorizedAccessException => "Destination access denied",
+        FileNotFoundException or DirectoryNotFoundException => "Destination unavailable",
+        IOException => "Transfer I/O error",
+        _ => "Transfer failed"
+    };
 
     private static string SafeFileName(string name)
     {
@@ -549,6 +711,8 @@ internal sealed class MainForm : Form
         _timer.Stop();
         if (_mdns is not null) await _mdns.DisposeAsync();
         await _server.DisposeAsync();
+        _transportSupervisor.Dispose();
+        _network.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         Close();
