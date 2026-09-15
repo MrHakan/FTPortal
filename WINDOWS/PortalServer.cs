@@ -287,14 +287,27 @@ internal sealed class PortalServer : IAsyncDisposable
             var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
             try
             {
-                while (true)
+                var remaining = currentSize;
+                while (remaining > 0)
                 {
-                    var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), transferToken);
+                    var read = await source.ReadAsync(
+                        buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)),
+                        transferToken
+                    );
                     if (read == 0) break;
                     await context.Response.Body.WriteAsync(buffer.AsMemory(0, read), transferToken);
                     transferred += read;
+                    remaining -= read;
                     _transfers.Update(transferId, transferred);
                 }
+
+                if (remaining != 0)
+                {
+                    _shares.Release(id);
+                    _transfers.Finish(transferId, success: false, detail: "Source changed during transfer", finalBytes: transferred);
+                    return;
+                }
+
                 await context.Response.Body.FlushAsync(transferToken);
             }
             finally

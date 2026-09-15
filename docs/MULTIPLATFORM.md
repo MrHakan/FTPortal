@@ -14,7 +14,7 @@ The original PowerShell edition remains feature-richer and keeps its existing AP
 
 ## Android
 
-The Android app starts `PortalService` as a foreground service of type `connectedDevice`. `NanoHTTPD` listens on TCP/8080. Android NSD advertises `_http._tcp.`. Files are referenced by Storage Access Framework content URIs and read via `ContentResolver` only when a peer requests them.
+The Android app starts `PortalService` as a foreground service of type `connectedDevice`. `NanoHTTPD` tries TCP/80 first and falls back to TCP/8080; the actual bound port is persisted and used for browser URLs and peer metadata. Android NSD advertises `_ftportal._tcp.` on the separate native peer port. Files are referenced by Storage Access Framework content URIs and read via `ContentResolver` only when a peer requests them.
 
 The Android host rejects public and known VPN-interface clients before routing and checks the remote private IPv4 against an active local interface prefix. Its web port is selected in the order 80 → 8080 and the actual bound port is persisted and advertised.
 

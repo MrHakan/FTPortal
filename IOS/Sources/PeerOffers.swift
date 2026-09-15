@@ -67,6 +67,7 @@ final class PeerOfferStore {
     func prepareOutgoing(files: [SharedFile]) throws -> PeerOfferWire {
         guard !files.isEmpty else { throw offerError("No pending files to offer") }
         guard files.count <= maximumFilesPerOffer else { throw offerError("Too many files in one offer") }
+        guard files.allSatisfy({ $0.size >= 0 }) else { throw offerError("All v2 offer files must have a known size") }
 
         let now = nowMilliseconds()
         let offerId = randomHex(bytes: 16)
@@ -114,9 +115,10 @@ final class PeerOfferStore {
         let files = wire.files.filter { file in
             !file.id.isEmpty && file.id.count <= 64 && file.id.allSatisfy { character in
                 character.isLetter || character.isNumber
-            } && !file.name.isEmpty && file.name.count <= 255
+            } && !file.name.isEmpty && file.name.count <= 255 && file.size >= 0
         }
-        guard !files.isEmpty else { return nil }
+        guard files.count == wire.files.count,
+              Set(files.map { $0.id.lowercased() }).count == files.count else { return nil }
 
         let offer = IncomingPeerOffer(
             offerId: wire.offerId.lowercased(),

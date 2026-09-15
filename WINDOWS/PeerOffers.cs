@@ -63,6 +63,7 @@ internal static class PeerOfferStore
     {
         if (files.Count == 0) throw new InvalidOperationException("No pending files to offer.");
         if (files.Count > MaximumFilesPerOffer) throw new InvalidOperationException("Too many files in one offer.");
+        if (files.Any(file => file.Size < 0)) throw new InvalidOperationException("All v2 offer files must have a known size.");
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var offerId = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
@@ -117,7 +118,7 @@ internal static class PeerOfferStore
         if (wire.Files.Count is < 1 or > MaximumFilesPerOffer) return null;
 
         var files = wire.Files
-            .Where(file => file is not null && !string.IsNullOrWhiteSpace(file.Id) && file.Id.Length <= 64 && file.Id.All(char.IsLetterOrDigit))
+            .Where(file => file is not null && !string.IsNullOrWhiteSpace(file.Id) && file.Id.Length <= 64 && file.Id.All(char.IsLetterOrDigit) && file.Size >= 0)
             .Where(file => !string.IsNullOrWhiteSpace(file.Name) && file.Name.Length <= 255)
             .Select(file => file with
             {
@@ -125,7 +126,7 @@ internal static class PeerOfferStore
                 Mime = string.IsNullOrWhiteSpace(file.Mime) ? "application/octet-stream" : file.Mime[..Math.Min(file.Mime.Length, 128)]
             })
             .ToArray();
-        if (files.Length == 0) return null;
+        if (files.Length != wire.Files.Count || files.Select(file => file.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count() != files.Length) return null;
 
         var alias = string.IsNullOrWhiteSpace(wire.SenderAlias) ? remoteHost : wire.SenderAlias[..Math.Min(wire.SenderAlias.Length, 120)];
         var platform = string.IsNullOrWhiteSpace(wire.SenderPlatform) ? "Unknown" : wire.SenderPlatform[..Math.Min(wire.SenderPlatform.Length, 40)];

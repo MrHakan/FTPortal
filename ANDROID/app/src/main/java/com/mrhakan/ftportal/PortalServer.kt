@@ -349,13 +349,30 @@ private class CompletionInputStream(
     private var settled = false
 
     override fun read(): Int {
+        if (expected >= 0 && transferred >= expected) {
+            reachedEof = true
+            settleIfComplete()
+            return -1
+        }
         val value = super.read()
         if (value >= 0) { transferred++; onProgress(transferred) } else { reachedEof = true; settleIfComplete() }
         return value
     }
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-        val count = super.read(buffer, offset, length)
+        if (length == 0) return 0
+        val permittedLength = if (expected >= 0) {
+            val remaining = expected - transferred
+            if (remaining <= 0) {
+                reachedEof = true
+                settleIfComplete()
+                return -1
+            }
+            minOf(length.toLong(), remaining).toInt()
+        } else {
+            length
+        }
+        val count = super.read(buffer, offset, permittedLength)
         if (count > 0) { transferred += count; onProgress(transferred) }
         else if (count < 0) { reachedEof = true; settleIfComplete() }
         return count
@@ -363,7 +380,7 @@ private class CompletionInputStream(
 
     override fun close() {
         if (!settled) {
-            val complete = if (expected >= 0) transferred >= expected else reachedEof
+            val complete = if (expected >= 0) transferred == expected else reachedEof
             settled = true
             if (complete) completed() else interrupted()
         }
@@ -372,7 +389,7 @@ private class CompletionInputStream(
 
     private fun settleIfComplete() {
         if (settled) return
-        val complete = if (expected >= 0) transferred >= expected else reachedEof
+        val complete = if (expected >= 0) transferred == expected else reachedEof
         if (complete) { settled = true; completed() }
     }
 }
