@@ -201,7 +201,7 @@ internal sealed class TransferCenter
             var bytes = transfer.BytesTransferred;
             var total = transfer.TotalBytes;
             var percent = total > 0
-                ? (int)Math.Clamp(bytes * 100d / total, 0d, 100d)
+                ? (int?)Math.Clamp(bytes * 100d / total, 0d, 100d)
                 : null;
             var eta = total > 0 && transfer.SmoothedBytesPerSecond > 1 && bytes < total
                 ? (long?)Math.Max(0, (total - bytes) / transfer.SmoothedBytesPerSecond)
