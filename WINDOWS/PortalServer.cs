@@ -232,7 +232,9 @@ internal sealed class PortalServer : IAsyncDisposable
                 _transfers.Token(transferId)
             );
             var token = cancellation.Token;
-            await using var input = upload.OpenReadStream(MaximumBrowserUploadBytes);
+            // The request and parsed IFormFile length were validated above;
+            // IFormFile itself exposes its stream without a size parameter.
+            await using var input = upload.OpenReadStream();
             await using var output = new FileStream(
                 destination,
                 FileMode.CreateNew,
