@@ -36,7 +36,7 @@ final class PortalStore {
     func add(url: URL) -> SharedFile {
         let scopeActive = url.startAccessingSecurityScopedResource()
         let bookmark = try? url.bookmarkData(
-            options: [.withSecurityScope],
+            options: [],
             includingResourceValuesForKeys: nil,
             relativeTo: nil
         )
@@ -114,7 +114,7 @@ final class PortalStore {
             var stale = false
             guard let url = try? URL(
                 resolvingBookmarkData: stored.bookmark,
-                options: [.withSecurityScope],
+                options: [],
                 relativeTo: nil,
                 bookmarkDataIsStale: &stale
             ), url.startAccessingSecurityScopedResource() else { continue }
@@ -122,7 +122,7 @@ final class PortalStore {
             let bookmark: Data
             if stale {
                 bookmark = (try? url.bookmarkData(
-                    options: [.withSecurityScope],
+                    options: [],
                     includingResourceValuesForKeys: nil,
                     relativeTo: nil
                 )) ?? stored.bookmark

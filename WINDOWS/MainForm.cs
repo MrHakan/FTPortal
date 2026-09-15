@@ -30,6 +30,7 @@ internal sealed class MainForm : Form
     private readonly ListBox _files = new() { Dock = DockStyle.Fill, SelectionMode = SelectionMode.MultiExtended };
     private readonly ListBox _lobbies = new() { Dock = DockStyle.Fill, SelectionMode = SelectionMode.One };
     private readonly ListBox _incoming = new() { Dock = DockStyle.Fill, SelectionMode = SelectionMode.One };
+    private readonly ListBox _activeTransfers = new() { Dock = DockStyle.Fill, SelectionMode = SelectionMode.One };
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 3000 };
     private readonly NotifyIcon _tray = new();
     private IReadOnlyList<SharedFile> _visibleShares = [];
@@ -62,6 +63,7 @@ internal sealed class MainForm : Form
         {
             var count = _transfers.CancelAll();
             _notice.Text = count == 0 ? "No active transfers." : $"Cancelled {count} active transfer{(count == 1 ? "" : "s")}.";
+            RefreshDashboard();
         };
         var history = new Button { Text = "Transfer history", AutoSize = true };
         history.Click += (_, _) => ShowTransferHistory();
@@ -124,22 +126,26 @@ internal sealed class MainForm : Form
         lobbiesGroup.Controls.Add(_lobbies);
         var incomingGroup = new GroupBox { Text = "Incoming v2 offers · Accept / Decline", Dock = DockStyle.Fill, Padding = new Padding(8) };
         incomingGroup.Controls.Add(_incoming);
+        var activeTransfersGroup = new GroupBox { Text = "Active transfers · cancellation releases one-shot claims", Dock = DockStyle.Fill, Padding = new Padding(8) };
+        activeTransfersGroup.Controls.Add(_activeTransfers);
         _lobbies.DoubleClick += (_, _) => JoinSelectedLobby();
         _incoming.DoubleClick += async (_, _) => await AcceptSelectedOfferAsync();
 
         var lists = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            RowCount = 3,
+            RowCount = 4,
             ColumnCount = 1,
             Padding = new Padding(12, 0, 12, 12)
         };
-        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 38));
-        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 36));
-        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 26));
+        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 32));
+        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 30));
+        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
+        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 18));
         lists.Controls.Add(mySharesGroup, 0, 0);
         lists.Controls.Add(lobbiesGroup, 0, 1);
         lists.Controls.Add(incomingGroup, 0, 2);
+        lists.Controls.Add(activeTransfersGroup, 0, 3);
 
         Controls.Add(lists);
         Controls.Add(header);
@@ -160,8 +166,9 @@ internal sealed class MainForm : Form
         _timer.Tick += async (_, _) =>
         {
             var networkChanged = Interlocked.Exchange(ref _networkChanged, 0) == 1;
-            RefreshDashboard();
             var fallbackNotice = await _transportSupervisor.EnsureFallbackAsync();
+            if (networkChanged) await RebindMdnsAsync();
+            RefreshDashboard();
             if (!string.IsNullOrWhiteSpace(fallbackNotice)) _notice.Text = fallbackNotice;
             await RefreshLobbiesAsync(force: networkChanged);
         };
@@ -173,18 +180,25 @@ internal sealed class MainForm : Form
         try
         {
             await _server.StartAsync(80, 8080, 8787);
+            var fallbackNotice = await _transportSupervisor.EnsureFallbackAsync(force: true);
+            if (!string.IsNullOrWhiteSpace(fallbackNotice)) _notice.Text = fallbackNotice;
             _mdns = new MdnsResponder(client => _network.AddressForClient(client));
             _mdns.Start();
             RefreshDashboard();
             await RefreshLobbiesAsync(force: true);
-
-            var fallbackNotice = await _transportSupervisor.EnsureFallbackAsync(force: true);
-            if (!string.IsNullOrWhiteSpace(fallbackNotice)) _notice.Text = fallbackNotice;
         }
         catch (Exception ex)
         {
             _notice.Text = "Server failed: " + ex.Message;
         }
+    }
+
+    private async Task RebindMdnsAsync()
+    {
+        if (_mdns is null) return;
+        await _mdns.DisposeAsync();
+        _mdns = new MdnsResponder(client => _network.AddressForClient(client));
+        _mdns.Start();
     }
 
     private void AddFile()
@@ -273,6 +287,15 @@ internal sealed class MainForm : Form
         _transferStatus.Text = activeTransfers.Count == 0
             ? $"Transfers: idle · history: {historyCount}"
             : $"Transfers: {activeTransfers.Count} active · {string.Join(" · ", activeTransfers.Take(2).Select(FormatTransfer))}";
+        _activeTransfers.BeginUpdate();
+        _activeTransfers.Items.Clear();
+        var transferItems = activeTransfers.Count == 0
+            ? new[] { "No active transfers." }
+            : activeTransfers.Select(transfer =>
+                $"{FormatTransfer(transfer)}  ·  {transfer.Peer}  ·  {transfer.BytesTransferred:N0}/{(transfer.TotalBytes >= 0 ? transfer.TotalBytes.ToString("N0") : "stream")} bytes"
+            ).ToArray();
+        _activeTransfers.Items.AddRange(transferItems);
+        _activeTransfers.EndUpdate();
 
         RefreshIncomingOffers();
     }
