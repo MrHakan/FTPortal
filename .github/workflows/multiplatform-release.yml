@@ -4,6 +4,8 @@ on:
   push:
     branches: [ main ]
     tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -43,6 +45,7 @@ jobs:
       - uses: android-actions/setup-android@v4
         with:
           log-accepted-android-sdk-licenses: false
+          packages: platform-tools
       - name: Install Android SDK
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
       - uses: gradle/actions/setup-gradle@v6
@@ -99,6 +102,7 @@ jobs:
       - name: Publish Windows x64
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
           dotnet publish .\WINDOWS\FTPortal.Windows.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o .\WINDOWS\publish
           Compress-Archive -Path .\WINDOWS\publish\* -DestinationPath .\FTPortal-Windows-x64.zip -Force
       - uses: actions/upload-artifact@v7
@@ -108,6 +112,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: github.event_name != 'pull_request'
     needs: [powershell, android, ios, windows]
     runs-on: ubuntu-latest
     permissions:

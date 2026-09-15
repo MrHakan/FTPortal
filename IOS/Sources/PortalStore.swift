@@ -15,15 +15,31 @@ final class PortalStore {
         let meta: SharedFile
         let url: URL
         let securityScopeActive: Bool
+        let bookmark: Data?
+    }
+
+    private struct StoredEntry: Codable {
+        let meta: SharedFile
+        let bookmark: Data
     }
 
     private let lock = NSLock()
+    private let stateKey = "FTPortalSharedFiles.v1"
     private var entries: [String: Entry] = [:]
     private var claimed: Set<String> = []
+
+    private init() {
+        restore()
+    }
 
     @discardableResult
     func add(url: URL) -> SharedFile {
         let scopeActive = url.startAccessingSecurityScopedResource()
+        let bookmark = try? url.bookmarkData(
+            options: [],
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
         let values = try? url.resourceValues(forKeys: [.fileSizeKey, .nameKey, .contentTypeKey])
         let type = values?.contentType ?? UTType(filenameExtension: url.pathExtension)
         let meta = SharedFile(
@@ -34,7 +50,8 @@ final class PortalStore {
         )
 
         lock.lock()
-        entries[meta.id] = Entry(meta: meta, url: url, securityScopeActive: scopeActive)
+        entries[meta.id] = Entry(meta: meta, url: url, securityScopeActive: scopeActive, bookmark: bookmark)
+        persistLocked()
         lock.unlock()
         return meta
     }
@@ -67,6 +84,7 @@ final class PortalStore {
         lock.lock()
         claimed.remove(id)
         let removed = entries.removeValue(forKey: id)
+        persistLocked()
         lock.unlock()
 
         if let removed, removed.securityScopeActive {
@@ -80,11 +98,57 @@ final class PortalStore {
             claimed.contains(key) ? nil : (key, entry)
         }
         for (id, _) in removable { entries.removeValue(forKey: id) }
+        if !removable.isEmpty { persistLocked() }
         lock.unlock()
 
         for (_, entry) in removable where entry.securityScopeActive {
             entry.url.stopAccessingSecurityScopedResource()
         }
+    }
+
+    private func restore() {
+        guard let data = UserDefaults.standard.data(forKey: stateKey),
+              let saved = try? JSONDecoder().decode([StoredEntry].self, from: data) else { return }
+
+        for stored in saved {
+            var stale = false
+            guard let url = try? URL(
+                resolvingBookmarkData: stored.bookmark,
+                options: [],
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            ), url.startAccessingSecurityScopedResource() else { continue }
+
+            let bookmark: Data
+            if stale {
+                bookmark = (try? url.bookmarkData(
+                    options: [],
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                )) ?? stored.bookmark
+            } else {
+                bookmark = stored.bookmark
+            }
+            entries[stored.meta.id] = Entry(
+                meta: stored.meta,
+                url: url,
+                securityScopeActive: true,
+                bookmark: bookmark
+            )
+        }
+
+        lock.lock()
+        persistLocked()
+        lock.unlock()
+    }
+
+    private func persistLocked() {
+        let saved = entries.values.compactMap { entry -> StoredEntry? in
+            guard let bookmark = entry.bookmark, !bookmark.isEmpty else { return nil }
+            return StoredEntry(meta: entry.meta, bookmark: bookmark)
+        }
+        guard let data = try? JSONEncoder().encode(saved) else { return }
+        UserDefaults.standard.set(data, forKey: stateKey)
     }
 
     var hasActiveTransfers: Bool {

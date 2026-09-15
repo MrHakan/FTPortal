@@ -126,7 +126,7 @@ A typical offer POST looks like:
 }
 ```
 
-The receiving server derives the sender host from the TCP connection instead of trusting a host supplied in JSON. Offer bodies and manifest sizes are bounded.
+The receiving server derives the sender host from the TCP connection instead of trusting a host supplied in JSON. Offer bodies and manifest sizes are bounded. Every v2 manifest entry must have a unique file ID and a known, non-negative byte length; receivers reject malformed manifests and only complete a file after its received length matches the manifest exactly.
 
 ## Platform receive behavior
 

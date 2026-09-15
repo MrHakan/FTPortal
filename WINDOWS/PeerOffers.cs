@@ -63,6 +63,7 @@ internal static class PeerOfferStore
     {
         if (files.Count == 0) throw new InvalidOperationException("No pending files to offer.");
         if (files.Count > MaximumFilesPerOffer) throw new InvalidOperationException("Too many files in one offer.");
+        if (files.Any(file => file.Size < 0)) throw new InvalidOperationException("All v2 offer files must have a known size.");
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var offerId = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
@@ -104,7 +105,11 @@ internal static class PeerOfferStore
         if (wire is null) return null;
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        if (!string.Equals(wire.Protocol, PeerProtocol.VersionV2, StringComparison.Ordinal)) return null;
+        if (!string.Equals(wire.Protocol, PeerProtocol.VersionV2, StringComparison.Ordinal) ||
+            wire.Files is null ||
+            string.IsNullOrWhiteSpace(wire.Token) ||
+            string.IsNullOrWhiteSpace(wire.OfferId) ||
+            string.IsNullOrWhiteSpace(wire.VerificationCode)) return null;
         if (!IsHex(wire.OfferId, 32) || !IsHex(wire.Token, 64)) return null;
         if (string.IsNullOrWhiteSpace(wire.SenderDeviceId) || string.Equals(wire.SenderDeviceId, PeerIdentity.DeviceId(), StringComparison.OrdinalIgnoreCase)) return null;
         if (wire.VerificationCode.Length != 6 || !wire.VerificationCode.All(char.IsDigit)) return null;
@@ -113,7 +118,7 @@ internal static class PeerOfferStore
         if (wire.Files.Count is < 1 or > MaximumFilesPerOffer) return null;
 
         var files = wire.Files
-            .Where(file => !string.IsNullOrWhiteSpace(file.Id) && file.Id.Length <= 64 && file.Id.All(char.IsLetterOrDigit))
+            .Where(file => file is not null && !string.IsNullOrWhiteSpace(file.Id) && file.Id.Length <= 64 && file.Id.All(char.IsLetterOrDigit) && file.Size >= 0)
             .Where(file => !string.IsNullOrWhiteSpace(file.Name) && file.Name.Length <= 255)
             .Select(file => file with
             {
@@ -121,7 +126,7 @@ internal static class PeerOfferStore
                 Mime = string.IsNullOrWhiteSpace(file.Mime) ? "application/octet-stream" : file.Mime[..Math.Min(file.Mime.Length, 128)]
             })
             .ToArray();
-        if (files.Length == 0) return null;
+        if (files.Length != wire.Files.Count || files.Select(file => file.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count() != files.Length) return null;
 
         var alias = string.IsNullOrWhiteSpace(wire.SenderAlias) ? remoteHost : wire.SenderAlias[..Math.Min(wire.SenderAlias.Length, 120)];
         var platform = string.IsNullOrWhiteSpace(wire.SenderPlatform) ? "Unknown" : wire.SenderPlatform[..Math.Min(wire.SenderPlatform.Length, 40)];
@@ -253,16 +258,38 @@ internal static class PeerOfferReceiver
     public static async Task<PeerOfferReceiveResult> ReceiveAllAsync(
         IncomingPeerOffer offer,
         string destinationDirectory,
+        TransferCenter transfers,
         CancellationToken cancellationToken = default)
     {
-        Directory.CreateDirectory(destinationDirectory);
         var completed = new List<string>();
         var failures = new List<string>();
+
+        try
+        {
+            Directory.CreateDirectory(destinationDirectory);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            failures.Add($"Destination unavailable: {TransferError(ex)}");
+            return new PeerOfferReceiveResult(completed, failures);
+        }
 
         foreach (var file in offer.Files)
         {
             var target = UniquePath(destinationDirectory, SafeFileName(file.Name));
             var temp = target + $".ftportal-{Guid.NewGuid():N}.part";
+            var transferId = transfers.Begin(
+                TransferDirection.Receive,
+                file.Name,
+                $"{offer.SenderAlias} ({offer.Host})",
+                file.Size
+            );
+            using var transferCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                transfers.Token(transferId)
+            );
+            var transferToken = transferCancellation.Token;
+            var received = 0L;
             try
             {
                 using var request = new HttpRequestMessage(
@@ -271,34 +298,62 @@ internal static class PeerOfferReceiver
                 );
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", offer.Token);
                 request.Headers.TryAddWithoutValidation("X-FTPortal-Client", PeerProtocol.VersionV2);
-                using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+                using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, transferToken);
                 if (response.StatusCode != HttpStatusCode.OK)
                     throw new IOException($"{file.Name}: peer returned HTTP {(int)response.StatusCode} {response.ReasonPhrase}");
 
-                await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken))
+                await using (var source = await response.Content.ReadAsStreamAsync(transferToken))
                 await using (var destination = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, useAsync: true))
                 {
-                    await source.CopyToAsync(destination, 128 * 1024, cancellationToken);
-                    await destination.FlushAsync(cancellationToken);
+                    var buffer = new byte[128 * 1024];
+                    while (true)
+                    {
+                        var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), transferToken);
+                        if (read == 0) break;
+                        await destination.WriteAsync(buffer.AsMemory(0, read), transferToken);
+                        received += read;
+                        transfers.Update(transferId, received);
+                    }
+                    await destination.FlushAsync(transferToken);
                 }
 
-                var received = new FileInfo(temp).Length;
+                transferToken.ThrowIfCancellationRequested();
+
                 if (file.Size >= 0 && received != file.Size)
                     throw new IOException($"{file.Name}: expected {file.Size:N0} bytes, received {received:N0}");
 
                 File.Move(temp, target);
                 completed.Add(target);
                 PeerOfferStore.MarkIncomingFileComplete(offer.OfferId, file.Id);
+                transfers.Finish(transferId, success: true, finalBytes: received);
             }
-            catch (Exception ex) when (ex is IOException or HttpRequestException or TaskCanceledException or OperationCanceledException)
+            catch (Exception ex) when (ex is IOException or HttpRequestException or UnauthorizedAccessException or ArgumentException or NotSupportedException or OperationCanceledException)
             {
                 try { if (File.Exists(temp)) File.Delete(temp); } catch { }
-                failures.Add(ex.Message);
+                transfers.Finish(transferId, success: false, detail: TransferError(ex), finalBytes: received);
+                failures.Add($"{file.Name}: {TransferError(ex)}");
+                if (transferToken.IsCancellationRequested || cancellationToken.IsCancellationRequested) break;
             }
         }
 
         return new PeerOfferReceiveResult(completed, failures);
     }
+
+    public static Task<PeerOfferReceiveResult> ReceiveAllAsync(
+        IncomingPeerOffer offer,
+        string destinationDirectory,
+        CancellationToken cancellationToken = default) =>
+        ReceiveAllAsync(offer, destinationDirectory, new TransferCenter(), cancellationToken);
+
+    private static string TransferError(Exception error) => error switch
+    {
+        OperationCanceledException => "Transfer cancelled",
+        HttpRequestException => "Peer connection failed",
+        UnauthorizedAccessException => "Destination access denied",
+        FileNotFoundException or DirectoryNotFoundException => "Destination unavailable",
+        IOException => "Transfer I/O error",
+        _ => "Transfer failed"
+    };
 
     private static string SafeFileName(string name)
     {

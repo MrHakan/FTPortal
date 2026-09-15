@@ -64,6 +64,7 @@ object PeerOfferStore {
     fun prepareOutgoing(files: List<SharedFile>): PreparedPeerOffer {
         require(files.isNotEmpty()) { "No pending files to offer" }
         require(files.size <= MAX_FILES_PER_OFFER) { "Too many files in one offer" }
+        require(files.all { it.size >= 0 }) { "All v2 offer files must have a known size" }
         cleanup()
 
         val offerId = randomHex(16)
@@ -107,14 +108,14 @@ object PeerOfferStore {
             for (index in 0 until filesJson.length()) {
                 val item = filesJson.optJSONObject(index) ?: continue
                 val id = item.optString("id")
-                val name = item.optString("name").take(255)
+                val name = item.optString("name")
                 val mime = item.optString("mime", "application/octet-stream").take(128)
                 val size = item.optLong("size", -1L)
-                if (id.isBlank() || id.length > 64 || id.any { !it.isLetterOrDigit() } || name.isBlank()) continue
+                if (id.isBlank() || id.length > 64 || id.any { !it.isLetterOrDigit() } || name.isBlank() || name.length > 255 || size < 0) continue
                 add(PeerOfferFile(id, name, size, mime.ifBlank { "application/octet-stream" }))
             }
         }
-        if (files.isEmpty()) return null
+        if (files.size != filesJson.length() || files.map { it.id.lowercase() }.toSet().size != files.size) return null
 
         if (incoming.size >= MAX_INCOMING_OFFERS && !incoming.containsKey(offerId)) return null
         val offer = IncomingPeerOffer(

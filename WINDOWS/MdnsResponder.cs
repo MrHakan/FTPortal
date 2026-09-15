@@ -7,7 +7,7 @@ namespace FTPortal.Windows;
 internal sealed class MdnsResponder : IAsyncDisposable
 {
     private static readonly IPAddress MulticastAddress = IPAddress.Parse("224.0.0.251");
-    private readonly Func<IPAddress?> _address;
+    private readonly Func<IPAddress?, IPAddress?> _address;
     private readonly CancellationTokenSource _stop = new();
     private UdpClient? _udp;
     private Task? _loop;
@@ -15,7 +15,9 @@ internal sealed class MdnsResponder : IAsyncDisposable
     public bool IsRunning => _udp is not null && _loop is not null && !_loop.IsCompleted;
     public string? LastError { get; private set; }
 
-    public MdnsResponder(Func<IPAddress?> address) => _address = address;
+    public MdnsResponder(Func<IPAddress?> address) : this(_ => address()) { }
+
+    public MdnsResponder(Func<IPAddress?, IPAddress?> address) => _address = address;
 
     public void Start()
     {
@@ -25,7 +27,29 @@ internal sealed class MdnsResponder : IAsyncDisposable
             var udp = new UdpClient(AddressFamily.InterNetwork);
             udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             udp.Client.Bind(new IPEndPoint(IPAddress.Any, 5353));
-            udp.JoinMulticastGroup(MulticastAddress);
+            var joined = false;
+            foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+            {
+                try
+                {
+                    if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                    foreach (var unicast in nic.GetIPProperties().UnicastAddresses)
+                    {
+                        if (unicast.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        try
+                        {
+                            udp.JoinMulticastGroup(MulticastAddress, unicast.Address);
+                            joined = true;
+                        }
+                        catch (SocketException) { }
+                    }
+                }
+                catch
+                {
+                    // An adapter may disappear while mDNS is joining groups.
+                }
+            }
+            if (!joined) udp.JoinMulticastGroup(MulticastAddress);
             _udp = udp;
             LastError = null;
             _loop = Task.Run(RunAsync);
@@ -48,10 +72,13 @@ internal sealed class MdnsResponder : IAsyncDisposable
             {
                 var result = await _udp.ReceiveAsync(_stop.Token);
                 if (!ContainsQuestion(result.Buffer, "ftphakan.local")) continue;
-                var ip = _address();
+                var ip = _address(result.RemoteEndPoint.Address);
                 if (ip is null || ip.AddressFamily != AddressFamily.InterNetwork) continue;
-                var response = BuildAResponse("ftphakan.local", ip);
-                await _udp.SendAsync(response, new IPEndPoint(MulticastAddress, 5353), _stop.Token);
+                var transactionId = result.Buffer.Length >= 2
+                    ? (ushort)((result.Buffer[0] << 8) | result.Buffer[1])
+                    : (ushort)0;
+                var response = BuildAResponse("ftphakan.local", ip, transactionId);
+                await _udp.SendAsync(response, result.RemoteEndPoint, _stop.Token);
                 LastError = null;
             }
             catch (OperationCanceledException)
@@ -97,7 +124,7 @@ internal sealed class MdnsResponder : IAsyncDisposable
         return false;
     }
 
-    private static byte[] BuildAResponse(string name, IPAddress address)
+    private static byte[] BuildAResponse(string name, IPAddress address, ushort transactionId)
     {
         using var stream = new MemoryStream();
         void U16(ushort value)
@@ -113,7 +140,7 @@ internal sealed class MdnsResponder : IAsyncDisposable
             stream.WriteByte((byte)value);
         }
 
-        U16(0);
+        U16(transactionId);
         U16(0x8400);
         U16(0);
         U16(1);

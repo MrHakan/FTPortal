@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using System.Buffers;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Encodings.Web;
@@ -11,13 +12,21 @@ internal sealed class PortalServer : IAsyncDisposable
 {
     private const int MaximumOfferBytes = 128 * 1024;
     private readonly ShareRegistry _shares;
+    private readonly TransferCenter _transfers;
+    private readonly NetworkTransportManager _network;
     private WebApplication? _legacyApp;
     private WebApplication? _peerApp;
 
     public int Port { get; private set; }
     public bool PeerAvailable => _peerApp is not null;
+    public string? PeerError { get; private set; }
 
-    public PortalServer(ShareRegistry shares) => _shares = shares;
+    public PortalServer(ShareRegistry shares, TransferCenter transfers, NetworkTransportManager network)
+    {
+        _shares = shares;
+        _transfers = transfers;
+        _network = network;
+    }
 
     public async Task<int> StartAsync(params int[] ports)
     {
@@ -35,7 +44,7 @@ internal sealed class PortalServer : IAsyncDisposable
                 Port = port;
                 break;
             }
-            catch (Exception ex) when (ex is IOException or SocketException)
+            catch (Exception ex) when (IsPortBindFailure(ex))
             {
                 last = ex;
                 if (candidate is not null) await candidate.DisposeAsync();
@@ -58,11 +67,13 @@ internal sealed class PortalServer : IAsyncDisposable
             candidate = BuildApp(PeerProtocol.Port, legacySurface: false);
             await candidate.StartAsync();
             _peerApp = candidate;
+            PeerError = null;
         }
-        catch
+        catch (Exception ex)
         {
             if (candidate is not null) await candidate.DisposeAsync();
             _peerApp = null;
+            PeerError = ShortError(ex);
         }
     }
 
@@ -84,6 +95,14 @@ internal sealed class PortalServer : IAsyncDisposable
             context.Response.Headers["Referrer-Policy"] = "no-referrer";
             context.Response.Headers["X-Frame-Options"] = "DENY";
             context.Response.Headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
+
+            if (!_network.IsAllowedClient(context.Connection.RemoteIpAddress))
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                await context.Response.WriteAsync("Client is outside the active local network.", context.RequestAborted);
+                return;
+            }
+
             await next();
         });
 
@@ -115,7 +134,24 @@ internal sealed class PortalServer : IAsyncDisposable
         app.MapGet("/", () => Results.Content(Html(), "text/html; charset=utf-8"));
         app.MapGet("/api/state", () => Results.Json(new
         {
-            files = _shares.All().Select(file => new { file.Id, file.Name, file.Size, file.Mime })
+            files = _shares.All().Select(file => new { file.Id, file.Name, file.Size, file.Mime }),
+            transfers = new
+            {
+                active = _transfers.Active().Select(transfer => new
+                {
+                    transfer.Id,
+                    transfer.Direction,
+                    transfer.FileName,
+                    transfer.Peer,
+                    transfer.BytesTransferred,
+                    transfer.TotalBytes,
+                    transfer.ProgressPercent,
+                    transfer.BytesPerSecond,
+                    transfer.EtaSeconds,
+                    transfer.StartedAt
+                }),
+                historyCount = _transfers.History().Count
+            }
         }));
         app.MapMethods("/download/{id}", [HttpMethods.Get, HttpMethods.Head], async (HttpContext context, string id) =>
         {
@@ -222,35 +258,120 @@ internal sealed class PortalServer : IAsyncDisposable
             return;
         }
 
+        var transferId = string.Empty;
+        var transferred = 0L;
         try
         {
-            var currentSize = new FileInfo(file.Path).Length;
+            await using var source = new FileStream(
+                file.Path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                128 * 1024,
+                FileOptions.Asynchronous | FileOptions.SequentialScan
+            );
+            var currentSize = source.Length;
+            transferId = _transfers.Begin(
+                TransferDirection.Send,
+                file.Name,
+                RemotePeer(context),
+                currentSize
+            );
+            using var transferCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                context.RequestAborted,
+                _transfers.Token(transferId)
+            );
+            var transferToken = transferCancellation.Token;
             SetDownloadHeaders(context, file, currentSize, protocolVersion);
-            await context.Response.SendFileAsync(file.Path, context.RequestAborted);
-            if (context.RequestAborted.IsCancellationRequested)
+
+            var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+            try
+            {
+                var remaining = currentSize;
+                while (remaining > 0)
+                {
+                    var read = await source.ReadAsync(
+                        buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)),
+                        transferToken
+                    );
+                    if (read == 0) break;
+                    await context.Response.Body.WriteAsync(buffer.AsMemory(0, read), transferToken);
+                    transferred += read;
+                    remaining -= read;
+                    _transfers.Update(transferId, transferred);
+                }
+
+                if (remaining != 0)
+                {
+                    _shares.Release(id);
+                    _transfers.Finish(transferId, success: false, detail: "Source changed during transfer", finalBytes: transferred);
+                    return;
+                }
+
+                await context.Response.Body.FlushAsync(transferToken);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+
+            if (transferToken.IsCancellationRequested)
             {
                 _shares.Release(id);
+                _transfers.Finish(transferId, success: false, detail: "Connection interrupted", finalBytes: transferred);
             }
             else
             {
                 _shares.Consume(id);
-                onCompleted?.Invoke();
+                try { onCompleted?.Invoke(); } catch { }
+                _transfers.Finish(transferId, success: true, finalBytes: transferred);
             }
         }
         catch (OperationCanceledException)
         {
             _shares.Release(id);
+            if (transferId.Length > 0)
+                _transfers.Finish(transferId, success: false, detail: "Connection interrupted", finalBytes: transferred);
         }
-        catch
+        catch (Exception ex)
         {
             _shares.Release(id);
-            if (!context.Response.HasStarted)
+            if (transferId.Length > 0)
+                _transfers.Finish(transferId, success: false, detail: TransferError(ex), finalBytes: transferred);
+            if (!context.Response.HasStarted && !context.RequestAborted.IsCancellationRequested)
             {
                 context.Response.StatusCode = StatusCodes.Status500InternalServerError;
-                await context.Response.WriteAsync("Transfer failed", context.RequestAborted);
+                await context.Response.WriteAsync("Transfer failed", CancellationToken.None);
             }
         }
     }
+
+    private static string RemotePeer(HttpContext context)
+    {
+        var address = context.Connection.RemoteIpAddress;
+        if (address?.IsIPv4MappedToIPv6 == true) address = address.MapToIPv4();
+        return address?.ToString() ?? "Local network peer";
+    }
+
+    private static string TransferError(Exception error) => error switch
+    {
+        UnauthorizedAccessException => "Source access denied",
+        FileNotFoundException or DirectoryNotFoundException => "Source file unavailable",
+        IOException => "Source I/O error",
+        _ => "Transfer failed"
+    };
+
+    private static bool IsPortBindFailure(Exception error)
+    {
+        for (var current = error; current is not null; current = current.InnerException)
+        {
+            if (current is IOException or SocketException) return true;
+        }
+        return false;
+    }
+
+    private static string ShortError(Exception error) =>
+        string.IsNullOrWhiteSpace(error.Message) ? error.GetType().Name : error.Message;
 
     private static bool ValidId(string id) =>
         !string.IsNullOrWhiteSpace(id) && id.Length <= 64 && id.All(Uri.IsHexDigit);

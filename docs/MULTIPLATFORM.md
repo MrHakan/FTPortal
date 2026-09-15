@@ -14,11 +14,15 @@ The original PowerShell edition remains feature-richer and keeps its existing AP
 
 ## Android
 
-The Android app starts `PortalService` as a foreground service of type `connectedDevice`. `NanoHTTPD` listens on TCP/8080. Android NSD advertises `_http._tcp.`. Files are referenced by Storage Access Framework content URIs and read via `ContentResolver` only when a peer requests them.
+The Android app starts `PortalService` as a foreground service of type `connectedDevice`. `NanoHTTPD` tries TCP/80 first and falls back to TCP/8080; the actual bound port is persisted and used for browser URLs and peer metadata. Android NSD advertises `_ftportal._tcp.` on the separate native peer port. Files are referenced by Storage Access Framework content URIs and read via `ContentResolver` only when a peer requests them.
+
+The Android host rejects public and known VPN-interface clients before routing and checks the remote private IPv4 against an active local interface prefix. Its web port is selected in the order 80 → 8080 and the actual bound port is persisted and advertised.
 
 ## iOS
 
 The iOS app uses `NWListener` and Bonjour. Selected files remain security-scoped URLs. A custom streaming HTTP responder reads 256 KiB chunks from the source file. iOS does not permit a general-purpose third-party app to run an arbitrary local TCP server indefinitely after suspension; the app uses a background task to let an active transfer finish, but reliable hosting requires the app to remain active. This is an operating-system limitation, not a storage limitation.
+
+Selected URLs are persisted as security-scoped bookmarks and restored when possible; stale or unavailable bookmarks are discarded without blocking app startup. Requests are admitted only from loopback or the active local private `/24` fallback.
 
 ## Windows
 
@@ -29,4 +33,8 @@ The Windows executable is a WinForms shell around an ASP.NET Core/Kestrel host. 
 3. Mobile Hotspot / virtual local adapter
 4. Other operational private IPv4 interfaces
 
-When no useful Wi-Fi/LAN interface exists, the dashboard can request Windows Mobile Hotspot through `NetworkOperatorTetheringManager`. The mDNS responder answers A-record requests for `ftphakan.local` with the current preferred local IPv4 address. Port 80 is preferred so the hostname works without an explicit port; 8080 and 8787 are fallback ports.
+When no useful Wi-Fi/LAN interface exists, the dashboard and the transport supervisor can request Windows Mobile Hotspot through `NetworkOperatorTetheringManager`. Automatic attempts are serialized and backed off, and a manual stop temporarily suppresses automatic re-arming. Port 80 is preferred so the hostname works without an explicit port; 8080 and 8787 are fallback ports.
+
+Windows HTTP and peer requests pass an active-bearer admission check before routing. Loopback is allowed for local diagnostics; remote clients must be private IPv4 addresses on a current, non-VPN subnet. Virtual host-only adapters are excluded unless Windows identifies them as a Wi-Fi Direct or Mobile Hotspot transport. Discovery uses the adapter's subnet mask where the host count is bounded, and falls back to a bounded `/24` probe for very large networks.
+
+The native Windows dashboard tracks active send/receive byte counts, smoothed throughput, estimated progress and a bounded metadata-only history. A cancellation releases the one-shot claim and removes any `.part` destination; a successful stream consumes the share only after the response is flushed.
