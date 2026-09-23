@@ -52,6 +52,15 @@ Web browsers do not need the peer protocol and are intentionally excluded from v
 
 The PowerShell edition also remains on its mature existing lobby/router flow rather than duplicating the native v2 peer stack inside the monolithic script.
 
+Windows, Android and iOS now share the same offline `/dashboard` and `/lobby`
+browser views. The lobby shows currently advertised local addresses and native
+peer availability; the dashboard shows one-shot files and browser uploads. The
+webpage does not pretend to offer private recipient selection: use the native
+Nearby view for discovery and v2 offers. PowerShell retains its more advanced
+existing dashboard, sessions, QR enrollment and transport supervisor. See
+[`docs/WEB-PORTAL-OVERHAUL.md`](docs/WEB-PORTAL-OVERHAUL.md) for the endpoint
+contract, test command and remaining cross-platform parity work.
+
 ## Build + collective releases
 
 `.github/workflows/multiplatform-release.yml` builds all four editions in parallel. Pull requests run the same platform build/test jobs without publishing a release. A push to `main`, a `v*` tag, or a manual workflow run produces one GitHub Release containing:

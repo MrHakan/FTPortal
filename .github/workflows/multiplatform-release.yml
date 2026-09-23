@@ -12,6 +12,18 @@ permissions:
   contents: read
 
 jobs:
+  web-portal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check shared dashboard, lobby, and browser contracts
+        run: node --test WEB/tests/portal.test.mjs
+
   powershell:
     runs-on: windows-latest
     steps:
@@ -53,6 +65,8 @@ jobs:
           gradle-version: '8.9'
       - name: Build APK
         run: gradle -p ANDROID :app:assembleRelease --stacktrace
+      - name: Check bundled browser page
+        run: unzip -l ANDROID/app/build/outputs/apk/release/app-release.apk | grep -F 'assets/portal.html'
       - name: Name APK
         run: cp ANDROID/app/build/outputs/apk/release/app-release.apk FTPortal-Android.apk
       - uses: actions/upload-artifact@v7
@@ -75,6 +89,9 @@ jobs:
       - name: Build unsigned device app
         working-directory: IOS
         run: xcodebuild -project FTPortal.xcodeproj -scheme FTPortal -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Check bundled browser page
+        working-directory: IOS
+        run: test -f build/Build/Products/Release-iphoneos/FTPortal.app/portal.html
       - name: Package unsigned IPA
         working-directory: IOS
         run: |

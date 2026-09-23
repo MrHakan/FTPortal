@@ -28,7 +28,8 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
             return commonHeaders(jsonError(Response.Status.FORBIDDEN, "Client is outside the active local network"))
         }
         val response = when {
-            session.method == Method.GET && path == "/" -> newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html())
+            session.method == Method.GET && path in setOf("/", "/dashboard", "/lobby") -> newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", portalHtml())
+            session.method == Method.GET && path == "/api/portal" -> newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", portalJson())
             session.method == Method.GET && path == "/api/state" -> newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", stateJson())
             session.method == Method.POST && path == "/upload" -> receiveBrowserUpload(session, peer)
             session.method == Method.GET && path == PeerProtocol.INFO_PATH_V1 -> newFixedLengthResponse(
@@ -220,6 +221,27 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
         }
         return JSONObject().put("files", files).toString()
     }
+
+    private fun portalJson(): String {
+        val files = JSONArray()
+        ShareRegistry.all().forEach { file ->
+            files.put(JSONObject().put("id", file.id).put("name", file.name).put("size", file.size).put("mime", file.mime))
+        }
+        val port = PortalService.webPort()
+        val urls = JSONArray()
+        NetworkUrls.urls(port).forEach { url ->
+            urls.put(JSONObject().put("url", "$url/dashboard").put("kind", "Local network").put("adapter", "active"))
+        }
+        return JSONObject().put("platform", "Android")
+            .put("alias", PeerIdentity.alias())
+            .put("maxUploadBytes", MAX_UPLOAD_BYTES)
+            .put("lobbyActive", ShareRegistry.all().isNotEmpty() && PortalService.peerAvailable())
+            .put("files", files).put("addresses", urls).toString()
+    }
+
+    private fun portalHtml(): String = runCatching {
+        context.assets.open("portal.html").bufferedReader(Charsets.UTF_8).use { it.readText() }
+    }.getOrElse { html() } // Preserve the original offline browser fallback if the asset is unavailable.
 
     private fun html(): String {
         val receiveRows = ShareRegistry.all().joinToString("\n") { file ->

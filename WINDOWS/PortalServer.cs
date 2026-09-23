@@ -147,6 +147,25 @@ internal sealed class PortalServer : IAsyncDisposable
         if (!legacySurface) return;
 
         app.MapGet("/", () => Results.Content(Html(), "text/html; charset=utf-8"));
+        app.MapGet("/dashboard", () => Results.Content(Html(), "text/html; charset=utf-8"));
+        app.MapGet("/lobby", () => Results.Content(Html(), "text/html; charset=utf-8"));
+        app.MapGet("/api/portal", () => Results.Json(new
+        {
+            platform = "Windows",
+            alias = Environment.MachineName,
+            maxUploadBytes = MaximumBrowserUploadBytes,
+            lobbyActive = _shares.All().Count > 0 && PeerAvailable,
+            peerAvailable = PeerAvailable,
+            peerError = PeerError,
+            files = _shares.All().Select(file => new { file.Id, file.Name, file.Size, file.Mime }),
+            addresses = _network.Snapshot().Where(address => address.Kind == "Hotspot" || !address.IsVirtual)
+                .Select(address => new
+                {
+                    kind = address.Kind,
+                    adapter = address.Adapter,
+                    url = $"http://{address.Address}{(Port == 80 ? "" : $":{Port}")}/dashboard"
+                })
+        }));
         app.MapGet("/api/state", () => Results.Json(new
         {
             files = _shares.All().Select(file => new { file.Id, file.Name, file.Size, file.Mime }),
@@ -554,6 +573,13 @@ internal sealed class PortalServer : IAsyncDisposable
 
     private string Html()
     {
+        using var asset = typeof(PortalServer).Assembly.GetManifestResourceStream("FTPortal.Portal.html");
+        if (asset is not null)
+        {
+            using var reader = new StreamReader(asset, Encoding.UTF8);
+            return reader.ReadToEnd();
+        }
+        // Keep the self-contained legacy page as a packaging fallback.
         var encoder = HtmlEncoder.Default;
         var rows = string.Join("", _shares.All().Select(file =>
             $"<div class='file-row'><div class='file-copy'><strong>{encoder.Encode(file.Name)}</strong><span>{FormatBytes(file.Size)} · ONE-SHOT</span></div><a class='receive-button' href='/download/{file.Id}'>RECEIVE</a></div>"));

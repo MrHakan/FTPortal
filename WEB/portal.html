@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0d0f12">
+  <title>FTPortal · Local File Portal</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0d0f12;--card:#141720;--border:#252c3b;--accent:#4f8ef7;--accent2:#8e6cf7;--text:#e8ecf5;--muted:#9aa7bf;--ok:#4ff78e;--err:#ff8296}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 'Segoe UI',system-ui,sans-serif}
+    button,input{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}
+    header{position:sticky;top:0;z-index:2;background:rgba(20,23,32,.96);border-bottom:1px solid var(--border);padding:14px max(18px,calc((100vw - 1100px)/2));display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+    .brand{font-size:17px;font-weight:700;letter-spacing:.03em}.brand span{margin-right:9px}
+    .head-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.chip{border:1px solid var(--border);background:var(--bg);border-radius:20px;padding:5px 12px;font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 7px var(--ok);margin-right:8px}
+    nav{display:flex;gap:8px}nav a,.btn{display:inline-block;border:1px solid var(--border);color:var(--text);background:var(--card);border-radius:9px;padding:8px 13px;text-decoration:none}nav a.active,.btn.primary{border-color:var(--accent);background:var(--accent);color:white}.btn:hover,nav a:hover{border-color:var(--accent)}
+    main{max-width:1100px;margin:auto;padding:24px 18px 48px}.intro{margin:5px 0 23px}.intro h1{font-size:25px;margin:0 0 4px}.sub,.hint{color:var(--muted)}.hint{font-size:12px}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;min-width:0}.panel h2{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin:0 0 10px}.panel.wide{grid-column:1/-1}
+    .device-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.device{border:1px solid var(--accent);background:rgba(79,142,247,.08);padding:14px;border-radius:11px}.device strong{display:block;margin-top:5px}.device small{color:var(--muted)}
+    .file-row{display:flex;align-items:center;gap:12px;border:1px solid var(--border);border-radius:9px;padding:10px;margin-top:8px;min-width:0}.file-row .name{flex:1;min-width:0;overflow-wrap:anywhere}.file-row small{display:block;color:var(--muted)}.empty{border:1px dashed var(--border);border-radius:10px;text-align:center;padding:25px;color:var(--muted)}
+    .drop{display:block;border:2px dashed var(--border);border-radius:12px;text-align:center;padding:30px 12px;cursor:pointer}.drop.over{border-color:var(--accent);background:rgba(79,142,247,.08)}.drop strong{display:block;margin:4px}.drop small{color:var(--muted);overflow-wrap:anywhere}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px;align-items:center}.progress{width:100%;height:8px;accent-color:var(--accent);margin-top:13px}.status{min-height:20px;margin:8px 0;color:var(--muted)}.status.error{color:var(--err)}.status.success{color:var(--ok)}
+    .address{border:1px solid var(--border);border-radius:9px;padding:11px;margin:8px 0;overflow-wrap:anywhere}.address strong{display:block}.address small{color:var(--muted)}.mono{font-family:ui-monospace,Consolas,monospace;overflow-wrap:anywhere}
+    .note{padding:12px;border:1px solid var(--border);border-radius:9px;color:var(--muted)}.hidden{display:none!important}
+    @media(max-width:700px){header{padding:12px 16px}.grid{grid-template-columns:1fr}.panel.wide{grid-column:auto}main{padding:17px 14px}.intro h1{font-size:21px}}
+  </style>
+</head>
+<body>
+  <header><div class="brand"><span aria-hidden="true">📁</span>LOCAL FILE PORTAL</div><div class="head-right"><span class="chip"><span class="dot"></span><span id="host">Host online</span></span><nav aria-label="Portal"><a href="/dashboard" id="dashLink">Dashboard</a><a href="/lobby" id="lobbyLink">Lobby</a></nav></div></header>
+  <main>
+    <div class="intro"><h1 id="title">Dashboard</h1><div class="sub" id="subtitle">Direct local transfers · no cloud</div></div>
+    <div id="dashboard" class="grid">
+      <section class="panel wide"><h2>Connected device</h2><div id="devices" class="device-grid"></div><p class="hint">This browser is connected to this host. To find other FTPortal devices and send private offers, open the native app's Nearby view.</p></section>
+      <section class="panel"><h2>Receive files · one-shot</h2><div id="files" aria-live="polite"></div></section>
+      <section class="panel"><h2>Transmit files</h2><p class="hint">Files sent here are saved on this host. For private targeted transfers use the native app.</p><input type="file" id="picker" multiple hidden><label for="picker" class="drop" id="drop"><span aria-hidden="true">↑</span><strong>Choose or drop files</strong><small id="selection">No files selected</small></label><div class="actions"><button type="button" id="send" class="btn primary" disabled>Send files</button><button type="button" id="clear" class="btn" disabled>Clear</button></div><progress id="progress" class="progress hidden" max="100" value="0"></progress><div id="uploadStatus" role="status" class="status"></div><p id="limit" class="hint"></p></section>
+    </div>
+    <div id="lobby" class="grid hidden">
+      <section class="panel"><h2>Step 1 · Join local network</h2><p>Connect your other device to the same local Wi-Fi, hotspot, or LAN as this host.</p><div id="addresses"></div><p class="hint">The address shown is for the currently active network. If the network changes, this panel updates automatically.</p></section>
+      <section class="panel"><h2>Step 2 · Open the portal</h2><div class="address mono" id="portalUrl"></div><div class="actions"><button type="button" class="btn primary" id="copy">Copy link</button><a class="btn" href="/dashboard">Open dashboard</a></div><p class="hint">Copy the link or type it on the other device. Browsers can upload or download; the native app offers discovery and accept/decline.</p></section>
+      <section class="panel wide"><h2>Native lobby</h2><div id="lobbyState" class="note"></div><p class="hint">Native ftportal/1 and ftportal/2 endpoints remain available independently of this browser fallback. A failed native peer listener does not stop browser transfers.</p></section>
+    </div>
+  </main>
+  <script>
+  (function(){
+    'use strict';
+    var $=function(id){return document.getElementById(id)},queue=[],uploading=false,mode=location.pathname==='/lobby'?'lobby':'dashboard';
+    $('dashboard').classList.toggle('hidden',mode!=='dashboard');$('lobby').classList.toggle('hidden',mode!=='lobby');
+    $(mode==='lobby'?'lobbyLink':'dashLink').classList.add('active');$('title').textContent=mode==='lobby'?'Lobby':'Dashboard';
+    if(mode==='lobby')$('subtitle').textContent='Join the network, then open this host in a browser';
+    function size(n){if(n<0)return 'stream';if(n<1024)return n+' B';if(n<1048576)return(n/1024).toFixed(1)+' KB';if(n<1073741824)return(n/1048576).toFixed(1)+' MB';return(n/1073741824).toFixed(2)+' GB'}
+    function status(message,kind){$('uploadStatus').textContent=message;$('uploadStatus').className='status '+(kind||'')}
+    function renderQueue(){var total=queue.reduce(function(n,f){return n+f.size},0);$('selection').textContent=queue.length?queue.length+' file(s) · '+size(total):'No files selected';$('send').disabled=uploading||!queue.length;$('clear').disabled=uploading||!queue.length}
+    function add(files){if(uploading)return;Array.prototype.forEach.call(files,function(f){if(!queue.some(function(x){return x.name===f.name&&x.size===f.size&&x.lastModified===f.lastModified}))queue.push(f)});renderQueue()}
+    $('picker').addEventListener('change',function(){add(this.files);this.value='' });$('clear').addEventListener('click',function(){queue=[];renderQueue();status('')});
+    ['dragenter','dragover'].forEach(function(ev){$('drop').addEventListener(ev,function(e){e.preventDefault();$('drop').classList.add('over')})});
+    ['dragleave','drop'].forEach(function(ev){$('drop').addEventListener(ev,function(e){e.preventDefault();$('drop').classList.remove('over')})});
+    $('drop').addEventListener('drop',function(e){add(e.dataTransfer.files)});
+    function upload(file,limit){return new Promise(function(resolve){if(limit>0&&file.size>limit){resolve({ok:false,name:file.name,error:'File exceeds the host upload limit'});return}
+      var body=new FormData(),xhr=new XMLHttpRequest();body.append('file',file,file.name);xhr.open('POST','/upload');
+      xhr.upload.onprogress=function(e){if(e.lengthComputable){$('progress').value=Math.round(100*e.loaded/e.total);status('Sending '+file.name+' · '+size(e.loaded)+' / '+size(e.total))}};
+      xhr.onload=function(){var data={};try{data=JSON.parse(xhr.responseText)}catch(ignore){}resolve({ok:xhr.status>=200&&xhr.status<300&&data.ok!==false,name:file.name,error:data.error||data.msg||'Upload failed'})};
+      xhr.onerror=function(){resolve({ok:false,name:file.name,error:'Connection interrupted'})};xhr.send(body)
+    })}
+    var uploadLimit=0;
+    $('send').addEventListener('click',async function(){if(uploading||!queue.length)return;uploading=true;renderQueue();$('progress').classList.remove('hidden');
+      var pending=queue.slice(),failed=[];for(var i=0;i<pending.length;i++){var result=await upload(pending[i],uploadLimit);if(!result.ok)failed.push(result);$('progress').value=Math.round(100*(i+1)/pending.length)}
+      queue=failed.map(function(r){return pending.find(function(f){return f.name===r.name})}).filter(Boolean);uploading=false;renderQueue();
+      status(failed.length?failed.length+' file(s) failed: '+failed[0].error:pending.length+' file(s) sent successfully',failed.length?'error':'success');
+      setTimeout(function(){$('progress').classList.add('hidden')},1500);refresh()
+    });
+    function textNode(tag,text,className){var n=document.createElement(tag);n.textContent=text;if(className)n.className=className;return n}
+    function render(info){$('host').textContent=(info.alias||info.platform||'Host')+' · '+(info.platform||'FTPortal');
+      uploadLimit=Number(info.maxUploadBytes)||0;$('limit').textContent=uploadLimit?'Host browser upload limit: '+size(uploadLimit):'';
+      var files=$('files');files.replaceChildren();(info.files||[]).forEach(function(f){var row=textNode('div','','file-row'),label=textNode('div',f.name,'name'),meta=textNode('small',size(Number(f.size))+' · ONE-SHOT'),a=textNode('a','↓ Download','btn');a.href='/download/'+encodeURIComponent(f.id);label.appendChild(meta);row.appendChild(label);row.appendChild(a);files.appendChild(row)});
+      if(!files.childElementCount)files.appendChild(textNode('div','No file waiting. Share a file in the native app to make it available here.','empty'));
+      var devices=$('devices');devices.replaceChildren();var card=textNode('div','','device');card.appendChild(textNode('span','● Online'));card.appendChild(textNode('strong',info.alias||info.platform||'This device'));card.appendChild(textNode('small',(info.platform||'FTPortal')+' · browser fallback'));devices.appendChild(card);
+      var addresses=$('addresses');addresses.replaceChildren();(info.addresses||[]).forEach(function(item){var box=textNode('div','','address'),addr=textNode('strong',item.url,'mono');box.appendChild(addr);box.appendChild(textNode('small',(item.kind||'Local network')+' · '+(item.adapter||'active')));addresses.appendChild(box)});
+      if(!addresses.childElementCount)addresses.appendChild(textNode('div','No active local network address. Connect to a local network and retry.','note'));
+      $('portalUrl').textContent=location.origin+'/dashboard';$('lobbyState').textContent=info.lobbyActive?'Ready to share '+info.files.length+' pending one-shot file(s) via ftportal/1 or ftportal/2.':'No files pending. The browser host is ready; share a file in the native app to activate the native lobby.'
+    }
+    async function refresh(){try{var response=await fetch('/api/portal',{cache:'no-store'});if(!response.ok)throw Error('Host unavailable');render(await response.json())}catch(e){if(mode==='lobby')$('lobbyState').textContent='Connection interrupted. Waiting for the host or a new network address.'}}
+    $('copy').addEventListener('click',function(){var url=location.origin+'/dashboard';if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(url).then(function(){$('copy').textContent='Copied'},function(){$('copy').textContent='Copy manually: '+url});else $('copy').textContent='Copy manually: '+url});
+    refresh();setInterval(refresh,4000);window.addEventListener('focus',refresh)
+  })();
+  </script>
+</body>
+</html>

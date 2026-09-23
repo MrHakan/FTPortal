@@ -6,7 +6,12 @@ import java.net.NetworkInterface
 object NetworkUrls {
     fun ipv4Addresses(): List<String> = runCatching {
         NetworkInterface.getNetworkInterfaces().toList()
-            .filter { it.isUp && !it.isLoopback }
+            .filter { network ->
+                val label = "${network.name} ${network.displayName}".lowercase()
+                network.isUp && !network.isLoopback &&
+                    listOf("vpn", "tun", "tap", "wireguard", "tailscale", "zerotier", "hamachi")
+                        .none { label.contains(it) }
+            }
             .flatMap { it.inetAddresses.toList() }
             .filterIsInstance<Inet4Address>()
             .filter { it.isSiteLocalAddress }

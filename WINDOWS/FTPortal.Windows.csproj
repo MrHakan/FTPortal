@@ -14,4 +14,7 @@
     <SelfContained>true</SelfContained>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../WEB/portal.html" LogicalName="FTPortal.Portal.html" />
+  </ItemGroup>
 </Project>
