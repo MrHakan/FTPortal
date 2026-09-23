@@ -35,7 +35,11 @@ class PortalService : Service() {
         @Volatile
         private var boundWebPort: Int = 0
 
+        @Volatile
+        private var boundPeerPort: Boolean = false
+
         fun webPort(): Int = boundWebPort.takeIf { it > 0 } ?: PRIMARY_WEB_PORT
+        fun peerAvailable(): Boolean = boundPeerPort
     }
 
     private var legacyServer: PortalServer? = null
@@ -53,6 +57,7 @@ class PortalService : Service() {
         TransferCenter.initialize(applicationContext)
         HostPreferences.setServiceRunning(applicationContext, true)
         HostPreferences.setBoundWebPort(applicationContext, 0)
+        boundPeerPort = false
         createChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
@@ -66,6 +71,7 @@ class PortalService : Service() {
             peerServer = PortalServer(applicationContext, PeerProtocol.PEER_PORT).also {
                 it.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             }
+            boundPeerPort = true
         }.onFailure {
             Log.w(TAG, "Peer protocol port unavailable; web host remains active", it)
         }
@@ -100,6 +106,7 @@ class PortalService : Service() {
         nsd = null
         peerServer?.stop()
         peerServer = null
+        boundPeerPort = false
         legacyServer?.stop()
         legacyServer = null
         boundWebPort = 0

@@ -140,8 +140,13 @@ final class PortalServer {
             return
         }
 
-        if method == "GET" && path == "/" {
+        if method == "GET" && (path == "/" || path == "/dashboard" || path == "/lobby") {
             sendHtml(connection)
+        } else if method == "GET" && path == "/qr.js" {
+            let data = Bundle.main.url(forResource: "qr", withExtension: "js").flatMap { try? Data(contentsOf: $0) } ?? Data("/* QR unavailable */".utf8)
+            sendResponse(connection, status: "200 OK", contentType: "application/javascript; charset=utf-8", data: data)
+        } else if method == "GET" && path == "/api/portal" {
+            sendPortal(connection)
         } else if method == "GET" && path == "/api/state" {
             sendState(connection)
         } else if method == "POST" && path == "/upload" {
@@ -364,7 +369,29 @@ final class PortalServer {
         }
     }
 
+    private func sendPortal(_ connection: NWConnection) {
+        let files = PortalStore.shared.all()
+        let addresses: [[String: String]] = Self.localIPv4().map { address in
+            ["url": "http://\(address):\(Self.legacyPort)/dashboard", "kind": "Local network", "adapter": "active"]
+        }
+        let payload: [String: Any] = [
+            "platform": "iOS", "alias": PeerIdentity.alias(),
+            "maxUploadBytes": maximumBrowserUploadBytes,
+            "lobbyActive": !files.isEmpty && peerListener != nil,
+            "files": files.map { ["id": $0.id, "name": $0.name, "size": $0.size, "mime": $0.mime] as [String: Any] },
+            "addresses": addresses
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
+        sendResponse(connection, status: "200 OK", contentType: "application/json; charset=utf-8", data: data)
+    }
+
     private func sendHtml(_ connection: NWConnection) {
+        if let asset = Bundle.main.url(forResource: "portal", withExtension: "html"),
+           let data = try? Data(contentsOf: asset) {
+            sendResponse(connection, status: "200 OK", contentType: "text/html; charset=utf-8", data: data)
+            return
+        }
+        // Keep the built-in legacy page when the app bundle lacks the shared asset.
         let rows = PortalStore.shared.all().map { file in
             "<div class='file-row'><div class='file-copy'><strong>\(html(file.name))</strong><span>\(formatBytes(file.size)) · ONE-SHOT</span></div><a class='receive-button' href='/download/\(file.id)'>RECEIVE</a></div>"
         }.joined()
@@ -527,7 +554,7 @@ final class PortalServer {
         "Cache-Control: no-store\r\n" +
         "X-Content-Type-Options: nosniff\r\n" +
         "Referrer-Policy: no-referrer\r\n" +
-            "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'\r\n"
+            "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'\r\n"
     }
 
     private func attachmentDisposition(_ name: String) -> String {

@@ -109,7 +109,7 @@ internal sealed class PortalServer : IAsyncDisposable
             context.Response.Headers["X-Content-Type-Options"] = "nosniff";
             context.Response.Headers["Referrer-Policy"] = "no-referrer";
             context.Response.Headers["X-Frame-Options"] = "DENY";
-            context.Response.Headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'";
+            context.Response.Headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'";
 
             if (!_network.IsAllowedClient(context.Connection.RemoteIpAddress))
             {
@@ -147,6 +147,26 @@ internal sealed class PortalServer : IAsyncDisposable
         if (!legacySurface) return;
 
         app.MapGet("/", () => Results.Content(Html(), "text/html; charset=utf-8"));
+        app.MapGet("/dashboard", () => Results.Content(Html(), "text/html; charset=utf-8"));
+        app.MapGet("/lobby", () => Results.Content(Html(), "text/html; charset=utf-8"));
+        app.MapGet("/qr.js", () => Results.Content(EmbeddedAsset("FTPortal.QR.js") ?? "/* QR unavailable */", "application/javascript; charset=utf-8"));
+        app.MapGet("/api/portal", () => Results.Json(new
+        {
+            platform = "Windows",
+            alias = Environment.MachineName,
+            maxUploadBytes = MaximumBrowserUploadBytes,
+            lobbyActive = _shares.All().Count > 0 && PeerAvailable,
+            peerAvailable = PeerAvailable,
+            peerError = PeerError,
+            files = _shares.All().Select(file => new { file.Id, file.Name, file.Size, file.Mime }),
+            addresses = _network.Snapshot().Where(address => address.Kind == "Hotspot" || !address.IsVirtual)
+                .Select(address => new
+                {
+                    kind = address.Kind,
+                    adapter = address.Adapter,
+                    url = $"http://{address.Address}{(Port == 80 ? "" : $":{Port}")}/dashboard"
+                })
+        }));
         app.MapGet("/api/state", () => Results.Json(new
         {
             files = _shares.All().Select(file => new { file.Id, file.Name, file.Size, file.Mime }),
@@ -554,6 +574,9 @@ internal sealed class PortalServer : IAsyncDisposable
 
     private string Html()
     {
+        var page = EmbeddedAsset("FTPortal.Portal.html");
+        if (page is not null) return page;
+        // Keep the self-contained legacy page as a packaging fallback.
         var encoder = HtmlEncoder.Default;
         var rows = string.Join("", _shares.All().Select(file =>
             $"<div class='file-row'><div class='file-copy'><strong>{encoder.Encode(file.Name)}</strong><span>{FormatBytes(file.Size)} · ONE-SHOT</span></div><a class='receive-button' href='/download/{file.Id}'>RECEIVE</a></div>"));
@@ -575,6 +598,14 @@ internal sealed class PortalServer : IAsyncDisposable
 <script>(function(){var input=document.getElementById('txFile'),zone=document.getElementById('dropZone'),button=document.getElementById('txButton'),name=document.getElementById('fileName'),wrap=document.getElementById('progressWrap'),bar=document.getElementById('progressBar'),text=document.getElementById('progressText'),size=document.getElementById('progressSize'),result=document.getElementById('result'),selected=null;function fmt(bytes){if(bytes<1024)return bytes+' B';if(bytes<1048576)return(bytes/1024).toFixed(1)+' KB';if(bytes<1073741824)return(bytes/1048576).toFixed(1)+' MB';return(bytes/1073741824).toFixed(2)+' GB'}function choose(file){selected=file||null;name.textContent=selected?selected.name+' · '+fmt(selected.size):'Nothing selected';button.disabled=!selected;result.textContent=''}input.addEventListener('change',function(){choose(input.files&&input.files[0])});['dragenter','dragover'].forEach(function(ev){zone.addEventListener(ev,function(e){e.preventDefault();zone.classList.add('active')})});['dragleave','drop'].forEach(function(ev){zone.addEventListener(ev,function(e){e.preventDefault();zone.classList.remove('active')})});zone.addEventListener('drop',function(e){if(e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0])choose(e.dataTransfer.files[0])});button.addEventListener('click',function(){if(!selected)return;var data=new FormData();data.append('file',selected,selected.name);var xhr=new XMLHttpRequest();xhr.open('POST','/upload',true);button.disabled=true;wrap.style.display='block';result.textContent='';xhr.upload.onprogress=function(e){if(!e.lengthComputable)return;var p=Math.min(100,Math.round(e.loaded/e.total*100));bar.style.width=p+'%';text.textContent=p+'%';size.textContent=fmt(e.loaded)+' / '+fmt(e.total)};xhr.onload=function(){button.disabled=false;if(xhr.status>=200&&xhr.status<300){bar.style.width='100%';text.textContent='100%';result.textContent='Received by Windows · Downloads/FTPortal';selected=null;input.value='';name.textContent='Nothing selected';button.disabled=true}else{var msg='Transfer failed';try{msg=JSON.parse(xhr.responseText).error||msg}catch(ignore){}result.textContent=msg}};xhr.onerror=function(){button.disabled=false;result.textContent='Connection interrupted'};xhr.send(data)})})();</script>
 </body></html>
 """;
+    }
+
+    private static string? EmbeddedAsset(string name)
+    {
+        using var asset = typeof(PortalServer).Assembly.GetManifestResourceStream(name);
+        if (asset is null) return null;
+        using var reader = new StreamReader(asset, Encoding.UTF8);
+        return reader.ReadToEnd();
     }
 
     private static string FormatBytes(long bytes) => bytes switch

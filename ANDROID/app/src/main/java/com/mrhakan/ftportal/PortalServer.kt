@@ -28,7 +28,9 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
             return commonHeaders(jsonError(Response.Status.FORBIDDEN, "Client is outside the active local network"))
         }
         val response = when {
-            session.method == Method.GET && path == "/" -> newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html())
+            session.method == Method.GET && path in setOf("/", "/dashboard", "/lobby") -> newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", portalHtml())
+            session.method == Method.GET && path == "/qr.js" -> newFixedLengthResponse(Response.Status.OK, "application/javascript; charset=utf-8", assetText("qr.js") ?: "/* QR unavailable */")
+            session.method == Method.GET && path == "/api/portal" -> newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", portalJson())
             session.method == Method.GET && path == "/api/state" -> newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", stateJson())
             session.method == Method.POST && path == "/upload" -> receiveBrowserUpload(session, peer)
             session.method == Method.GET && path == PeerProtocol.INFO_PATH_V1 -> newFixedLengthResponse(
@@ -221,6 +223,29 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
         return JSONObject().put("files", files).toString()
     }
 
+    private fun portalJson(): String {
+        val files = JSONArray()
+        ShareRegistry.all().forEach { file ->
+            files.put(JSONObject().put("id", file.id).put("name", file.name).put("size", file.size).put("mime", file.mime))
+        }
+        val port = PortalService.webPort()
+        val urls = JSONArray()
+        NetworkUrls.urls(port).forEach { url ->
+            urls.put(JSONObject().put("url", "$url/dashboard").put("kind", "Local network").put("adapter", "active"))
+        }
+        return JSONObject().put("platform", "Android")
+            .put("alias", PeerIdentity.alias())
+            .put("maxUploadBytes", MAX_UPLOAD_BYTES)
+            .put("lobbyActive", ShareRegistry.all().isNotEmpty() && PortalService.peerAvailable())
+            .put("files", files).put("addresses", urls).toString()
+    }
+
+    private fun assetText(name: String): String? = runCatching {
+        context.assets.open(name).bufferedReader(Charsets.UTF_8).use { it.readText() }
+    }.getOrNull()
+
+    private fun portalHtml(): String = assetText("portal.html") ?: html()
+
     private fun html(): String {
         val receiveRows = ShareRegistry.all().joinToString("\n") { file ->
             val size = if (file.size >= 0) formatBytes(file.size) else "STREAM"
@@ -315,7 +340,7 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
         addHeader("Cache-Control", "no-store")
         addHeader("X-Content-Type-Options", "nosniff")
         addHeader("Referrer-Policy", "no-referrer")
-        addHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'")
+        addHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'")
     }
 
     private fun htmlEsc(value: String) = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")

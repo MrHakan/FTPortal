@@ -7,6 +7,8 @@ android {
     namespace = "com.mrhakan.ftportal"
     compileSdk = 35
 
+    sourceSets.getByName("main").assets.srcDir("../../WEB")
+
     defaultConfig {
         applicationId = "com.mrhakan.ftportal"
         minSdk = 26
