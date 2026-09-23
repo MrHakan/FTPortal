@@ -142,6 +142,9 @@ final class PortalServer {
 
         if method == "GET" && (path == "/" || path == "/dashboard" || path == "/lobby") {
             sendHtml(connection)
+        } else if method == "GET" && path == "/qr.js" {
+            let data = Bundle.main.url(forResource: "qr", withExtension: "js").flatMap { try? Data(contentsOf: $0) } ?? Data("/* QR unavailable */".utf8)
+            sendResponse(connection, status: "200 OK", contentType: "application/javascript; charset=utf-8", data: data)
         } else if method == "GET" && path == "/api/portal" {
             sendPortal(connection)
         } else if method == "GET" && path == "/api/state" {
@@ -551,7 +554,7 @@ final class PortalServer {
         "Cache-Control: no-store\r\n" +
         "X-Content-Type-Options: nosniff\r\n" +
         "Referrer-Policy: no-referrer\r\n" +
-            "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'\r\n"
+            "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'\r\n"
     }
 
     private func attachmentDisposition(_ name: String) -> String {

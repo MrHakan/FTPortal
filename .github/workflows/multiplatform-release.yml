@@ -66,7 +66,9 @@ jobs:
       - name: Build APK
         run: gradle -p ANDROID :app:assembleRelease --stacktrace
       - name: Check bundled browser page
-        run: unzip -l ANDROID/app/build/outputs/apk/release/app-release.apk | grep -F 'assets/portal.html'
+        run: |
+          unzip -l ANDROID/app/build/outputs/apk/release/app-release.apk | grep -F 'assets/portal.html'
+          unzip -l ANDROID/app/build/outputs/apk/release/app-release.apk | grep -F 'assets/qr.js'
       - name: Name APK
         run: cp ANDROID/app/build/outputs/apk/release/app-release.apk FTPortal-Android.apk
       - uses: actions/upload-artifact@v7
@@ -91,7 +93,9 @@ jobs:
         run: xcodebuild -project FTPortal.xcodeproj -scheme FTPortal -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
       - name: Check bundled browser page
         working-directory: IOS
-        run: test -f build/Build/Products/Release-iphoneos/FTPortal.app/portal.html
+        run: |
+          test -f build/Build/Products/Release-iphoneos/FTPortal.app/portal.html
+          test -f build/Build/Products/Release-iphoneos/FTPortal.app/qr.js
       - name: Package unsigned IPA
         working-directory: IOS
         run: |

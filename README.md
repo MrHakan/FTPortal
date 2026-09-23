@@ -53,8 +53,10 @@ Web browsers do not need the peer protocol and are intentionally excluded from v
 The PowerShell edition also remains on its mature existing lobby/router flow rather than duplicating the native v2 peer stack inside the monolithic script.
 
 Windows, Android and iOS now share the same offline `/dashboard` and `/lobby`
-browser views. The lobby shows currently advertised local addresses and native
-peer availability; the dashboard shows one-shot files and browser uploads. The
+browser views, visually aligned with the original FTPHAKAN dashboard and
+PowerShell lobby. The lobby shows a local address QR, active bearer addresses
+and native peer availability; the dashboard shows an invite QR, file queue,
+one-shot transfers and browser uploads. The
 webpage does not pretend to offer private recipient selection: use the native
 Nearby view for discovery and v2 offers. PowerShell retains its more advanced
 existing dashboard, sessions, QR enrollment and transport supervisor. See

@@ -1,83 +1,183 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0d0f12">
   <title>FTPortal · Local File Portal</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%81%3C/text%3E%3C/svg%3E">
   <style>
-    :root{color-scheme:dark;--bg:#0d0f12;--card:#141720;--border:#252c3b;--accent:#4f8ef7;--accent2:#8e6cf7;--text:#e8ecf5;--muted:#9aa7bf;--ok:#4ff78e;--err:#ff8296}
-    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 'Segoe UI',system-ui,sans-serif}
-    button,input{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}
-    header{position:sticky;top:0;z-index:2;background:rgba(20,23,32,.96);border-bottom:1px solid var(--border);padding:14px max(18px,calc((100vw - 1100px)/2));display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-    .brand{font-size:17px;font-weight:700;letter-spacing:.03em}.brand span{margin-right:9px}
-    .head-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.chip{border:1px solid var(--border);background:var(--bg);border-radius:20px;padding:5px 12px;font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 7px var(--ok);margin-right:8px}
-    nav{display:flex;gap:8px}nav a,.btn{display:inline-block;border:1px solid var(--border);color:var(--text);background:var(--card);border-radius:9px;padding:8px 13px;text-decoration:none}nav a.active,.btn.primary{border-color:var(--accent);background:var(--accent);color:white}.btn:hover,nav a:hover{border-color:var(--accent)}
-    main{max-width:1100px;margin:auto;padding:24px 18px 48px}.intro{margin:5px 0 23px}.intro h1{font-size:25px;margin:0 0 4px}.sub,.hint{color:var(--muted)}.hint{font-size:12px}
-    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;min-width:0}.panel h2{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin:0 0 10px}.panel.wide{grid-column:1/-1}
-    .device-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.device{border:1px solid var(--accent);background:rgba(79,142,247,.08);padding:14px;border-radius:11px}.device strong{display:block;margin-top:5px}.device small{color:var(--muted)}
-    .file-row{display:flex;align-items:center;gap:12px;border:1px solid var(--border);border-radius:9px;padding:10px;margin-top:8px;min-width:0}.file-row .name{flex:1;min-width:0;overflow-wrap:anywhere}.file-row small{display:block;color:var(--muted)}.empty{border:1px dashed var(--border);border-radius:10px;text-align:center;padding:25px;color:var(--muted)}
-    .drop{display:block;border:2px dashed var(--border);border-radius:12px;text-align:center;padding:30px 12px;cursor:pointer}.drop.over{border-color:var(--accent);background:rgba(79,142,247,.08)}.drop strong{display:block;margin:4px}.drop small{color:var(--muted);overflow-wrap:anywhere}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px;align-items:center}.progress{width:100%;height:8px;accent-color:var(--accent);margin-top:13px}.status{min-height:20px;margin:8px 0;color:var(--muted)}.status.error{color:var(--err)}.status.success{color:var(--ok)}
-    .address{border:1px solid var(--border);border-radius:9px;padding:11px;margin:8px 0;overflow-wrap:anywhere}.address strong{display:block}.address small{color:var(--muted)}.mono{font-family:ui-monospace,Consolas,monospace;overflow-wrap:anywhere}
-    .note{padding:12px;border:1px solid var(--border);border-radius:9px;color:var(--muted)}.hidden{display:none!important}
-    @media(max-width:700px){header{padding:12px 16px}.grid{grid-template-columns:1fr}.panel.wide{grid-column:auto}main{padding:17px 14px}.intro h1{font-size:21px}}
+    :root{color-scheme:dark;--bg:#0d0f12;--card:#141720;--border:#252c3b;--accent:#4f8ef7;--accent2:#8e6cf7;--text:#e8ecf5;--muted:#9aa7bf;--ok:#4ff78e;--err:#f74f6a;--warn:#f7c14f}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 'Segoe UI',system-ui,sans-serif;min-height:100vh}
+    button,input{font:inherit}button{cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}
+    header{position:sticky;top:0;z-index:10;background:rgba(20,23,32,.94);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+    .brand{display:flex;align-items:center;gap:11px}.brand .icon{font-size:24px}.brand h1{font-size:16px;letter-spacing:.5px;margin:0}
+    .hdr-right{display:flex;align-items:center;gap:10px;font-size:13px;flex-wrap:wrap}
+    .me-chip{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--border);padding:6px 12px;border-radius:20px}
+    .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok);display:inline-block}
+    .hbtn,.btn{border-radius:9px;text-decoration:none;font-size:13px;display:inline-block}
+    .hbtn{background:transparent;border:1px solid var(--border);color:var(--muted);padding:6px 12px}.hbtn:hover,.hbtn.on{color:var(--accent);border-color:var(--accent)}
+    .btn{background:var(--accent);border:1px solid var(--accent);padding:10px 18px;color:#fff;font-weight:600}.btn:hover{filter:brightness(1.1)}
+    .btn.ghost{background:transparent;border-color:var(--border);color:var(--muted)}.btn.ghost:hover{color:var(--text);border-color:var(--accent)}
+    main{max-width:1100px;margin:auto;padding:24px}
+    .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:22px;overflow-x:auto}
+    .panel h2{font-size:13px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);margin:0 0 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+    .target-chip{background:rgba(79,142,247,.15);color:var(--accent);padding:4px 10px;border-radius:14px;font-size:12px;text-transform:none;letter-spacing:0;font-weight:600}
+    .hint{color:var(--muted);font-size:12px;margin:10px 0 0;line-height:1.55}.sub{color:var(--muted);margin:-7px 0 15px}
+    .connect-flex{display:flex;gap:26px;align-items:center;flex-wrap:wrap}.url-box{font-size:16px;font-weight:600;background:var(--bg);padding:11px 15px;border-radius:9px;border:1px solid var(--border);margin-bottom:12px;overflow-wrap:anywhere}
+    .qr{background:#fff;padding:10px;border-radius:10px;line-height:0;min-width:190px;min-height:190px;display:flex;align-items:center;justify-content:center}.qr canvas,.qr img{display:block;max-width:100%}
+    .dev-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
+    .dev{background:var(--bg);border:1px solid var(--border);border-radius:11px;padding:14px;display:flex;flex-direction:column;gap:4px;position:relative;min-height:96px}
+    .dev.public{background:linear-gradient(135deg,rgba(79,142,247,.08),rgba(142,108,247,.08));border-color:rgba(79,142,247,.3)}
+    .dev.self{border-style:dashed}.dev-icon{font-size:22px}.dev-name{font-size:14px;font-weight:600;overflow-wrap:anywhere}.dev-sub{font-size:11px;color:var(--muted)}.dev-status{position:absolute;top:10px;right:10px;width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
+    .drop{display:block;border:2px dashed var(--border);border-radius:12px;padding:34px;text-align:center;color:var(--muted);cursor:pointer;transition:all .2s}.drop.over{border-color:var(--accent);background:rgba(79,142,247,.06);color:var(--text)}.drop .big{font-size:36px;margin-bottom:8px}
+    .filelist{display:flex;flex-direction:column;gap:8px;margin:14px 0 0}.fileitem{display:flex;align-items:center;gap:12px;padding:9px 13px;background:var(--bg);border:1px solid var(--border);border-radius:10px;font-size:13px}
+    .fi-ic{font-size:18px}.fi-name{flex:1;overflow-wrap:anywhere}.fi-size,.fi-stat{font-size:12px;color:var(--muted);white-space:nowrap}.fi-stat.ok{color:var(--ok)}.fi-stat.err{color:var(--err)}.fi-x{color:var(--err);background:none;border:0;padding:3px 7px}
+    .up-row{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}.count-lbl{color:var(--muted);font-size:13px;margin-left:auto}
+    .bar-wrap{display:none;margin-top:14px;background:var(--bg);border-radius:30px;overflow:hidden;height:8px;border:1px solid var(--border)}.bar-wrap.show{display:block}.bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .12s}
+    .up-stats{margin-top:8px;font-size:12px;color:var(--muted);text-align:right;min-height:15px;font-variant-numeric:tabular-nums}
+    .txt-row{display:flex;gap:10px;margin-top:14px}.txt-row input{flex:1;min-width:0;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:9px;color:var(--text);outline:none}.txt-row input:focus{border-color:var(--accent)}
+    .tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}.tab{padding:6px 14px;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:8px;font-size:13px}.tab.on{background:rgba(79,142,247,.15);color:var(--accent);border-color:var(--accent)}
+    table{width:100%;border-collapse:collapse}th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);padding:8px 10px;border-bottom:1px solid var(--border)}td{padding:11px 10px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle}tr:last-child td{border-bottom:0}tr:hover td{background:rgba(79,142,247,.04)}.td-nm{overflow-wrap:anywhere}.dt{color:var(--muted);font-size:12px;white-space:nowrap}
+    .pill{display:inline-block;padding:2px 8px;border-radius:11px;font-size:11px;background:rgba(79,142,247,.12);color:var(--accent)}.pill.me{background:rgba(79,247,142,.12);color:var(--ok)}.dl{color:var(--accent);text-decoration:none;white-space:nowrap}.dl:hover{text-decoration:underline}.empty{text-align:center;color:var(--muted);padding:28px}
+    .toast-box{position:fixed;right:22px;bottom:22px;z-index:50;display:flex;flex-direction:column;gap:10px}.toast{padding:12px 18px;border-radius:10px;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.5);background:#15243a;border:1px solid var(--accent);color:var(--text);max-width:min(380px,90vw)}.toast.err{background:#321016;border-color:var(--err);color:var(--err)}.toast.ok{background:#16321f;border-color:var(--ok);color:var(--ok)}
+    .hidden{display:none!important}
+    .lobby-intro h1{font-size:26px;margin:0 0 4px}.step-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:22px;align-items:start}.step-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;min-width:0}.step{color:var(--accent);font-size:12px;letter-spacing:.09em;text-transform:uppercase}.step-card h2{font-size:19px;margin:4px 0 14px}.step-card .qr{width:212px;height:212px;margin-bottom:16px}.address{font-family:ui-monospace,Consolas,monospace;color:var(--ok);overflow-wrap:anywhere;font-size:16px}
+    .bchip{display:inline-flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--border);border-radius:20px;padding:6px 13px;margin:6px 6px 0 0;color:var(--muted);font-size:12px}.bchip.pri{border-color:var(--accent);color:var(--text)}.bchip i{width:8px;height:8px;border-radius:50%;background:var(--ok)}
+    .lobby-status{margin-top:24px;color:var(--muted)}.lobby-status strong{color:var(--text)}.warning{color:var(--warn);border:1px solid var(--warn);border-radius:9px;padding:10px 14px;margin-top:16px;font-size:12px}
+    @media(max-width:680px){header{padding:12px 14px}main{padding:14px}.panel{padding:16px}.step-grid{grid-template-columns:1fr}.txt-row{flex-wrap:wrap}.txt-row input{flex-basis:100%}th:nth-child(4),td:nth-child(4){display:none}}
   </style>
 </head>
 <body>
-  <header><div class="brand"><span aria-hidden="true">📁</span>LOCAL FILE PORTAL</div><div class="head-right"><span class="chip"><span class="dot"></span><span id="host">Host online</span></span><nav aria-label="Portal"><a href="/dashboard" id="dashLink">Dashboard</a><a href="/lobby" id="lobbyLink">Lobby</a></nav></div></header>
-  <main>
-    <div class="intro"><h1 id="title">Dashboard</h1><div class="sub" id="subtitle">Direct local transfers · no cloud</div></div>
-    <div id="dashboard" class="grid">
-      <section class="panel wide"><h2>Connected device</h2><div id="devices" class="device-grid"></div><p class="hint">This browser is connected to this host. To find other FTPortal devices and send private offers, open the native app's Nearby view.</p></section>
-      <section class="panel"><h2>Receive files · one-shot</h2><div id="files" aria-live="polite"></div></section>
-      <section class="panel"><h2>Transmit files</h2><p class="hint">Files sent here are saved on this host. For private targeted transfers use the native app.</p><input type="file" id="picker" multiple hidden><label for="picker" class="drop" id="drop"><span aria-hidden="true">↑</span><strong>Choose or drop files</strong><small id="selection">No files selected</small></label><div class="actions"><button type="button" id="send" class="btn primary" disabled>Send files</button><button type="button" id="clear" class="btn" disabled>Clear</button></div><progress id="progress" class="progress hidden" max="100" value="0"></progress><div id="uploadStatus" role="status" class="status"></div><p id="limit" class="hint"></p></section>
+  <header>
+    <div class="brand"><span class="icon" aria-hidden="true">📁</span><h1>LOCAL FILE PORTAL</h1></div>
+    <div class="hdr-right">
+      <div class="me-chip"><span class="dot"></span><span>Host:</span><b id="myNick">FTPortal</b></div>
+      <span id="onlineCount" class="hint">Local · no cloud</span>
+      <button type="button" class="hbtn" id="inviteBtn">🔗 Invite</button>
+      <button type="button" class="hbtn" id="notifBtn" title="Sound and browser notifications">🔔</button>
+      <a class="hbtn" href="/dashboard" id="dashboardLink">Dashboard</a>
+      <a class="hbtn" href="/lobby" id="lobbyLink">Lobby</a>
     </div>
-    <div id="lobby" class="grid hidden">
-      <section class="panel"><h2>Step 1 · Join local network</h2><p>Connect your other device to the same local Wi-Fi, hotspot, or LAN as this host.</p><div id="addresses"></div><p class="hint">The address shown is for the currently active network. If the network changes, this panel updates automatically.</p></section>
-      <section class="panel"><h2>Step 2 · Open the portal</h2><div class="address mono" id="portalUrl"></div><div class="actions"><button type="button" class="btn primary" id="copy">Copy link</button><a class="btn" href="/dashboard">Open dashboard</a></div><p class="hint">Copy the link or type it on the other device. Browsers can upload or download; the native app offers discovery and accept/decline.</p></section>
-      <section class="panel wide"><h2>Native lobby</h2><div id="lobbyState" class="note"></div><p class="hint">Native ftportal/1 and ftportal/2 endpoints remain available independently of this browser fallback. A failed native peer listener does not stop browser transfers.</p></section>
-    </div>
+  </header>
+  <main id="dashboard">
+    <section class="panel hidden" id="connectPanel">
+      <h2>Invite a Device</h2>
+      <div class="connect-flex"><div>
+        <div class="url-box" id="urlBox"></div>
+        <button type="button" class="btn" id="copyUrl">📋 Copy Link</button>
+        <p class="hint">Other device must be on the same local network. Scan the QR or open the address.</p>
+      </div><div class="qr" id="inviteQr" aria-label="Portal address QR"></div></div>
+    </section>
+    <section class="panel">
+      <h2>Connected Devices <span class="target-chip">This host · browser fallback</span></h2>
+      <div id="devices" class="dev-grid"></div>
+      <p class="hint">Private offers to nearby FTPortal devices are available in the native app's Nearby view.</p>
+    </section>
+    <section class="panel">
+      <h2>Send Files</h2>
+      <input type="file" id="file" multiple hidden>
+      <label class="drop" id="drop" for="file"><div class="big">📤</div>
+        <div>Drag &amp; drop files here or click to select</div>
+        <span class="hint">Sent directly to this host. No cloud.</span>
+      </label>
+      <div id="fileList" class="filelist"></div>
+      <div class="up-row"><button type="button" class="btn" id="upBtn" disabled>Send</button>
+        <button type="button" class="btn ghost hidden" id="clearBtn">Clear</button>
+        <span class="count-lbl" id="countLbl"></span></div>
+      <div class="bar-wrap" id="barWrap"><div class="bar" id="bar"></div></div>
+      <div class="up-stats" id="upStats" role="status"></div>
+      <div class="txt-row"><input type="text" id="txtMsg" placeholder="Quick note or link... (sent as .txt)" maxlength="4000">
+        <button type="button" class="btn ghost" id="txtBtn">Send Text</button></div>
+      <p class="hint" id="limit"></p>
+    </section>
+    <section class="panel">
+      <h2>Transfers</h2>
+      <div class="tabs"><button type="button" class="tab on" data-filter="all">All</button>
+        <button type="button" class="tab" data-filter="available">Available</button>
+        <button type="button" class="tab" data-filter="sent">Sent this session</button></div>
+      <table><thead><tr><th></th><th>File</th><th>Size</th><th>From / To</th><th>Date</th><th></th></tr></thead><tbody id="transferBody"></tbody></table>
+      <p class="hint">Available files are one-shot: successful downloads consume the share. “Sent this session” is a browser-only view, not server history.</p>
+    </section>
   </main>
+  <main id="lobby" class="hidden">
+    <div class="lobby-intro"><h1>FTPortal</h1><p class="sub">Local network · this device is the host</p></div>
+    <div class="step-grid">
+      <section class="step-card"><div class="step">Step 1</div><h2>Join this network</h2>
+        <p>Connect the other device to the same Wi-Fi, hotspot or local network.</p>
+        <div id="bearers" aria-live="polite"></div>
+        <p class="hint">Network credentials are managed by the operating system. No hotspot or captive-portal credentials are disclosed by this page.</p>
+      </section>
+      <section class="step-card"><div class="step">Step 2</div><h2>Open the portal</h2>
+        <div id="lobbyQr" class="qr" aria-label="Portal address QR"></div>
+        <div id="lobbyUrl" class="address"></div>
+        <p class="hint">Scan after joining the network, or enter the address. If the QR cannot load, copy the link below.</p>
+        <div class="up-row"><button type="button" class="btn" id="copyLobby">📋 Copy link</button>
+          <a class="btn ghost" href="/dashboard">Open dashboard →</a></div>
+      </section>
+    </div>
+    <div id="lobbyWarning" class="warning hidden"></div>
+    <div class="lobby-status"><span class="dot"></span> <strong id="lobbyCount">Checking lobby...</strong> · <span id="nativeStatus">Native ftportal/1 and ftportal/2 remain available when the peer listener is active.</span></div>
+  </main>
+  <div class="toast-box" id="toasts" aria-live="polite"></div>
+  <script src="/qr.js"></script>
   <script>
   (function(){
     'use strict';
-    var $=function(id){return document.getElementById(id)},queue=[],uploading=false,mode=location.pathname==='/lobby'?'lobby':'dashboard';
+    var $=function(id){return document.getElementById(id)},mode=location.pathname==='/lobby'?'lobby':'dashboard';
+    var queue=[],sending=false,filter='all',sent=[],known=null,limit=0,notifOn=false,lastQr='',currentUrl=location.origin+'/dashboard';
+    try{notifOn=localStorage.getItem('ftportalNotif')==='1'}catch(ignore){}
     $('dashboard').classList.toggle('hidden',mode!=='dashboard');$('lobby').classList.toggle('hidden',mode!=='lobby');
-    $(mode==='lobby'?'lobbyLink':'dashLink').classList.add('active');$('title').textContent=mode==='lobby'?'Lobby':'Dashboard';
-    if(mode==='lobby')$('subtitle').textContent='Join the network, then open this host in a browser';
-    function size(n){if(n<0)return 'stream';if(n<1024)return n+' B';if(n<1048576)return(n/1024).toFixed(1)+' KB';if(n<1073741824)return(n/1048576).toFixed(1)+' MB';return(n/1073741824).toFixed(2)+' GB'}
-    function status(message,kind){$('uploadStatus').textContent=message;$('uploadStatus').className='status '+(kind||'')}
-    function renderQueue(){var total=queue.reduce(function(n,f){return n+f.size},0);$('selection').textContent=queue.length?queue.length+' file(s) · '+size(total):'No files selected';$('send').disabled=uploading||!queue.length;$('clear').disabled=uploading||!queue.length}
-    function add(files){if(uploading)return;Array.prototype.forEach.call(files,function(f){if(!queue.some(function(x){return x.name===f.name&&x.size===f.size&&x.lastModified===f.lastModified}))queue.push(f)});renderQueue()}
-    $('picker').addEventListener('change',function(){add(this.files);this.value='' });$('clear').addEventListener('click',function(){queue=[];renderQueue();status('')});
-    ['dragenter','dragover'].forEach(function(ev){$('drop').addEventListener(ev,function(e){e.preventDefault();$('drop').classList.add('over')})});
-    ['dragleave','drop'].forEach(function(ev){$('drop').addEventListener(ev,function(e){e.preventDefault();$('drop').classList.remove('over')})});
-    $('drop').addEventListener('drop',function(e){add(e.dataTransfer.files)});
-    function upload(file,limit){return new Promise(function(resolve){if(limit>0&&file.size>limit){resolve({ok:false,name:file.name,error:'File exceeds the host upload limit'});return}
-      var body=new FormData(),xhr=new XMLHttpRequest();body.append('file',file,file.name);xhr.open('POST','/upload');
-      xhr.upload.onprogress=function(e){if(e.lengthComputable){$('progress').value=Math.round(100*e.loaded/e.total);status('Sending '+file.name+' · '+size(e.loaded)+' / '+size(e.total))}};
-      xhr.onload=function(){var data={};try{data=JSON.parse(xhr.responseText)}catch(ignore){}resolve({ok:xhr.status>=200&&xhr.status<300&&data.ok!==false,name:file.name,error:data.error||data.msg||'Upload failed'})};
-      xhr.onerror=function(){resolve({ok:false,name:file.name,error:'Connection interrupted'})};xhr.send(body)
-    })}
-    var uploadLimit=0;
-    $('send').addEventListener('click',async function(){if(uploading||!queue.length)return;uploading=true;renderQueue();$('progress').classList.remove('hidden');
-      var pending=queue.slice(),failed=[];for(var i=0;i<pending.length;i++){var result=await upload(pending[i],uploadLimit);if(!result.ok)failed.push(result);$('progress').value=Math.round(100*(i+1)/pending.length)}
-      queue=failed.map(function(r){return pending.find(function(f){return f.name===r.name})}).filter(Boolean);uploading=false;renderQueue();
-      status(failed.length?failed.length+' file(s) failed: '+failed[0].error:pending.length+' file(s) sent successfully',failed.length?'error':'success');
-      setTimeout(function(){$('progress').classList.add('hidden')},1500);refresh()
-    });
-    function textNode(tag,text,className){var n=document.createElement(tag);n.textContent=text;if(className)n.className=className;return n}
-    function render(info){$('host').textContent=(info.alias||info.platform||'Host')+' · '+(info.platform||'FTPortal');
-      uploadLimit=Number(info.maxUploadBytes)||0;$('limit').textContent=uploadLimit?'Host browser upload limit: '+size(uploadLimit):'';
-      var files=$('files');files.replaceChildren();(info.files||[]).forEach(function(f){var row=textNode('div','','file-row'),label=textNode('div',f.name,'name'),meta=textNode('small',size(Number(f.size))+' · ONE-SHOT'),a=textNode('a','↓ Download','btn');a.href='/download/'+encodeURIComponent(f.id);label.appendChild(meta);row.appendChild(label);row.appendChild(a);files.appendChild(row)});
-      if(!files.childElementCount)files.appendChild(textNode('div','No file waiting. Share a file in the native app to make it available here.','empty'));
-      var devices=$('devices');devices.replaceChildren();var card=textNode('div','','device');card.appendChild(textNode('span','● Online'));card.appendChild(textNode('strong',info.alias||info.platform||'This device'));card.appendChild(textNode('small',(info.platform||'FTPortal')+' · browser fallback'));devices.appendChild(card);
-      var addresses=$('addresses');addresses.replaceChildren();(info.addresses||[]).forEach(function(item){var box=textNode('div','','address'),addr=textNode('strong',item.url,'mono');box.appendChild(addr);box.appendChild(textNode('small',(item.kind||'Local network')+' · '+(item.adapter||'active')));addresses.appendChild(box)});
-      if(!addresses.childElementCount)addresses.appendChild(textNode('div','No active local network address. Connect to a local network and retry.','note'));
-      $('portalUrl').textContent=location.origin+'/dashboard';$('lobbyState').textContent=info.lobbyActive?'Ready to share '+info.files.length+' pending one-shot file(s) via ftportal/1 or ftportal/2.':'No files pending. The browser host is ready; share a file in the native app to activate the native lobby.'
+    $(mode==='lobby'?'lobbyLink':'dashboardLink').classList.add('on');
+    function el(tag,text,cls){var node=document.createElement(tag);node.textContent=text||'';if(cls)node.className=cls;return node}
+    function fmt(n){if(n<0)return'STREAM';if(n<1024)return n+' B';if(n<1048576)return(n/1024).toFixed(2)+' KB';if(n<1073741824)return(n/1048576).toFixed(2)+' MB';return(n/1073741824).toFixed(2)+' GB'}
+    function date(iso){return new Date(iso).toLocaleString()}
+    function toast(message,kind){var node=el('div',message,'toast '+(kind||''));$('toasts').appendChild(node);setTimeout(function(){node.remove()},4500)}
+    function qr(box,value){if(!window.QRCode){box.textContent='QR unavailable · use the address';return}box.replaceChildren();try{new QRCode(box,{text:value,width:188,height:188,colorDark:'#000000',colorLight:'#ffffff',correctLevel:QRCode.CorrectLevel.M})}catch(e){box.textContent='QR unavailable · use the address'}}
+    function copied(button){button.textContent='Copied ✓';setTimeout(function(){button.textContent='📋 Copy link'},1800)}
+    function copy(button){var value=currentUrl;if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(value).then(function(){copied(button)},function(){toast('Copy manually: '+value,'err')})}else{var field=el('textarea',value);field.value=value;document.body.appendChild(field);field.select();try{document.execCommand('copy');copied(button)}catch(e){toast('Copy manually: '+value,'err')}field.remove()}}
+    $('copyUrl').addEventListener('click',function(){copy(this)});$('copyLobby').addEventListener('click',function(){copy(this)});
+    $('inviteBtn').addEventListener('click',function(){if(mode==='lobby'){location.href='/dashboard#invite';return}var panel=$('connectPanel');panel.classList.toggle('hidden');this.classList.toggle('on',!panel.classList.contains('hidden'));if(!panel.classList.contains('hidden'))qr($('inviteQr'),currentUrl)});
+    if(location.hash==='#invite'&&mode==='dashboard')$('inviteBtn').click();
+    $('notifBtn').classList.toggle('on',notifOn);
+    $('notifBtn').addEventListener('click',function(){notifOn=!notifOn;this.classList.toggle('on',notifOn);try{localStorage.setItem('ftportalNotif',notifOn?'1':'0')}catch(ignore){}if(notifOn&&window.Notification&&Notification.permission==='default')Notification.requestPermission();toast(notifOn?'Notifications on':'Notifications off')});
+    function notify(file){if(!notifOn)return;try{var ctx=new(window.AudioContext||window.webkitAudioContext)(),osc=ctx.createOscillator(),gain=ctx.createGain();osc.connect(gain);gain.connect(ctx.destination);gain.gain.value=.04;osc.start();setTimeout(function(){osc.stop();ctx.close()},140)}catch(ignore){}if(document.hidden&&window.Notification&&Notification.permission==='granted')new Notification('FTPortal file waiting',{body:file})}
+    function card(icon,name,sub,cls){var node=el('div','','dev '+cls);node.appendChild(el('div',icon,'dev-icon'));node.appendChild(el('div',name,'dev-name'));node.appendChild(el('div',sub,'dev-sub'));if(cls==='self')node.appendChild(el('div','','dev-status'));return node}
+    function renderDevices(info){var box=$('devices');box.replaceChildren();box.appendChild(card('🌐','Browser fallback','Connected directly to this host','public'));box.appendChild(card('💻',info.alias||info.platform||'This device',(info.platform||'FTPortal')+' · host (me)','self'));$('myNick').textContent=info.alias||info.platform||'FTPortal';$('onlineCount').textContent='Local · '+info.files.length+' file(s) ready'}
+    function renderTransfers(files){var body=$('transferBody');body.replaceChildren();
+      var rows=[];if(filter!=='sent')files.forEach(function(file){rows.push({kind:'available',name:file.name,size:Number(file.size),id:file.id,created:'',target:'This host'})});
+      if(filter!=='available')sent.forEach(function(file){rows.push({kind:'sent',name:file.name,size:file.size,created:file.created,target:'This host'})});
+      if(!rows.length){var empty=el('tr'),cell=el('td','📦 No files in this view.','empty');cell.colSpan=6;empty.appendChild(cell);body.appendChild(empty);return}
+      rows.forEach(function(file){var tr=el('tr');tr.appendChild(el('td',file.kind==='available'?'📄':'📤'));tr.appendChild(el('td',file.name,'td-nm'));tr.appendChild(el('td',fmt(file.size)));var from=el('td');from.appendChild(el('span',file.kind==='available'?'Host':'Me','pill'+(file.kind==='sent'?' me':'')));from.appendChild(document.createTextNode(' → '+file.target));tr.appendChild(from);tr.appendChild(el('td',file.created?date(file.created):'Pending','dt'));var action=el('td');if(file.id){var a=el('a','↓ Download','dl');a.href='/download/'+encodeURIComponent(file.id);action.appendChild(a)}else action.appendChild(el('span','✓ Sent','fi-stat ok'));tr.appendChild(action);body.appendChild(tr)})
     }
-    async function refresh(){try{var response=await fetch('/api/portal',{cache:'no-store'});if(!response.ok)throw Error('Host unavailable');render(await response.json())}catch(e){if(mode==='lobby')$('lobbyState').textContent='Connection interrupted. Waiting for the host or a new network address.'}}
-    $('copy').addEventListener('click',function(){var url=location.origin+'/dashboard';if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(url).then(function(){$('copy').textContent='Copied'},function(){$('copy').textContent='Copy manually: '+url});else $('copy').textContent='Copy manually: '+url});
+    document.querySelectorAll('.tab').forEach(function(tab){tab.addEventListener('click',function(){filter=tab.dataset.filter;document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('on',t===tab)});renderTransfers(window.portalFiles||[])})});
+    function stage(files){if(sending)return;Array.prototype.forEach.call(files,function(file){if(!queue.some(function(q){return q.file.name===file.name&&q.file.size===file.size&&q.file.lastModified===file.lastModified}))queue.push({file:file,state:'wait',loaded:0})});renderQueue()}
+    function renderQueue(){var box=$('fileList');box.replaceChildren();queue.forEach(function(item,index){var row=el('div','','fileitem');row.appendChild(el('span','📄','fi-ic'));row.appendChild(el('span',item.file.name,'fi-name'));row.appendChild(el('span',fmt(item.file.size),'fi-size'));if(item.state!=='wait')row.appendChild(el('span',item.state==='ok'?'✓ sent':item.state==='err'?'✕ retry':'sending…','fi-stat '+(item.state==='ok'?'ok':item.state==='err'?'err':'')));if(!sending){var remove=el('button','✕','fi-x');remove.type='button';remove.setAttribute('aria-label','Remove '+item.file.name);remove.addEventListener('click',function(){queue.splice(index,1);renderQueue()});row.appendChild(remove)}box.appendChild(row)});$('upBtn').disabled=sending||!queue.some(function(q){return q.state!=='ok'});$('clearBtn').classList.toggle('hidden',!queue.length||sending);$('countLbl').textContent=queue.length+' file(s) '+(sending?'sending':'selected')}
+    $('file').addEventListener('change',function(){stage(this.files);this.value=''});$('clearBtn').addEventListener('click',function(){queue=[];renderQueue()});
+    ['dragenter','dragover'].forEach(function(event){$('drop').addEventListener(event,function(e){e.preventDefault();this.classList.add('over')})});['dragleave','drop'].forEach(function(event){$('drop').addEventListener(event,function(e){e.preventDefault();this.classList.remove('over')})});$('drop').addEventListener('drop',function(e){stage(e.dataTransfer.files)});
+    function upload(item){return new Promise(function(done){if(limit&&item.file.size>limit){item.state='err';toast(item.file.name+' exceeds '+fmt(limit)+' browser limit','err');done(false);return}
+      item.state='up';renderQueue();var data=new FormData();data.append('file',item.file,item.file.name);var xhr=new XMLHttpRequest(),start=Date.now();xhr.open('POST','/upload',true);
+      xhr.upload.onprogress=function(e){if(!e.lengthComputable)return;item.loaded=e.loaded;$('bar').style.width=Math.round(100*e.loaded/e.total)+'%';var elapsed=(Date.now()-start)/1000,speed=elapsed?e.loaded/elapsed:0,eta=speed?Math.ceil((e.total-e.loaded)/speed):0;$('upStats').textContent=fmt(e.loaded)+' / '+fmt(e.total)+' · '+fmt(speed)+'/s · ETA '+eta+'s'};
+      xhr.onload=function(){var response={};try{response=JSON.parse(xhr.responseText)}catch(ignore){}var ok=xhr.status>=200&&xhr.status<300&&response.ok!==false;item.state=ok?'ok':'err';if(!ok)toast(item.file.name+': '+(response.error||response.msg||'Transfer failed'),'err');renderQueue();done(ok)};
+      xhr.onerror=function(){item.state='err';renderQueue();toast(item.file.name+': connection interrupted','err');done(false)};xhr.send(data)
+    })}
+    $('upBtn').addEventListener('click',async function(){if(sending)return;var pending=queue.filter(function(q){return q.state!=='ok'});if(!pending.length)return;sending=true;renderQueue();$('barWrap').classList.add('show');var success=0;
+      for(var i=0;i<pending.length;i++){if(await upload(pending[i])){success++;sent.unshift({name:pending[i].file.name,size:pending[i].file.size,created:new Date().toISOString()})}$('bar').style.width=Math.round(100*(i+1)/pending.length)+'%'}
+      sending=false;renderQueue();renderTransfers(window.portalFiles||[]);toast(success+' / '+pending.length+' file(s) sent',success===pending.length?'ok':'err');setTimeout(function(){$('barWrap').classList.remove('show');$('bar').style.width='0';$('upStats').textContent=''},1300);refresh()
+    });
+    $('txtBtn').addEventListener('click',function(){var field=$('txtMsg'),value=field.value.trim();if(!value)return;var name='note-'+new Date().toISOString().replace(/[:.]/g,'-')+'.txt';stage([new File([value],name,{type:'text/plain'})]);field.value='';toast('Note added to send queue')});
+    $('txtMsg').addEventListener('keydown',function(e){if(e.key==='Enter')$('txtBtn').click()});
+    function renderLobby(info){var preferred=info.addresses.find(function(a){try{return new URL(a.url).hostname===location.hostname}catch(e){return false}});
+      currentUrl=(preferred||info.addresses[0]||{}).url||location.origin+'/dashboard';var url=currentUrl;$('lobbyUrl').textContent=url;$('urlBox').textContent=url;
+      if(lastQr!==url){lastQr=url;qr($('lobbyQr'),url);if(!$('connectPanel').classList.contains('hidden'))qr($('inviteQr'),url)}
+      var box=$('bearers');box.replaceChildren();(info.addresses||[]).forEach(function(a){var chip=el('div','','bchip'+(a.url.indexOf(location.hostname)>=0?' pri':''));chip.appendChild(el('i'));chip.appendChild(el('span',(a.kind||'Local network')+' · '+a.url));box.appendChild(chip)});
+      if(!box.childElementCount)box.appendChild(el('p','No active local address. Connect to a network and retry.','hint'));
+      $('lobbyCount').textContent=info.lobbyActive?'Native lobby active · '+info.files.length+' file(s)':'No native file share pending';
+      var warning=$('lobbyWarning');warning.classList.toggle('hidden',!!box.childElementCount&&info.addresses.length>0);warning.textContent='No local network bearer is currently available. Browser transfers cannot start until the host reconnects.'
+    }
+    async function refresh(){try{var response=await fetch('/api/portal',{cache:'no-store'});if(!response.ok)throw Error('Host unavailable');var info=await response.json();info.files=Array.isArray(info.files)?info.files:[];info.addresses=Array.isArray(info.addresses)?info.addresses:[];window.portalFiles=info.files;limit=Number(info.maxUploadBytes)||0;$('limit').textContent=limit?'Host browser upload limit: '+fmt(limit):'';renderDevices(info);renderTransfers(info.files);renderLobby(info);
+      var current=new Set(info.files.map(function(f){return f.id}));if(known!==null)info.files.forEach(function(f){if(!known.has(f.id)){toast('New file available: '+f.name,'ok');notify(f.name)}});known=current
+    }catch(e){$('onlineCount').textContent='Host connection lost';$('lobbyCount').textContent='Host connection lost';$('lobbyWarning').classList.remove('hidden');$('lobbyWarning').textContent='Cannot reach the host. The network address may have changed.'}}
     refresh();setInterval(refresh,4000);window.addEventListener('focus',refresh)
   })();
   </script>
