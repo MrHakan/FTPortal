@@ -265,7 +265,8 @@ internal sealed class MainForm : Form
         {
             await _server.StartAsync(80, 8080, 8787);
             if (_allowExit) return;
-            var fallbackNotice = await _transportSupervisor.EnsureFallbackAsync(force: true);
+            var fallbackNotice = await _transportSupervisor.EnsureFallbackAsync(force: true, cancellationToken: _lifetime.Token);
+            if (_allowExit) return;
             if (!string.IsNullOrWhiteSpace(fallbackNotice)) _notice.Text = fallbackNotice;
             _mdns = new MdnsResponder(client => _network.AddressForClient(client));
             _mdns.Start();
@@ -275,7 +276,7 @@ internal sealed class MainForm : Form
         }
         catch (Exception ex)
         {
-            _notice.Text = "Server failed: " + ex.Message;
+            if (!_allowExit) _notice.Text = "Server failed: " + ex.Message;
         }
     }
 
@@ -501,7 +502,7 @@ internal sealed class MainForm : Form
         }
         catch (Exception ex)
         {
-            _notice.Text = "Lobby scan failed: " + ex.Message;
+            if (!_allowExit) _notice.Text = "Lobby scan failed: " + ex.Message;
         }
         finally
         {
@@ -832,7 +833,10 @@ internal sealed class MainForm : Form
         _allowExit = true;
         _timer.Stop();
         _lifetime.Cancel(); _transfers.CancelAll();
-        await _startupTask; await _maintenanceTask; await _discoveryTask;
+        // Refresh handlers already report failures. A previously failed scan
+        // must not prevent listener and tray cleanup during shutdown.
+        try { await Task.WhenAll(_startupTask, _maintenanceTask, _discoveryTask); }
+        catch (Exception) { }
         if (_mdns is not null) await _mdns.DisposeAsync();
         await _server.DisposeAsync();
         _transportSupervisor.Dispose();

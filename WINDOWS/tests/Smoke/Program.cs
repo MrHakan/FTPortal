@@ -13,6 +13,9 @@ internal static class Smoke
         try
         {
             SelectionSurvivesRefresh();
+            // ListBox installs a WinForms context; this console runner has no
+            // message loop to resume the HTTP test's asynchronous continuations.
+            SynchronizationContext.SetSynchronizationContext(null);
             RunAsync().GetAwaiter().GetResult();
             Console.WriteLine("Windows smoke passed: stable selections, streaming upload, limits, partial cleanup, cancellation, admission and one-shot lifecycle.");
             return 0;

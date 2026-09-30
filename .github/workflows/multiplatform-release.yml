@@ -127,6 +127,7 @@ jobs:
         with:
           dotnet-version: '8.0.x'
       - name: Exercise Windows HTTP host and selection lifecycle
+        timeout-minutes: 5
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
