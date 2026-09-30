@@ -15,6 +15,7 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
     <EmbeddedResource Include="../WEB/portal.html" LogicalName="FTPortal.Portal.html" />
     <EmbeddedResource Include="../WEB/qr.js" LogicalName="FTPortal.QR.js" />
     <EmbeddedResource Include="../WEB/qr.LICENSE" LogicalName="FTPortal.QR.LICENSE" />

@@ -9,7 +9,7 @@
   <style>
     :root{color-scheme:dark;--bg:#0d0f12;--card:#141720;--border:#252c3b;--accent:#4f8ef7;--accent2:#8e6cf7;--text:#e8ecf5;--muted:#9aa7bf;--ok:#4ff78e;--err:#f74f6a;--warn:#f7c14f}
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 'Segoe UI',system-ui,sans-serif;min-height:100vh}
-    button,input{font:inherit}button{cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}
+    button,input,select{font:inherit}button{cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}
     header{position:sticky;top:0;z-index:10;background:rgba(20,23,32,.94);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
     .brand{display:flex;align-items:center;gap:11px}.brand .icon{font-size:24px}.brand h1{font-size:16px;letter-spacing:.5px;margin:0}
     .hdr-right{display:flex;align-items:center;gap:10px;font-size:13px;flex-wrap:wrap}
@@ -32,7 +32,7 @@
     .dev.self{border-style:dashed}.dev-icon{font-size:22px}.dev-name{font-size:14px;font-weight:600;overflow-wrap:anywhere}.dev-sub{font-size:11px;color:var(--muted)}.dev-status{position:absolute;top:10px;right:10px;width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
     .drop{display:block;border:2px dashed var(--border);border-radius:12px;padding:34px;text-align:center;color:var(--muted);cursor:pointer;transition:all .2s}.drop.over{border-color:var(--accent);background:rgba(79,142,247,.06);color:var(--text)}.drop .big{font-size:36px;margin-bottom:8px}
     .filelist{display:flex;flex-direction:column;gap:8px;margin:14px 0 0}.fileitem{display:flex;align-items:center;gap:12px;padding:9px 13px;background:var(--bg);border:1px solid var(--border);border-radius:10px;font-size:13px}
-    .fi-ic{font-size:18px}.fi-name{flex:1;overflow-wrap:anywhere}.fi-size,.fi-stat{font-size:12px;color:var(--muted);white-space:nowrap}.fi-stat.ok{color:var(--ok)}.fi-stat.err{color:var(--err)}.fi-x{color:var(--err);background:none;border:0;padding:3px 7px}
+    .fi-ic{font-size:18px}.fi-name{flex:1;min-width:0;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.fi-size,.fi-stat{font-size:12px;color:var(--muted);white-space:nowrap}.fi-stat.ok{color:var(--ok)}.fi-stat.err{color:var(--err)}.fi-x{color:var(--err);background:none;border:0;padding:3px 7px}
     .up-row{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}.count-lbl{color:var(--muted);font-size:13px;margin-left:auto}
     .bar-wrap{display:none;margin-top:14px;background:var(--bg);border-radius:30px;overflow:hidden;height:8px;border:1px solid var(--border)}.bar-wrap.show{display:block}.bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .12s}
     .up-stats{margin-top:8px;font-size:12px;color:var(--muted);text-align:right;min-height:15px;font-variant-numeric:tabular-nums}
@@ -46,59 +46,92 @@
     .bchip{display:inline-flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--border);border-radius:20px;padding:6px 13px;margin:6px 6px 0 0;color:var(--muted);font-size:12px}.bchip.pri{border-color:var(--accent);color:var(--text)}.bchip i{width:8px;height:8px;border-radius:50%;background:var(--ok)}
     .lobby-status{margin-top:24px;color:var(--muted)}.lobby-status strong{color:var(--text)}.warning{color:var(--warn);border:1px solid var(--warn);border-radius:9px;padding:10px 14px;margin-top:16px;font-size:12px}
     @media(max-width:680px){header{padding:12px 14px}main{padding:14px}.panel{padding:16px}.step-grid{grid-template-columns:1fr}.txt-row{flex-wrap:wrap}.txt-row input{flex-basis:100%}th:nth-child(4),td:nth-child(4){display:none}}
+    :focus-visible{outline:2px solid var(--accent);outline-offset:4px}
+    .skip{position:fixed;top:-100px;left:16px;z-index:100;background:var(--card);color:var(--text);padding:12px}.skip:focus{top:12px}
+    .hdr-right .hbtn{min-height:36px;display:inline-flex;align-items:center;justify-content:center}
+    .dot.offline{background:var(--warn);box-shadow:none}.connection{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px;color:var(--muted)}
+    .connection strong{color:var(--text)}.connection .hbtn{margin-left:auto}.connection.offline{color:var(--warn)}
+    .workspace-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:22px;align-items:start}.workspace-grid>.panel{margin:0;min-width:0}
+    .section-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.section-head h2{margin-bottom:8px}
+    .badge{font-size:12px;color:var(--accent);background:rgba(79,142,247,.12);border-radius:20px;padding:4px 10px;white-space:nowrap}
+    .search{width:100%;margin:0 0 14px;padding:10px 12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:9px}
+    .filelist{max-height:320px;overflow:auto}.fileitem{gap:8px}.fi-x{min-width:36px;min-height:36px}.fi-stat{white-space:normal;max-width:120px}.fileitem.error{border-color:var(--err)}
+    .drop{padding:26px 14px}.drop[aria-disabled="true"]{opacity:.6;cursor:wait}.up-row .btn{min-height:44px}.up-row .count-lbl{margin-left:0;flex-basis:100%}
+    .txt-row .btn{min-height:44px}.up-stats{min-height:36px;overflow-wrap:anywhere;text-align:left}.btn.cancel{color:var(--warn);border-color:var(--warn);background:transparent}
+    .table-scroll{overflow:auto}table{min-width:460px}.dl{display:inline-block;padding:9px 6px;min-height:40px}.table-footer{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:12px}
+    .address-select{background:var(--bg);color:var(--text);border:1px solid var(--border);padding:9px;border-radius:8px;max-width:100%;margin-bottom:12px}
+    .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+    @media(max-width:900px){.workspace-grid{grid-template-columns:1fr}}@media(max-width:680px){.hdr-right .hbtn{min-height:44px}.fi-size{font-size:11px}.connection{font-size:12px}.panel{overflow:visible}.fi-stat{max-width:90px}}
+    @media(max-width:680px){
+      .dev-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.dev{padding:12px}.dev-sub{font-size:11px}
+      table{min-width:0}thead{display:none}tbody tr{display:grid;grid-template-columns:minmax(0,1fr) auto;padding:10px 0;border-bottom:1px solid var(--border)}
+      tbody td{display:block;border:0;padding:4px 6px}tbody td:first-child,tbody td:nth-child(4){display:none}
+      tbody td:nth-child(2){grid-column:1/-1;font-weight:600}tbody td:nth-child(3){grid-column:1;color:var(--muted);font-size:12px}
+      tbody td:nth-child(5){grid-column:1;white-space:normal;font-size:11px}tbody td:last-child{grid-column:2;grid-row:2/4;align-self:center}
+    }
+    @media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;scroll-behavior:auto!important}}
   </style>
 </head>
 <body>
+  <a class="skip" href="#dashboard">Skip to dashboard</a>
   <header>
-    <div class="brand"><span class="icon" aria-hidden="true">📁</span><h1>LOCAL FILE PORTAL</h1></div>
+    <div class="brand"><span class="icon" aria-hidden="true">⇄</span><h1>LOCAL FILE PORTAL</h1></div>
     <div class="hdr-right">
-      <div class="me-chip"><span class="dot"></span><span>Host:</span><b id="myNick">FTPortal</b></div>
+      <div class="me-chip"><span class="dot offline" id="hostDot"></span><span>Host:</span><b id="myNick">FTPortal</b></div>
       <span id="onlineCount" class="hint">Local · no cloud</span>
-      <button type="button" class="hbtn" id="inviteBtn">🔗 Invite</button>
-      <button type="button" class="hbtn" id="notifBtn" title="Sound and browser notifications">🔔</button>
+      <button type="button" class="hbtn" id="inviteBtn">Invite</button>
+      <button type="button" class="hbtn" id="notifBtn" title="Sound and browser notifications" aria-label="Toggle notifications" aria-pressed="false">Sound</button>
       <a class="hbtn" href="/dashboard" id="dashboardLink">Dashboard</a>
       <a class="hbtn" href="/lobby" id="lobbyLink">Lobby</a>
     </div>
   </header>
   <main id="dashboard">
+    <div class="connection" id="connection" role="status"><strong id="connectionText">Connecting to host…</strong><span id="connectionDetail">Local network · no cloud</span><button type="button" class="hbtn" id="refreshBtn">Refresh</button></div>
     <section class="panel hidden" id="connectPanel">
       <h2>Invite a Device</h2>
       <div class="connect-flex"><div>
         <div class="url-box" id="urlBox"></div>
-        <button type="button" class="btn" id="copyUrl">📋 Copy Link</button>
+        <button type="button" class="btn" id="copyUrl">Copy link</button>
         <p class="hint">Other device must be on the same local network. Scan the QR or open the address.</p>
       </div><div class="qr" id="inviteQr" aria-label="Portal address QR"></div></div>
     </section>
     <section class="panel">
-      <h2>Connected Devices <span class="target-chip">This host · browser fallback</span></h2>
+      <h2>Host &amp; connection <span class="target-chip">Direct browser transfer</span></h2>
       <div id="devices" class="dev-grid"></div>
       <p class="hint">Private offers to nearby FTPortal devices are available in the native app's Nearby view.</p>
     </section>
+    <div class="workspace-grid">
     <section class="panel">
-      <h2>Send Files</h2>
+      <div class="section-head"><h2>Send Files</h2><span class="badge" id="queueBadge">Queue empty</span></div>
+      <p class="sub">Choose files, then send them to this host.</p>
       <input type="file" id="file" multiple hidden>
-      <label class="drop" id="drop" for="file"><div class="big">📤</div>
+      <label class="drop" id="drop" for="file" tabindex="0" role="button" aria-label="Choose files to send" aria-disabled="false"><div class="big">↑</div>
         <div>Drag &amp; drop files here or click to select</div>
         <span class="hint">Sent directly to this host. No cloud.</span>
       </label>
       <div id="fileList" class="filelist"></div>
       <div class="up-row"><button type="button" class="btn" id="upBtn" disabled>Send</button>
+        <button type="button" class="btn cancel hidden" id="cancelBtn">Cancel queue</button>
         <button type="button" class="btn ghost hidden" id="clearBtn">Clear</button>
         <span class="count-lbl" id="countLbl"></span></div>
-      <div class="bar-wrap" id="barWrap"><div class="bar" id="bar"></div></div>
+      <div class="bar-wrap" id="barWrap" role="progressbar" aria-label="Current file upload" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="bar" id="bar"></div></div>
       <div class="up-stats" id="upStats" role="status"></div>
-      <div class="txt-row"><input type="text" id="txtMsg" placeholder="Quick note or link... (sent as .txt)" maxlength="4000">
-        <button type="button" class="btn ghost" id="txtBtn">Send Text</button></div>
+      <div class="txt-row"><input type="text" id="txtMsg" aria-label="Quick note or link" placeholder="Quick note or link... (sent as .txt)" maxlength="4000">
+        <button type="button" class="btn ghost" id="txtBtn">Add note</button></div>
       <p class="hint" id="limit"></p>
     </section>
     <section class="panel">
-      <h2>Transfers</h2>
-      <div class="tabs"><button type="button" class="tab on" data-filter="all">All</button>
+      <div class="section-head"><h2>Transfers</h2><span class="badge" id="readyBadge">0 ready</span></div>
+      <p class="sub">Receive shared files or check what you sent.</p>
+      <input class="search" type="search" id="search" aria-label="Search transfers" placeholder="Search files…">
+      <div class="tabs" role="group" aria-label="Filter transfers"><button type="button" class="tab on" data-filter="all">All</button>
         <button type="button" class="tab" data-filter="available">Available</button>
         <button type="button" class="tab" data-filter="sent">Sent this session</button></div>
-      <table><thead><tr><th></th><th>File</th><th>Size</th><th>From / To</th><th>Date</th><th></th></tr></thead><tbody id="transferBody"></tbody></table>
-      <p class="hint">Available files are one-shot: successful downloads consume the share. “Sent this session” is a browser-only view, not server history.</p>
+      <div class="table-scroll"><table><thead><tr><th></th><th>File</th><th>Size</th><th>From / To</th><th>Date</th><th></th></tr></thead><tbody id="transferBody"></tbody></table></div>
+      <div class="table-footer"><span class="hint" id="resultCount"></span><button class="hbtn hidden" type="button" id="moreBtn">Show more</button></div>
+      <p class="hint">Available files are one-shot: successful downloads consume the share. Sent history keeps the latest 100 receipts in this tab. Cancelling stops the queue; a file already saved by the host may remain there.</p>
     </section>
+    </div>
   </main>
   <main id="lobby" class="hidden">
     <div class="lobby-intro"><h1>FTPortal</h1><p class="sub">Local network · this device is the host</p></div>
@@ -110,9 +143,10 @@
       </section>
       <section class="step-card"><div class="step">Step 2</div><h2>Open the portal</h2>
         <div id="lobbyQr" class="qr" aria-label="Portal address QR"></div>
+        <label class="sr-only" for="addressChoice">Portal network address</label><select class="address-select" id="addressChoice"></select>
         <div id="lobbyUrl" class="address"></div>
         <p class="hint">Scan after joining the network, or enter the address. If the QR cannot load, copy the link below.</p>
-        <div class="up-row"><button type="button" class="btn" id="copyLobby">📋 Copy link</button>
+        <div class="up-row"><button type="button" class="btn" id="copyLobby">Copy link</button>
           <a class="btn ghost" href="/dashboard">Open dashboard →</a></div>
       </section>
     </div>
@@ -122,63 +156,357 @@
   <div class="toast-box" id="toasts" aria-live="polite"></div>
   <script src="/qr.js"></script>
   <script>
-  (function(){
+  (function () {
     'use strict';
-    var $=function(id){return document.getElementById(id)},mode=location.pathname==='/lobby'?'lobby':'dashboard';
-    var queue=[],sending=false,filter='all',sent=[],known=null,limit=0,notifOn=false,lastQr='',currentUrl=location.origin+'/dashboard';
-    try{notifOn=localStorage.getItem('ftportalNotif')==='1'}catch(ignore){}
-    $('dashboard').classList.toggle('hidden',mode!=='dashboard');$('lobby').classList.toggle('hidden',mode!=='lobby');
-    $(mode==='lobby'?'lobbyLink':'dashboardLink').classList.add('on');
-    function el(tag,text,cls){var node=document.createElement(tag);node.textContent=text||'';if(cls)node.className=cls;return node}
-    function fmt(n){if(n<0)return'STREAM';if(n<1024)return n+' B';if(n<1048576)return(n/1024).toFixed(2)+' KB';if(n<1073741824)return(n/1048576).toFixed(2)+' MB';return(n/1073741824).toFixed(2)+' GB'}
-    function date(iso){return new Date(iso).toLocaleString()}
-    function toast(message,kind){var node=el('div',message,'toast '+(kind||''));$('toasts').appendChild(node);setTimeout(function(){node.remove()},4500)}
-    function qr(box,value){if(!window.QRCode){box.textContent='QR unavailable · use the address';return}box.replaceChildren();try{new QRCode(box,{text:value,width:188,height:188,colorDark:'#000000',colorLight:'#ffffff',correctLevel:QRCode.CorrectLevel.M})}catch(e){box.textContent='QR unavailable · use the address'}}
-    function copied(button){button.textContent='Copied ✓';setTimeout(function(){button.textContent='📋 Copy link'},1800)}
-    function copy(button){var value=currentUrl;if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(value).then(function(){copied(button)},function(){toast('Copy manually: '+value,'err')})}else{var field=el('textarea',value);field.value=value;document.body.appendChild(field);field.select();try{document.execCommand('copy');copied(button)}catch(e){toast('Copy manually: '+value,'err')}field.remove()}}
-    $('copyUrl').addEventListener('click',function(){copy(this)});$('copyLobby').addEventListener('click',function(){copy(this)});
-    $('inviteBtn').addEventListener('click',function(){if(mode==='lobby'){location.href='/dashboard#invite';return}var panel=$('connectPanel');panel.classList.toggle('hidden');this.classList.toggle('on',!panel.classList.contains('hidden'));if(!panel.classList.contains('hidden'))qr($('inviteQr'),currentUrl)});
-    if(location.hash==='#invite'&&mode==='dashboard')$('inviteBtn').click();
-    $('notifBtn').classList.toggle('on',notifOn);
-    $('notifBtn').addEventListener('click',function(){notifOn=!notifOn;this.classList.toggle('on',notifOn);try{localStorage.setItem('ftportalNotif',notifOn?'1':'0')}catch(ignore){}if(notifOn&&window.Notification&&Notification.permission==='default')Notification.requestPermission();toast(notifOn?'Notifications on':'Notifications off')});
-    function notify(file){if(!notifOn)return;try{var ctx=new(window.AudioContext||window.webkitAudioContext)(),osc=ctx.createOscillator(),gain=ctx.createGain();osc.connect(gain);gain.connect(ctx.destination);gain.gain.value=.04;osc.start();setTimeout(function(){osc.stop();ctx.close()},140)}catch(ignore){}if(document.hidden&&window.Notification&&Notification.permission==='granted')new Notification('FTPortal file waiting',{body:file})}
-    function card(icon,name,sub,cls){var node=el('div','','dev '+cls);node.appendChild(el('div',icon,'dev-icon'));node.appendChild(el('div',name,'dev-name'));node.appendChild(el('div',sub,'dev-sub'));if(cls==='self')node.appendChild(el('div','','dev-status'));return node}
-    function renderDevices(info){var box=$('devices');box.replaceChildren();box.appendChild(card('🌐','Browser fallback','Connected directly to this host','public'));box.appendChild(card('💻',info.alias||info.platform||'This device',(info.platform||'FTPortal')+' · host (me)','self'));$('myNick').textContent=info.alias||info.platform||'FTPortal';$('onlineCount').textContent='Local · '+info.files.length+' file(s) ready'}
-    function renderTransfers(files){var body=$('transferBody');body.replaceChildren();
-      var rows=[];if(filter!=='sent')files.forEach(function(file){rows.push({kind:'available',name:file.name,size:Number(file.size),id:file.id,created:'',target:'This host'})});
-      if(filter!=='available')sent.forEach(function(file){rows.push({kind:'sent',name:file.name,size:file.size,created:file.created,target:'This host'})});
-      if(!rows.length){var empty=el('tr'),cell=el('td','📦 No files in this view.','empty');cell.colSpan=6;empty.appendChild(cell);body.appendChild(empty);return}
-      rows.forEach(function(file){var tr=el('tr');tr.appendChild(el('td',file.kind==='available'?'📄':'📤'));tr.appendChild(el('td',file.name,'td-nm'));tr.appendChild(el('td',fmt(file.size)));var from=el('td');from.appendChild(el('span',file.kind==='available'?'Host':'Me','pill'+(file.kind==='sent'?' me':'')));from.appendChild(document.createTextNode(' → '+file.target));tr.appendChild(from);tr.appendChild(el('td',file.created?date(file.created):'Pending','dt'));var action=el('td');if(file.id){var a=el('a','↓ Download','dl');a.href='/download/'+encodeURIComponent(file.id);action.appendChild(a)}else action.appendChild(el('span','✓ Sent','fi-stat ok'));tr.appendChild(action);body.appendChild(tr)})
+    var $ = function (id) { return document.getElementById(id); };
+    var mode = location.pathname === '/lobby' ? 'lobby' : 'dashboard';
+    var queue = [], sent = [], sending = false, stopRequested = false, activeUpload = null;
+    var filter = 'all', shown = 100, files = [], known = null, limit = 0, connected = false;
+    var notifOn = false, currentUrl = location.origin + '/dashboard', selectedAddress = '';
+    var lastQr = '', deviceKey = '', transferKey = '', lobbyKey = '';
+    var pollTimer = null, polling = false, failures = 0, stopped = false, progressTimer = null;
+    var queueKeys = new Set(), audio = null, queueViewKey = '';
+    try { notifOn = localStorage.getItem('ftportalNotif') === '1'; } catch (ignore) {}
+    $('dashboard').classList.toggle('hidden', mode !== 'dashboard');
+    $('lobby').classList.toggle('hidden', mode !== 'lobby');
+    $(mode === 'lobby' ? 'lobbyLink' : 'dashboardLink').classList.add('on');
+    $(mode === 'lobby' ? 'lobbyLink' : 'dashboardLink').setAttribute('aria-current', 'page');
+
+    function el(tag, text, cls) {
+      var node = document.createElement(tag);
+      node.textContent = text || '';
+      if (cls) node.className = cls;
+      return node;
     }
-    document.querySelectorAll('.tab').forEach(function(tab){tab.addEventListener('click',function(){filter=tab.dataset.filter;document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('on',t===tab)});renderTransfers(window.portalFiles||[])})});
-    function stage(files){if(sending)return;Array.prototype.forEach.call(files,function(file){if(!queue.some(function(q){return q.file.name===file.name&&q.file.size===file.size&&q.file.lastModified===file.lastModified}))queue.push({file:file,state:'wait',loaded:0})});renderQueue()}
-    function renderQueue(){var box=$('fileList');box.replaceChildren();queue.forEach(function(item,index){var row=el('div','','fileitem');row.appendChild(el('span','📄','fi-ic'));row.appendChild(el('span',item.file.name,'fi-name'));row.appendChild(el('span',fmt(item.file.size),'fi-size'));if(item.state!=='wait')row.appendChild(el('span',item.state==='ok'?'✓ sent':item.state==='err'?'✕ retry':'sending…','fi-stat '+(item.state==='ok'?'ok':item.state==='err'?'err':'')));if(!sending){var remove=el('button','✕','fi-x');remove.type='button';remove.setAttribute('aria-label','Remove '+item.file.name);remove.addEventListener('click',function(){queue.splice(index,1);renderQueue()});row.appendChild(remove)}box.appendChild(row)});$('upBtn').disabled=sending||!queue.some(function(q){return q.state!=='ok'});$('clearBtn').classList.toggle('hidden',!queue.length||sending);$('countLbl').textContent=queue.length+' file(s) '+(sending?'sending':'selected')}
-    $('file').addEventListener('change',function(){stage(this.files);this.value=''});$('clearBtn').addEventListener('click',function(){queue=[];renderQueue()});
-    ['dragenter','dragover'].forEach(function(event){$('drop').addEventListener(event,function(e){e.preventDefault();this.classList.add('over')})});['dragleave','drop'].forEach(function(event){$('drop').addEventListener(event,function(e){e.preventDefault();this.classList.remove('over')})});$('drop').addEventListener('drop',function(e){stage(e.dataTransfer.files)});
-    function upload(item){return new Promise(function(done){if(limit&&item.file.size>limit){item.state='err';toast(item.file.name+' exceeds '+fmt(limit)+' browser limit','err');done(false);return}
-      item.state='up';renderQueue();var data=new FormData();data.append('file',item.file,item.file.name);var xhr=new XMLHttpRequest(),start=Date.now();xhr.open('POST','/upload',true);
-      xhr.upload.onprogress=function(e){if(!e.lengthComputable)return;item.loaded=e.loaded;$('bar').style.width=Math.round(100*e.loaded/e.total)+'%';var elapsed=(Date.now()-start)/1000,speed=elapsed?e.loaded/elapsed:0,eta=speed?Math.ceil((e.total-e.loaded)/speed):0;$('upStats').textContent=fmt(e.loaded)+' / '+fmt(e.total)+' · '+fmt(speed)+'/s · ETA '+eta+'s'};
-      xhr.onload=function(){var response={};try{response=JSON.parse(xhr.responseText)}catch(ignore){}var ok=xhr.status>=200&&xhr.status<300&&response.ok!==false;item.state=ok?'ok':'err';if(!ok)toast(item.file.name+': '+(response.error||response.msg||'Transfer failed'),'err');renderQueue();done(ok)};
-      xhr.onerror=function(){item.state='err';renderQueue();toast(item.file.name+': connection interrupted','err');done(false)};xhr.send(data)
-    })}
-    $('upBtn').addEventListener('click',async function(){if(sending)return;var pending=queue.filter(function(q){return q.state!=='ok'});if(!pending.length)return;sending=true;renderQueue();$('barWrap').classList.add('show');var success=0;
-      for(var i=0;i<pending.length;i++){if(await upload(pending[i])){success++;sent.unshift({name:pending[i].file.name,size:pending[i].file.size,created:new Date().toISOString()})}$('bar').style.width=Math.round(100*(i+1)/pending.length)+'%'}
-      sending=false;renderQueue();renderTransfers(window.portalFiles||[]);toast(success+' / '+pending.length+' file(s) sent',success===pending.length?'ok':'err');setTimeout(function(){$('barWrap').classList.remove('show');$('bar').style.width='0';$('upStats').textContent=''},1300);refresh()
+    function fmt(n) {
+      if (!Number.isFinite(n) || n < 0) return 'STREAM';
+      var units = ['B', 'KB', 'MB', 'GB', 'TB'], index = 0;
+      while (n >= 1024 && index < units.length - 1) { n /= 1024; index++; }
+      return (index ? n.toFixed(1) : Math.round(n)) + ' ' + units[index];
+    }
+    function toast(message, kind) {
+      var box = $('toasts');
+      while (box.childElementCount >= 3) box.firstChild.remove();
+      var node = el('div', message, 'toast ' + (kind || ''));
+      box.appendChild(node);
+      setTimeout(function () { node.remove(); }, 6000);
+    }
+    function qr(box, value) {
+      box.replaceChildren();
+      if (!window.QRCode) { box.textContent = 'QR unavailable · use the address'; return; }
+      try {
+        new QRCode(box, { text: value, width: 188, height: 188, colorDark: '#000000', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.M });
+      } catch (ignore) { box.textContent = 'QR unavailable · use the address'; }
+    }
+    function copy(button) {
+      var value = currentUrl, original = button.textContent;
+      function copied() { button.textContent = 'Copied ✓'; setTimeout(function () { button.textContent = original; }, 1800); }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(value).then(copied, function () { toast('Copy manually: ' + value, 'err'); });
+      } else {
+        var field = el('textarea', value); field.value = value;
+        document.body.appendChild(field); field.select();
+        try { if (document.execCommand('copy')) copied(); else toast('Copy manually: ' + value, 'err'); }
+        catch (ignore) { toast('Copy manually: ' + value, 'err'); }
+        field.remove(); button.focus();
+      }
+    }
+    $('copyUrl').addEventListener('click', function () { copy(this); });
+    $('copyLobby').addEventListener('click', function () { copy(this); });
+    $('inviteBtn').addEventListener('click', function () {
+      if (mode === 'lobby') { location.href = '/dashboard#invite'; return; }
+      var panel = $('connectPanel'); panel.classList.toggle('hidden');
+      var open = !panel.classList.contains('hidden');
+      this.classList.toggle('on', open); this.setAttribute('aria-expanded', String(open));
+      if (open) qr($('inviteQr'), currentUrl);
     });
-    $('txtBtn').addEventListener('click',function(){var field=$('txtMsg'),value=field.value.trim();if(!value)return;var name='note-'+new Date().toISOString().replace(/[:.]/g,'-')+'.txt';stage([new File([value],name,{type:'text/plain'})]);field.value='';toast('Note added to send queue')});
-    $('txtMsg').addEventListener('keydown',function(e){if(e.key==='Enter')$('txtBtn').click()});
-    function renderLobby(info){var preferred=info.addresses.find(function(a){try{return new URL(a.url).hostname===location.hostname}catch(e){return false}});
-      currentUrl=(preferred||info.addresses[0]||{}).url||location.origin+'/dashboard';var url=currentUrl;$('lobbyUrl').textContent=url;$('urlBox').textContent=url;
-      if(lastQr!==url){lastQr=url;qr($('lobbyQr'),url);if(!$('connectPanel').classList.contains('hidden'))qr($('inviteQr'),url)}
-      var box=$('bearers');box.replaceChildren();(info.addresses||[]).forEach(function(a){var chip=el('div','','bchip'+(a.url.indexOf(location.hostname)>=0?' pri':''));chip.appendChild(el('i'));chip.appendChild(el('span',(a.kind||'Local network')+' · '+a.url));box.appendChild(chip)});
-      if(!box.childElementCount)box.appendChild(el('p','No active local address. Connect to a network and retry.','hint'));
-      $('lobbyCount').textContent=info.lobbyActive?'Native lobby active · '+info.files.length+' file(s)':'No native file share pending';
-      var warning=$('lobbyWarning');warning.classList.toggle('hidden',!!box.childElementCount&&info.addresses.length>0);warning.textContent='No local network bearer is currently available. Browser transfers cannot start until the host reconnects.'
+    if (location.hash === '#invite' && mode === 'dashboard') $('inviteBtn').click();
+    function notificationButton() {
+      $('notifBtn').classList.toggle('on', notifOn);
+      $('notifBtn').setAttribute('aria-pressed', String(notifOn));
     }
-    async function refresh(){try{var response=await fetch('/api/portal',{cache:'no-store'});if(!response.ok)throw Error('Host unavailable');var info=await response.json();info.files=Array.isArray(info.files)?info.files:[];info.addresses=Array.isArray(info.addresses)?info.addresses:[];window.portalFiles=info.files;limit=Number(info.maxUploadBytes)||0;$('limit').textContent=limit?'Host browser upload limit: '+fmt(limit):'';renderDevices(info);renderTransfers(info.files);renderLobby(info);
-      var current=new Set(info.files.map(function(f){return f.id}));if(known!==null)info.files.forEach(function(f){if(!known.has(f.id)){toast('New file available: '+f.name,'ok');notify(f.name)}});known=current
-    }catch(e){$('onlineCount').textContent='Host connection lost';$('lobbyCount').textContent='Host connection lost';$('lobbyWarning').classList.remove('hidden');$('lobbyWarning').textContent='Cannot reach the host. The network address may have changed.'}}
-    refresh();setInterval(refresh,4000);window.addEventListener('focus',refresh)
+    notificationButton();
+    $('notifBtn').addEventListener('click', function () {
+      notifOn = !notifOn; notificationButton();
+      try { localStorage.setItem('ftportalNotif', notifOn ? '1' : '0'); } catch (ignore) {}
+      if (notifOn) {
+        try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); audio.resume().catch(function () {}); } catch (ignore) {}
+        if (window.Notification && Notification.permission === 'default') Notification.requestPermission().catch(function () {});
+      }
+      toast(notifOn ? 'Notifications on' : 'Notifications off');
+    });
+    function notify(name) {
+      if (!notifOn) return;
+      try {
+        if (audio && audio.state === 'running') {
+          var osc = audio.createOscillator(), gain = audio.createGain();
+          osc.connect(gain); gain.connect(audio.destination); gain.gain.value = .04; osc.start();
+          osc.stop(audio.currentTime + .14);
+          osc.onended = function () { osc.disconnect(); gain.disconnect(); };
+        }
+        if (document.hidden && window.Notification && Notification.permission === 'granted') new Notification('FTPortal file waiting', { body: name });
+      } catch (ignore) {}
+    }
+    function card(icon, name, sub, cls) {
+      var node = el('div', '', 'dev ' + cls);
+      node.appendChild(el('div', icon, 'dev-icon'));
+      node.appendChild(el('div', name, 'dev-name')); node.appendChild(el('div', sub, 'dev-sub'));
+      return node;
+    }
+    function renderDevices(info) {
+      var key = JSON.stringify([info.alias, info.platform]);
+      if (key !== deviceKey) {
+        deviceKey = key;
+        $('devices').replaceChildren(
+          card('↑', 'This browser', 'Send files directly to the host', 'public'),
+          card('↓', info.alias || info.platform || 'This device', (info.platform || 'FTPortal') + ' · receiving host', 'self')
+        );
+      }
+      $('myNick').textContent = info.alias || info.platform || 'FTPortal';
+      $('onlineCount').textContent = 'Local · ' + files.length + ' file(s) ready';
+      $('readyBadge').textContent = files.length + ' ready';
+    }
+    function renderTransfers(force) {
+      var query = $('search').value.trim().toLocaleLowerCase();
+      var key = JSON.stringify([files, sent, filter, query, shown]);
+      if (!force && key === transferKey) return;
+      transferKey = key;
+      var rows = [];
+      if (filter !== 'sent') files.forEach(function (file) { rows.push({ kind: 'available', name: file.name, size: Number(file.size), id: file.id }); });
+      if (filter !== 'available') sent.forEach(function (file) { rows.push({ kind: 'sent', name: file.name, size: file.size, created: file.created }); });
+      if (query) rows = rows.filter(function (file) { return file.name.toLocaleLowerCase().includes(query); });
+      var body = $('transferBody'), fragment = document.createDocumentFragment();
+      if (!rows.length) {
+        var empty = el('tr'), cell = el('td', query ? 'No matching files.' : filter === 'sent' ? 'Your send receipts will appear here.' : 'No files waiting. Share files from the host app.', 'empty');
+        cell.colSpan = 6; empty.appendChild(cell); fragment.appendChild(empty);
+      }
+      rows.slice(0, shown).forEach(function (file) {
+        var tr = el('tr'); tr.appendChild(el('td', file.kind === 'available' ? '↓' : '↑'));
+        tr.appendChild(el('td', file.name, 'td-nm')); tr.appendChild(el('td', fmt(file.size)));
+        var from = el('td'); from.appendChild(el('span', file.kind === 'available' ? 'Host → You' : 'You → Host', 'pill' + (file.kind === 'sent' ? ' me' : '')));
+        tr.appendChild(from); tr.appendChild(el('td', file.created ? new Date(file.created).toLocaleString() : 'Available', 'dt'));
+        var action = el('td');
+        if (file.id) {
+          var link = el('a', '↓ Download', 'dl'); link.href = '/download/' + encodeURIComponent(file.id);
+          link.setAttribute('download', ''); link.setAttribute('aria-label', 'Download ' + file.name);
+          link.addEventListener('click', function () { toast('Download handed to your browser. The share disappears after the host finishes sending.'); });
+          action.appendChild(link);
+        } else action.appendChild(el('span', '✓ Received', 'fi-stat ok'));
+        tr.appendChild(action); fragment.appendChild(tr);
+      });
+      body.replaceChildren(fragment);
+      $('resultCount').textContent = Math.min(shown, rows.length) + ' of ' + rows.length + ' file(s)';
+      $('moreBtn').classList.toggle('hidden', rows.length <= shown);
+    }
+    document.querySelectorAll('.tab').forEach(function (tab) {
+      tab.setAttribute('aria-pressed', String(tab.dataset.filter === filter));
+      tab.addEventListener('click', function () {
+        filter = tab.dataset.filter; shown = 100;
+        document.querySelectorAll('.tab').forEach(function (t) { t.classList.toggle('on', t === tab); t.setAttribute('aria-pressed', String(t === tab)); });
+        renderTransfers(true);
+      });
+    });
+    $('search').addEventListener('input', function () { shown = 100; renderTransfers(); });
+    $('moreBtn').addEventListener('click', function () { shown += 100; renderTransfers(); });
+    function fileKey(file) { return JSON.stringify([file.name, file.size, file.lastModified]); }
+    function stage(selected) {
+      if (sending) return;
+      var rejected = 0;
+      Array.prototype.forEach.call(selected, function (file) {
+        var key = fileKey(file);
+        if (queueKeys.has(key)) return;
+        if (queue.length >= 200) { rejected++; return; }
+        queueKeys.add(key); queue.push({ file: file, key: key, state: 'wait', error: '', loaded: 0 });
+      });
+      if (rejected) toast('The queue holds up to 200 files. Send this batch before adding more.', 'err');
+      renderQueue();
+    }
+    function renderQueue() {
+      var key = JSON.stringify([queue.map(function (item) { return [item.key, item.state, item.error]; }), limit, connected, sending, stopRequested]);
+      if (key === queueViewKey) return; queueViewKey = key;
+      var fragment = document.createDocumentFragment(), pendingBytes = 0, eligible = 0;
+      queue.forEach(function (item, index) {
+        var tooLarge = limit > 0 && item.file.size > limit;
+        pendingBytes += item.file.size; if (!tooLarge) eligible++;
+        var row = el('div', '', 'fileitem' + (tooLarge || item.state === 'err' ? ' error' : ''));
+        row.appendChild(el('span', '↑', 'fi-ic')); var name = el('span', item.file.name, 'fi-name'); name.title = item.file.name; row.appendChild(name);
+        row.appendChild(el('span', fmt(item.file.size), 'fi-size'));
+        var status = tooLarge ? 'Over ' + fmt(limit) + ' limit' : item.state === 'up' ? 'Sending…' : item.state === 'err' ? 'Retry' : item.state === 'cancel' ? 'Cancelled' : 'Ready';
+        var statusNode = el('span', status, 'fi-stat' + (tooLarge || item.state === 'err' ? ' err' : ''));
+        statusNode.title = item.error || status; row.appendChild(statusNode);
+        if (!sending) {
+          var remove = el('button', '✕', 'fi-x'); remove.type = 'button'; remove.setAttribute('aria-label', 'Remove ' + item.file.name);
+          remove.addEventListener('click', function () { queueKeys.delete(item.key); queue.splice(index, 1); renderQueue(); }); row.appendChild(remove);
+        }
+        fragment.appendChild(row);
+      });
+      $('fileList').replaceChildren(fragment);
+      $('upBtn').disabled = sending || !connected || eligible === 0;
+      $('upBtn').textContent = sending ? 'Sending…' : queue.some(function (item) { return item.state === 'err' || item.state === 'cancel'; }) ? 'Send / retry remaining' : 'Send files';
+      $('clearBtn').classList.toggle('hidden', !queue.length || sending);
+      $('cancelBtn').classList.toggle('hidden', !sending); $('cancelBtn').disabled = stopRequested;
+      $('queueBadge').textContent = queue.length ? queue.length + ' queued' : 'Queue empty';
+      $('countLbl').textContent = queue.length ? queue.length + ' file(s) · ' + fmt(pendingBytes) + (!connected ? ' · waiting for host' : '') : 'Up to 200 files per batch';
+      $('drop').setAttribute('aria-disabled', String(sending)); $('file').disabled = sending; $('txtBtn').disabled = sending;
+    }
+    $('file').addEventListener('change', function () { stage(this.files); this.value = ''; });
+    $('clearBtn').addEventListener('click', function () { queue = []; queueKeys.clear(); renderQueue(); });
+    $('drop').addEventListener('keydown', function (event) { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); if (!sending) $('file').click(); } });
+    ['dragenter', 'dragover'].forEach(function (event) { $('drop').addEventListener(event, function (e) { e.preventDefault(); if (!sending) this.classList.add('over'); }); });
+    ['dragleave', 'drop'].forEach(function (event) { $('drop').addEventListener(event, function (e) { e.preventDefault(); this.classList.remove('over'); }); });
+    $('drop').addEventListener('drop', function (e) { if (e.dataTransfer) stage(e.dataTransfer.files); });
+    function upload(item, index, count) {
+      return new Promise(function (done) {
+        var xhr = new XMLHttpRequest(), idleTimer = null, settled = false, started = Date.now(), lastPaint = 0;
+        activeUpload = xhr; item.state = 'up'; item.error = ''; renderQueue();
+        $('bar').style.width = '0%'; $('barWrap').setAttribute('aria-valuenow', '0');
+        $('upStats').textContent = 'File ' + index + ' / ' + count + ' · ' + item.file.name;
+        function finish(ok, detail) {
+          if (settled) return; settled = true; clearTimeout(idleTimer);
+          if (activeUpload === xhr) activeUpload = null;
+          item.state = ok ? 'ok' : stopRequested ? 'cancel' : 'err'; item.error = detail || '';
+          if (!ok && !stopRequested) toast(item.file.name + ': ' + detail, 'err'); done(ok);
+        }
+        function rearm(milliseconds) {
+          clearTimeout(idleTimer);
+          idleTimer = setTimeout(function () { finish(false, 'No response from host. Check its received files before retrying.'); xhr.abort(); }, milliseconds);
+        }
+        try {
+          var data = new FormData(); data.append('file', item.file, item.file.name); xhr.open('POST', '/upload', true);
+          xhr.upload.onprogress = function (event) {
+            rearm(60000);
+            if (!event.lengthComputable) return;
+            item.loaded = Math.min(item.file.size, Math.round(item.file.size * event.loaded / event.total));
+            var now = Date.now(); if (now - lastPaint < 150 && event.loaded !== event.total) return; lastPaint = now;
+            var percentage = Math.min(100, Math.round(100 * event.loaded / event.total));
+            var speed = item.loaded / Math.max(.1, (now - started) / 1000);
+            $('bar').style.width = percentage + '%'; $('barWrap').setAttribute('aria-valuenow', String(percentage));
+            $('upStats').textContent = 'File ' + index + ' / ' + count + ' · ' + fmt(item.loaded) + ' / ' + fmt(item.file.size) + ' · ' + fmt(speed) + '/s · ' + (percentage === 100 ? 'Waiting for host to save…' : 'ETA ' + Math.ceil((item.file.size - item.loaded) / Math.max(1, speed)) + 's');
+          };
+          xhr.upload.onload = function () { rearm(120000); };
+          xhr.onload = function () {
+            var response = null; try { response = JSON.parse(xhr.responseText); } catch (ignore) {}
+            var ok = xhr.status >= 200 && xhr.status < 300 && response && response.ok === true;
+            finish(!!ok, response && (response.error || response.msg) || 'Host did not confirm the saved file (HTTP ' + xhr.status + ').');
+          };
+          xhr.onerror = function () { finish(false, 'Connection interrupted. Check host before retrying.'); };
+          xhr.onabort = function () { finish(false, 'Cancelled. A file already saved by the host may remain there.'); };
+          xhr.ontimeout = function () { finish(false, 'Host timed out. Check host before retrying.'); };
+          rearm(60000); xhr.send(data);
+        } catch (error) { finish(false, 'Could not start the upload.'); }
+      });
+    }
+    $('cancelBtn').addEventListener('click', function () { stopRequested = true; this.disabled = true; if (activeUpload) activeUpload.abort(); });
+    $('upBtn').addEventListener('click', async function () {
+      if (sending || !connected) return;
+      var pending = queue.filter(function (item) { return !limit || item.file.size <= limit; });
+      if (!pending.length) return;
+      clearTimeout(progressTimer); sending = true; stopRequested = false; renderQueue(); $('barWrap').classList.add('show');
+      var success = 0;
+      try {
+        for (var index = 0; index < pending.length && !stopRequested; index++) {
+          var item = pending[index];
+          if (await upload(item, index + 1, pending.length)) {
+            success++; sent.unshift({ name: item.file.name, size: item.file.size, created: new Date().toISOString() }); sent = sent.slice(0, 100);
+            queueKeys.delete(item.key); queue = queue.filter(function (entry) { return entry !== item; });
+            // Drop the File/Blob reference as soon as a confirmed receipt exists.
+            pending[index] = null; item.file = null;
+          }
+          renderQueue(); renderTransfers();
+          if (!connected) stopRequested = true;
+        }
+      } finally {
+        sending = false; activeUpload = null; renderQueue();
+        $('upStats').textContent = success + ' / ' + pending.length + ' received by host' + (stopRequested ? ' · queue stopped' : queue.length ? ' · remaining files kept for retry' : ' · complete');
+        toast($('upStats').textContent, !stopRequested && success === pending.length ? 'ok' : '');
+        progressTimer = setTimeout(function () { $('barWrap').classList.remove('show'); }, 2500);
+        refresh();
+      }
+    });
+    $('txtBtn').addEventListener('click', function () {
+      if (sending) return;
+      var field = $('txtMsg'), value = field.value.trim(); if (!value) return;
+      stage([new File([value], 'note-' + new Date().toISOString().replace(/[:.]/g, '-') + '.txt', { type: 'text/plain' })]);
+      field.value = ''; toast('Note added to queue. Press Send files to deliver it.');
+    });
+    $('txtMsg').addEventListener('keydown', function (event) { if (event.key === 'Enter') $('txtBtn').click(); });
+    function updateAddress(value) {
+      currentUrl = value; $('lobbyUrl').textContent = value; $('urlBox').textContent = value;
+      if (lastQr !== value) {
+        lastQr = value;
+        if (mode === 'lobby') qr($('lobbyQr'), value);
+        if (!$('connectPanel').classList.contains('hidden')) qr($('inviteQr'), value);
+      }
+    }
+    $('addressChoice').addEventListener('change', function () { selectedAddress = this.value; updateAddress(this.value); });
+    function renderLobby(info) {
+      var addresses = info.addresses, preferred = addresses.find(function (address) { return address.url === selectedAddress; }) ||
+        addresses.find(function (address) { return new URL(address.url).hostname === location.hostname; }) || addresses[0];
+      selectedAddress = preferred ? preferred.url : '';
+      updateAddress(selectedAddress || location.origin + '/dashboard');
+      var key = JSON.stringify([addresses, selectedAddress]);
+      if (key !== lobbyKey) {
+        lobbyKey = key; var box = $('bearers'), select = $('addressChoice'); box.replaceChildren(); select.replaceChildren();
+        addresses.forEach(function (address) {
+          var chip = el('div', '', 'bchip' + (address.url === selectedAddress ? ' pri' : '')); chip.appendChild(el('i'));
+          chip.appendChild(el('span', (address.kind || 'Local network') + ' · ' + address.url)); box.appendChild(chip);
+          var option = el('option', (address.kind || 'Local network') + ' · ' + address.url); option.value = address.url; select.appendChild(option);
+        });
+        select.value = selectedAddress; select.classList.toggle('hidden', addresses.length < 2);
+        if (!addresses.length) box.appendChild(el('p', 'No active local address. Connect to a network and retry.', 'hint'));
+      }
+      $('lobbyCount').textContent = info.lobbyActive ? 'Native lobby active · ' + files.length + ' file(s)' : 'No native file share pending';
+      $('nativeStatus').textContent = info.peerAvailable === false ? 'Native peer listener unavailable. Browser transfers remain available.' : 'Native offers and discovery are managed in the host app.';
+      $('lobbyWarning').classList.toggle('hidden', addresses.length > 0);
+      $('lobbyWarning').textContent = 'No local network address is available. Connect the host and refresh before inviting another device.';
+    }
+    function normalise(info) {
+      if (!info || typeof info !== 'object' || !Array.isArray(info.files) || !Array.isArray(info.addresses)) throw Error('Invalid host response');
+      info.files = info.files.filter(function (file) { return file && typeof file.id === 'string' && typeof file.name === 'string'; });
+      info.addresses = info.addresses.filter(function (address) {
+        try { var url = new URL(address.url); return /^https?:$/.test(url.protocol) && !url.username && !url.password; } catch (ignore) { return false; }
+      });
+      return info;
+    }
+    function connection(ok, detail) {
+      connected = ok;
+      $('hostDot').classList.toggle('offline', !ok); $('connection').classList.toggle('offline', !ok);
+      $('connectionText').textContent = ok ? 'Connected to host' : 'Host connection lost';
+      $('connectionDetail').textContent = detail; renderQueue();
+      if (!ok) { $('onlineCount').textContent = 'Reconnecting…'; $('lobbyCount').textContent = 'Host connection lost'; $('lobbyWarning').classList.remove('hidden'); $('lobbyWarning').textContent = 'Cannot reach the host. Check the network and refresh; the address may have changed.'; }
+    }
+    function schedule() {
+      clearTimeout(pollTimer);
+      if (!stopped) pollTimer = setTimeout(refresh, failures ? Math.min(30000, 4000 * Math.pow(2, failures - 1)) : document.hidden ? 15000 : 4000);
+    }
+    async function refresh() {
+      if (polling || stopped) return;
+      clearTimeout(pollTimer); polling = true;
+      var controller = new AbortController(), deadline = setTimeout(function () { controller.abort(); }, 8000);
+      try {
+        var response = await fetch('/api/portal', { cache: 'no-store', signal: controller.signal });
+        if (!response.ok) throw Error('Host unavailable');
+        var info = normalise(await response.json()); files = info.files; window.portalFiles = files;
+        limit = Math.max(0, Number(info.maxUploadBytes) || 0); failures = 0;
+        $('limit').textContent = limit ? 'Browser limit: ' + fmt(limit) + ' per file. Use the native app for larger transfers.' : '';
+        renderDevices(info); renderTransfers(); renderLobby(info);
+        connection(true, info.platform + ' · ' + files.length + ' file(s) ready');
+        var current = new Set(files.map(function (file) { return file.id; }));
+        if (known !== null) {
+          var added = files.filter(function (file) { return !known.has(file.id); });
+          if (added.length) { toast(added.length === 1 ? 'New file available: ' + added[0].name : added.length + ' new files available', 'ok'); notify(added[0].name); }
+        }
+        known = current;
+      } catch (ignore) { failures++; connection(false, 'Automatic retry · or press Refresh'); }
+      finally { clearTimeout(deadline); polling = false; schedule(); }
+    }
+    $('refreshBtn').addEventListener('click', refresh);
+    window.addEventListener('focus', refresh);
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) refresh(); else if (!polling) schedule(); });
+    window.addEventListener('pagehide', function () { stopped = true; clearTimeout(pollTimer); if (audio) audio.close(); });
+    window.addEventListener('pageshow', function () { if (stopped) { stopped = false; audio = null; refresh(); } });
+    window.addEventListener('beforeunload', function (event) { if (sending) { event.preventDefault(); event.returnValue = ''; } });
+    renderQueue(); refresh();
   })();
   </script>
 </body>

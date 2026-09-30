@@ -81,14 +81,18 @@ class MainActivity : ComponentActivity() {
     private var pendingRemote: RemoteSelection? = null
     private var pendingIncomingOffer: IncomingPeerOffer? = null
     private var scanning = false
+    private var tickerCount = 0
+    private var renderedShares: List<SharedFile>? = null
+    private var renderedOffers: List<IncomingPeerOffer>? = null
+    private var renderedActive: List<TransferSnapshot>? = null
+    private var renderedHistory: List<TransferHistoryEntry>? = null
     private var currentScreen = PortalScreen.HOME
     private val handler = Handler(Looper.getMainLooper())
 
     private val uiTicker = object : Runnable {
         override fun run() {
-            refreshIncomingOffers()
-            renderActiveTransfers()
-            refreshBackgroundControls()
+            if (tickerCount++ % 5 == 0) refresh()
+            else { renderShares(); refreshIncomingOffers(); renderActiveTransfers() }
             if (currentScreen == PortalScreen.HISTORY) renderHistory()
             handler.postDelayed(this, 1_000)
         }
@@ -179,13 +183,19 @@ class MainActivity : ComponentActivity() {
         startPortal()
         refresh()
         refreshLobbies()
-        handler.post(uiTicker)
     }
 
     override fun onResume() {
         super.onResume()
         refresh()
         refreshBackgroundControls()
+        handler.removeCallbacks(uiTicker)
+        handler.post(uiTicker)
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(uiTicker)
+        super.onPause()
     }
 
     override fun onDestroy() {
@@ -441,8 +451,10 @@ class MainActivity : ComponentActivity() {
 
     private fun renderShares() {
         if (!::sharesContainer.isInitialized) return
-        sharesContainer.removeAllViews()
         val files = ShareRegistry.all()
+        if (files == renderedShares) return
+        renderedShares = files
+        sharesContainer.removeAllViews()
         if (files.isEmpty()) {
             sharesContainer.addView(emptyText("Nothing pending. Sharing a file makes this device visible as a lobby."))
             return
@@ -456,6 +468,8 @@ class MainActivity : ComponentActivity() {
     private fun renderActiveTransfers() {
         if (!::activeContainer.isInitialized) return
         val transfers = TransferCenter.active()
+        if (transfers == renderedActive) return
+        renderedActive = transfers
         activeCard.visibility = if (transfers.isEmpty()) View.GONE else View.VISIBLE
         activeContainer.removeAllViews()
         transfers.forEachIndexed { index, transfer ->
@@ -485,6 +499,8 @@ class MainActivity : ComponentActivity() {
     private fun refreshIncomingOffers() {
         if (!::incomingContainer.isInitialized) return
         val offers = PeerOfferStore.incoming()
+        if (offers == renderedOffers) return
+        renderedOffers = offers
         incomingContainer.removeAllViews()
         if (offers.isEmpty()) {
             incomingContainer.addView(emptyText("No incoming offers."))
@@ -518,8 +534,10 @@ class MainActivity : ComponentActivity() {
 
     private fun renderHistory() {
         if (!::historyContainer.isInitialized) return
-        historyContainer.removeAllViews()
         val history = TransferCenter.history(applicationContext)
+        if (history == renderedHistory) return
+        renderedHistory = history
+        historyContainer.removeAllViews()
         if (history.isEmpty()) {
             addCard(historyContainer, card().apply { addView(emptyText("No transfers yet. Completed and failed native/web transfers will appear here.")) })
             return
@@ -659,6 +677,7 @@ class MainActivity : ComponentActivity() {
                         while (true) {
                             val count = input.read(buffer)
                             if (count < 0) break
+                            if (selection.file.size >= 0 && received + count > selection.file.size) error("Peer exceeded the advertised file size")
                             out.write(buffer, 0, count)
                             received += count
                             TransferCenter.update(transferId, received)
@@ -682,6 +701,7 @@ class MainActivity : ComponentActivity() {
             }
 
             runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 Toast.makeText(
                     this,
                     if (errorMessage == null) "Received ${selection.file.name}" else "Transfer failed: $errorMessage",

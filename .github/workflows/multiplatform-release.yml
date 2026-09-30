@@ -23,6 +23,12 @@ jobs:
           node-version: '22'
       - name: Check shared dashboard, lobby, and browser contracts
         run: node --test WEB/tests/portal.test.mjs
+      - name: Install browser test runtime
+        run: |
+          npm ci --prefix WEB --ignore-scripts
+          WEB/node_modules/.bin/playwright install --with-deps chromium
+      - name: Exercise real browser dashboard and lobby
+        run: node WEB/tests/browser-smoke.mjs
 
   powershell:
     runs-on: windows-latest
@@ -120,11 +126,18 @@ jobs:
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '8.0.x'
+      - name: Exercise Windows HTTP host and selection lifecycle
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet run --project .\WINDOWS\tests\Smoke\FTPortal.Smoke.csproj -c Release -r win-x64 -p:SelfContained=false -p:PublishSingleFile=false
+          if ($LASTEXITCODE -ne 0) { throw "Windows smoke failed" }
       - name: Publish Windows x64
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           dotnet publish .\WINDOWS\FTPortal.Windows.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o .\WINDOWS\publish
+          if ($LASTEXITCODE -ne 0) { throw "Windows publish failed" }
           Compress-Archive -Path .\WINDOWS\publish\* -DestinationPath .\FTPortal-Windows-x64.zip -Force
       - uses: actions/upload-artifact@v7
         with:
@@ -134,7 +147,7 @@ jobs:
 
   release:
     if: github.event_name != 'pull_request'
-    needs: [powershell, android, ios, windows]
+    needs: [web-portal, powershell, android, ios, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

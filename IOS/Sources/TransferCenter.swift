@@ -5,7 +5,7 @@ enum TransferDirection: String, Codable {
     case receive
 }
 
-struct TransferSnapshot: Identifiable {
+struct TransferSnapshot: Identifiable, Equatable {
     let id: String
     let direction: TransferDirection
     let fileName: String
@@ -18,7 +18,7 @@ struct TransferSnapshot: Identifiable {
     let startedAt: Int64
 }
 
-struct TransferHistoryEntry: Identifiable, Codable {
+struct TransferHistoryEntry: Identifiable, Codable, Equatable {
     let id: String
     let direction: TransferDirection
     let fileName: String

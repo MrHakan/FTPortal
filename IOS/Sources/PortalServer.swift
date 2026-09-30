@@ -6,6 +6,12 @@ final class PortalServer {
     static let legacyPort: UInt16 = 8080
     static let peerPort: UInt16 = UInt16(PeerProtocol.peerPort)
 
+    private let stateLock = NSLock()
+    private var legacyReady = false
+    private var peerReady = false
+    var isReady: Bool { stateLock.lock(); defer { stateLock.unlock() }; return legacyReady }
+    var peerAvailable: Bool { stateLock.lock(); defer { stateLock.unlock() }; return peerReady }
+
     private var legacyListener: NWListener?
     private var peerListener: NWListener?
     private let queue = DispatchQueue(label: "ftportal.listener")
@@ -14,6 +20,8 @@ final class PortalServer {
     // Native v2 transfers remain the unrestricted route for larger files.
     private let maximumBodyBytes = 32 * 1024 * 1024 + 128 * 1024
     private let maximumBrowserUploadBytes = 32 * 1024 * 1024
+    private static let qrAsset = Bundle.main.url(forResource: "qr", withExtension: "js").flatMap { try? Data(contentsOf: $0) } ?? Data("/* QR unavailable */".utf8)
+    private static let portalAsset = Bundle.main.url(forResource: "portal", withExtension: "html").flatMap { try? Data(contentsOf: $0) }
     private let headerSeparator = Data("\r\n\r\n".utf8)
 
     func start() throws {
@@ -46,54 +54,68 @@ final class PortalServer {
         let listener = try NWListener(using: .tcp, on: endpointPort)
         listener.service = NWListener.Service(name: "FTPortal-\(PeerIdentity.alias())", type: serviceType)
         listener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
-        listener.stateUpdateHandler = { state in
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            let ready: Bool
+            if case .ready = state { ready = true } else { ready = false }
+            self.stateLock.lock()
+            if port == Self.legacyPort { self.legacyReady = ready }
+            if port == Self.peerPort { self.peerReady = ready }
+            self.stateLock.unlock()
             if case .failed(let error) = state { print("FTPortal listener \(port) failed: \(error)") }
         }
         return listener
     }
 
-    private func accept(_ connection: NWConnection) {
-        connection.start(queue: queue)
-        receiveRequest(connection, buffer: Data())
+    private final class RequestBuffer {
+        var data = Data()
+        var requiredBytes: Int?
     }
 
-    private func receiveRequest(_ connection: NWConnection, buffer: Data) {
+    private func accept(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        guard LocalNetworkGuard.isAllowed(remoteHost(connection)) else {
+            sendText(connection, status: "403 Forbidden", body: "Client is outside the active local network")
+            return
+        }
+        receiveRequest(connection, request: RequestBuffer())
+    }
+
+    private func receiveRequest(_ connection: NWConnection, request: RequestBuffer) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, complete, error in
             guard let self else { connection.cancel(); return }
-            var next = buffer
-            if let data { next.append(data) }
-
-            if let headerRange = next.range(of: self.headerSeparator) {
-                let headerLength = headerRange.lowerBound
-                if headerLength > self.maximumHeaderBytes {
+            // A shared reference accumulates bytes in one Data value. Passing
+            // Data by value and appending at every callback repeatedly copied
+            // the whole body, making large browser uploads quadratic.
+            if let data { request.data.append(data) }
+            if request.requiredBytes == nil {
+                if let headerRange = request.data.range(of: self.headerSeparator) {
+                    let headerLength = headerRange.lowerBound
+                    guard headerLength <= self.maximumHeaderBytes else {
+                        self.sendText(connection, status: "431 Request Header Fields Too Large", body: "Header too large")
+                        return
+                    }
+                    let bodyLength = self.contentLength(in: Data(request.data.prefix(headerLength)))
+                    guard bodyLength >= 0, bodyLength <= self.maximumBodyBytes else {
+                        self.sendText(connection, status: "413 Payload Too Large", body: "Request body too large")
+                        return
+                    }
+                    request.requiredBytes = headerRange.upperBound + bodyLength
+                } else if request.data.count >= self.maximumHeaderBytes {
                     self.sendText(connection, status: "431 Request Header Fields Too Large", body: "Header too large")
                     return
                 }
-                let headerData = Data(next.prefix(headerLength))
-                let bodyLength = self.contentLength(in: headerData)
-                guard bodyLength >= 0, bodyLength <= self.maximumBodyBytes else {
-                    self.sendText(connection, status: "413 Payload Too Large", body: "Request body too large")
-                    return
-                }
-                let required = headerRange.upperBound + bodyLength
-                if next.count >= required {
-                    self.route(connection, request: Data(next.prefix(required)))
-                    return
-                }
-            } else if next.count >= self.maximumHeaderBytes {
-                self.sendText(connection, status: "431 Request Header Fields Too Large", body: "Header too large")
+            }
+            if let required = request.requiredBytes, request.data.count >= required {
+                self.route(connection, request: Data(request.data.prefix(required)))
                 return
             }
-
-            if next.count > self.maximumHeaderBytes + self.maximumBodyBytes + self.headerSeparator.count {
+            if request.data.count > self.maximumHeaderBytes + self.maximumBodyBytes + self.headerSeparator.count {
                 self.sendText(connection, status: "413 Payload Too Large", body: "Request too large")
                 return
             }
-            if error != nil || complete {
-                connection.cancel()
-                return
-            }
-            self.receiveRequest(connection, buffer: next)
+            if error != nil || complete { connection.cancel(); return }
+            self.receiveRequest(connection, request: request)
         }
     }
 
@@ -143,7 +165,7 @@ final class PortalServer {
         if method == "GET" && (path == "/" || path == "/dashboard" || path == "/lobby") {
             sendHtml(connection)
         } else if method == "GET" && path == "/qr.js" {
-            let data = Bundle.main.url(forResource: "qr", withExtension: "js").flatMap { try? Data(contentsOf: $0) } ?? Data("/* QR unavailable */".utf8)
+            let data = Self.qrAsset
             sendResponse(connection, status: "200 OK", contentType: "application/javascript; charset=utf-8", data: data)
         } else if method == "GET" && path == "/api/portal" {
             sendPortal(connection)
@@ -377,7 +399,8 @@ final class PortalServer {
         let payload: [String: Any] = [
             "platform": "iOS", "alias": PeerIdentity.alias(),
             "maxUploadBytes": maximumBrowserUploadBytes,
-            "lobbyActive": !files.isEmpty && peerListener != nil,
+            "lobbyActive": !files.isEmpty && peerAvailable,
+            "peerAvailable": peerAvailable,
             "files": files.map { ["id": $0.id, "name": $0.name, "size": $0.size, "mime": $0.mime] as [String: Any] },
             "addresses": addresses
         ]
@@ -386,8 +409,7 @@ final class PortalServer {
     }
 
     private func sendHtml(_ connection: NWConnection) {
-        if let asset = Bundle.main.url(forResource: "portal", withExtension: "html"),
-           let data = try? Data(contentsOf: asset) {
+        if let data = Self.portalAsset {
             sendResponse(connection, status: "200 OK", contentType: "text/html; charset=utf-8", data: data)
             return
         }

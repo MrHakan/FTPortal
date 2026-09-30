@@ -18,9 +18,9 @@ internal sealed record TransportAddress(
 
 /// <summary>
 /// Reads the current Windows network topology and owns the Mobile Hotspot
-/// fallback operation. The host is deliberately evaluated on every snapshot:
-/// Wi-Fi, LAN and hotspot addresses can appear or disappear without restarting
-/// the Kestrel listeners.
+/// fallback operation. Topology is cached for at most one second and invalidated
+/// immediately on network change events. Bearers can change without restarting
+/// Kestrel, without enumerating every adapter for every HTTP request.
 /// </summary>
 internal sealed class NetworkTransportManager : IDisposable
 {
@@ -40,6 +40,9 @@ internal sealed class NetworkTransportManager : IDisposable
         "wsl"
     ];
 
+    private readonly object _snapshotGate = new();
+    private IReadOnlyList<TransportAddress> _snapshot = [];
+    private long _snapshotAt = long.MinValue;
     public event EventHandler? NetworkChanged;
 
     public NetworkTransportManager()
@@ -49,6 +52,17 @@ internal sealed class NetworkTransportManager : IDisposable
     }
 
     public IReadOnlyList<TransportAddress> Snapshot()
+    {
+        lock (_snapshotGate)
+        {
+            var now = Environment.TickCount64;
+            if (_snapshotAt != long.MinValue && now - _snapshotAt < 1000) return _snapshot;
+            _snapshot = ReadSnapshot(); _snapshotAt = now;
+            return _snapshot;
+        }
+    }
+
+    private static IReadOnlyList<TransportAddress> ReadSnapshot()
     {
         var result = new List<TransportAddress>();
 
@@ -204,7 +218,11 @@ internal sealed class NetworkTransportManager : IDisposable
                 .FirstOrDefault(profile => profile.NetworkAdapter is not null);
     }
 
-    private void OnNetworkChanged(object? sender, EventArgs args) => NetworkChanged?.Invoke(this, args);
+    private void OnNetworkChanged(object? sender, EventArgs args)
+    {
+        lock (_snapshotGate) _snapshotAt = long.MinValue;
+        NetworkChanged?.Invoke(this, args);
+    }
 
     private static (string Kind, int Priority) Classify(NetworkInterface nic)
     {

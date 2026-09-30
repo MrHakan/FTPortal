@@ -285,29 +285,47 @@ internal static class PeerDiscovery
     private static async Task<PeerLobby?> ProbeAsync(string host, CancellationToken cancellationToken)
     {
         var v2 = await ProbeVersionAsync(host, PeerProtocol.InfoPathV2, PeerProtocol.VersionV2, cancellationToken);
-        if (v2 is not null) return v2;
-        return await ProbeVersionAsync(host, PeerProtocol.InfoPathV1, PeerProtocol.VersionV1, cancellationToken);
+        if (v2.Lobby is not null || !v2.TryLegacy) return v2.Lobby;
+        var v1 = await ProbeVersionAsync(host, PeerProtocol.InfoPathV1, PeerProtocol.VersionV1, cancellationToken);
+        return v1.Lobby;
     }
 
-    private static async Task<PeerLobby?> ProbeVersionAsync(
+    private static async Task<(PeerLobby? Lobby, bool TryLegacy)> ProbeVersionAsync(
         string host,
         string path,
         string clientVersion,
         CancellationToken cancellationToken)
     {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(TimeSpan.FromMilliseconds(900));
+        cancellationToken = deadline.Token;
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, $"http://{host}:{PeerProtocol.Port}{path}");
             request.Headers.TryAddWithoutValidation("X-FTPortal-Client", clientVersion);
             request.Headers.Accept.ParseAdd("application/json");
             using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-            if (response.StatusCode != HttpStatusCode.OK) return null;
-            var json = await response.Content.ReadAsStringAsync(cancellationToken);
-            return PeerProtocol.ParseLobby(host, json);
+            if (response.StatusCode != HttpStatusCode.OK)
+                return (null, response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed);
+            // Discovery metadata must be bounded even when a local HTTP service
+            // on the peer port is not FTPortal. Read only one small manifest.
+            const int maximumInfoBytes = 256 * 1024;
+            if (response.Content.Headers.ContentLength > maximumInfoBytes) return (null, false);
+            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var body = new MemoryStream();
+            var buffer = new byte[8192];
+            while (true)
+            {
+                var count = await source.ReadAsync(buffer, cancellationToken);
+                if (count == 0) break;
+                if (body.Length + count > maximumInfoBytes) return (null, false);
+                body.Write(buffer, 0, count);
+            }
+            return (PeerProtocol.ParseLobby(host, System.Text.Encoding.UTF8.GetString(body.ToArray())), false);
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
         {
-            return null;
+            return (null, false);
         }
     }
 }

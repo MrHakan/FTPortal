@@ -25,6 +25,9 @@ final class AppModel: ObservableObject {
     @Published var activeTransfers: [TransferSnapshot] = []
     @Published var transferHistory: [TransferHistoryEntry] = []
     @Published var isScanning = false
+    @Published var portalURL: URL?
+    @Published var hostReachable = false
+    private var startupError: String?
 
     let server = PortalServer()
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
@@ -34,7 +37,8 @@ final class AppModel: ObservableObject {
             try server.start()
             refresh()
         } catch {
-            status = "Host failed: \(error.localizedDescription)"
+            startupError = "Host failed: \(error.localizedDescription)"
+            status = startupError!
         }
     }
 
@@ -43,14 +47,24 @@ final class AppModel: ObservableObject {
     func clearHistory() { TransferCenter.shared.clearHistory(); refresh() }
 
     func refresh() {
-        files = PortalStore.shared.all()
-        incomingOffers = PeerOfferStore.shared.incoming()
-        activeTransfers = TransferCenter.shared.active()
-        transferHistory = TransferCenter.shared.history()
+        let shares = PortalStore.shared.all()
+        let offers = PeerOfferStore.shared.incoming()
+        let active = TransferCenter.shared.active()
+        let history = TransferCenter.shared.history()
+        if files != shares { files = shares }
+        if incomingOffers != offers { incomingOffers = offers }
+        if activeTransfers != active { activeTransfers = active }
+        if transferHistory != history { transferHistory = history }
         let urls = PortalServer.localIPv4().map { "http://\($0):\(PortalServer.legacyPort)" }
-        status = urls.isEmpty
+        let reachable = server.isReady && !urls.isEmpty
+        if hostReachable != reachable { hostReachable = reachable }
+        let url = reachable ? urls.first.flatMap { URL(string: $0 + "/dashboard") } : nil
+        if portalURL != url { portalURL = url }
+        let nextStatus = startupError ?? (urls.isEmpty
             ? "Connect this iPhone/iPad to Wi-Fi or a local hotspot."
-            : "Web fallback: \(urls.joined(separator: " · "))\nNative peer: \(PeerProtocol.version) · TCP \(PeerProtocol.peerPort)"
+            : !server.isReady ? "Waiting for the browser host listener…"
+            : "Web access: \(urls.joined(separator: " · "))\nNative peer: \(server.peerAvailable ? "ready" : "unavailable")")
+        if status != nextStatus { status = nextStatus }
     }
 
     func discoverLobbies() {
@@ -77,6 +91,7 @@ final class AppModel: ObservableObject {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var model: AppModel
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -90,7 +105,7 @@ struct ContentView: View {
                 .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
         }
         .tint(.indigo)
-        .onReceive(timer) { _ in model.refresh() }
+        .onReceive(timer) { _ in if scenePhase == .active { model.refresh() } }
         .task { model.discoverLobbies() }
     }
 }
@@ -111,13 +126,19 @@ struct HomeView: View {
                         }
                         .frame(width: 54, height: 54)
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("Ready for local transfer").font(.headline)
+                            Text(model.hostReachable ? "Ready for local transfer" : "Waiting for connection").font(.headline)
                             Text("No cloud. No account. Same-network delivery.").font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Circle().fill(Color.green).frame(width: 9, height: 9)
+                        Circle().fill(model.hostReachable ? Color.green : Color.orange).frame(width: 9, height: 9)
                     }
                     Text(model.status).font(.caption.monospaced()).foregroundStyle(.secondary).padding(.top, 12)
+                    if let url = model.portalURL {
+                        HStack {
+                            Link("Open dashboard", destination: url)
+                            ShareLink(item: url) { Label("Invite", systemImage: "square.and.arrow.up") }
+                        }.buttonStyle(.bordered).padding(.top, 8)
+                    }
                 }
 
                 Button { importing = true } label: {
@@ -197,10 +218,10 @@ struct HomeView: View {
         }
         .background(Color(uiColor: .systemGroupedBackground))
         .navigationTitle("FTPortal")
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
             switch result {
             case .success(let urls):
-                if let url = urls.first { model.add(url); model.discoverLobbies() }
+                for url in urls { model.add(url) }; model.discoverLobbies()
             case .failure(let error): model.status = "File selection failed: \(error.localizedDescription)"
             }
         }
@@ -224,7 +245,7 @@ struct NearbyView: View {
                         }
                         Spacer()
                         Button { model.discoverLobbies() } label: { Image(systemName: "arrow.clockwise") }
-                            .buttonStyle(.bordered).disabled(model.isScanning)
+                            .buttonStyle(.bordered).disabled(model.isScanning).accessibilityLabel("Refresh nearby lobbies")
                     }
                     if model.isScanning { ProgressView("Scanning local network…").padding(.top, 10) }
                 }

@@ -11,9 +11,9 @@ internal sealed class ShareRegistry
     private readonly HashSet<string> _claimed = new(StringComparer.Ordinal);
     private readonly string _statePath;
 
-    public ShareRegistry()
+    public ShareRegistry(string? stateDirectory = null)
     {
-        var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FTPortal");
+        var directory = stateDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FTPortal");
         Directory.CreateDirectory(directory);
         _statePath = Path.Combine(directory, "shares.json");
         Load();

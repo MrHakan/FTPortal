@@ -1,7 +1,7 @@
 import Foundation
 import UniformTypeIdentifiers
 
-struct SharedFile: Identifiable, Codable {
+struct SharedFile: Identifiable, Codable, Equatable {
     let id: String
     let name: String
     let size: Int64

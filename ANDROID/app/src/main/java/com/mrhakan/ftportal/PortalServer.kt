@@ -21,6 +21,9 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
         private const val MAX_UPLOAD_BYTES = 8L * 1024L * 1024L * 1024L
     }
 
+    private val sharedPage: String? by lazy { readAsset("portal.html") }
+    private val qrScript: String? by lazy { readAsset("qr.js") }
+
     override fun serve(session: IHTTPSession): Response {
         val path = runCatching { Uri.decode(session.uri) }.getOrDefault(session.uri)
         val peer = session.remoteIpAddress.orEmpty().ifBlank { "Web/local peer" }
@@ -53,6 +56,10 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
         val announcedLength = session.headers["content-length"]?.toLongOrNull() ?: -1L
         // Content-Length also includes the multipart envelope; the uploaded
         // file itself is still checked against MAX_UPLOAD_BYTES below.
+        if (announcedLength < 0) return jsonError(Response.Status.BAD_REQUEST, "Content-Length is required")
+        if (!session.headers["content-type"].orEmpty().startsWith("multipart/form-data", ignoreCase = true)) {
+            return jsonError(Response.Status.UNSUPPORTED_MEDIA_TYPE, "Multipart form data is required")
+        }
         if (announcedLength > MAX_UPLOAD_BYTES + 1024 * 1024) {
             return jsonError(Response.Status.PAYLOAD_TOO_LARGE, "File is too large for this portal")
         }
@@ -126,8 +133,13 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
         val base = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
         val folder = File(base, "FTPortal").apply { mkdirs() }
         val target = uniqueFile(folder, fileName)
-        FileOutputStream(target).use { out -> copyWithProgress(tempFile, out, progress) }
-        return target.absolutePath
+        try {
+            FileOutputStream(target).use { out -> copyWithProgress(tempFile, out, progress) }
+            return target.absolutePath
+        } catch (error: Throwable) {
+            runCatching { target.delete() }
+            throw error
+        }
     }
 
     private fun copyWithProgress(source: File, output: OutputStream, progress: (Long) -> Unit) {
@@ -160,6 +172,7 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
 
     private fun receiveOffer(session: IHTTPSession): Response {
         val contentLength = session.headers["content-length"]?.toLongOrNull() ?: 0L
+        if (contentLength <= 0) return jsonError(Response.Status.BAD_REQUEST, "Offer body length is required")
         if (contentLength > 128 * 1024) return newFixedLengthResponse(Response.Status.PAYLOAD_TOO_LARGE, "text/plain; charset=utf-8", "Offer payload too large")
         val bodyFiles = HashMap<String, String>()
         val parsed = runCatching { session.parseBody(bodyFiles); bodyFiles["postData"].orEmpty() }.getOrNull()
@@ -237,10 +250,17 @@ class PortalServer(private val context: Context, port: Int) : NanoHTTPD(port) {
             .put("alias", PeerIdentity.alias())
             .put("maxUploadBytes", MAX_UPLOAD_BYTES)
             .put("lobbyActive", ShareRegistry.all().isNotEmpty() && PortalService.peerAvailable())
+            .put("peerAvailable", PortalService.peerAvailable())
             .put("files", files).put("addresses", urls).toString()
     }
 
-    private fun assetText(name: String): String? = runCatching {
+    private fun assetText(name: String): String? = when (name) {
+        "portal.html" -> sharedPage
+        "qr.js" -> qrScript
+        else -> readAsset(name)
+    }
+
+    private fun readAsset(name: String): String? = runCatching {
         context.assets.open(name).bufferedReader(Charsets.UTF_8).use { it.readText() }
     }.getOrNull()
 
