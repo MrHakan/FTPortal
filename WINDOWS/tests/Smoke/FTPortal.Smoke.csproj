@@ -5,6 +5,9 @@
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>false</PublishSingleFile>
     <AssemblyName>FTPortal.Smoke</AssemblyName>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../../FTPortal.Windows.csproj" /></ItemGroup>

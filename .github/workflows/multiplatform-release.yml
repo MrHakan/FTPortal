@@ -130,9 +130,9 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          dotnet build .\WINDOWS\tests\Smoke\FTPortal.Smoke.csproj -c Release -r win-x64 -p:SelfContained=false -p:PublishSingleFile=false
+          dotnet build .\WINDOWS\tests\Smoke\FTPortal.Smoke.csproj -c Release -r win-x64 -p:PublishSingleFile=false
           if ($LASTEXITCODE -ne 0) { throw "Windows smoke build failed" }
-          dotnet .\WINDOWS\tests\Smoke\bin\Release\net8.0-windows10.0.19041.0\win-x64\FTPortal.Smoke.dll
+          & .\WINDOWS\tests\Smoke\bin\Release\net8.0-windows10.0.19041.0\win-x64\FTPortal.Smoke.exe
           if ($LASTEXITCODE -ne 0) { throw "Windows smoke failed" }
       - name: Publish Windows x64
         shell: powershell
