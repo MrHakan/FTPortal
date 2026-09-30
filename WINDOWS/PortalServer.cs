@@ -313,7 +313,20 @@ internal sealed class PortalServer : IAsyncDisposable
         {
             if (!saved && transferId is not null)
                 _transfers.Finish(transferId, success: false, detail: "Transfer cancelled", finalBytes: transferred);
-            await ErrorAsync(StatusCodes.Status409Conflict, "Transfer cancelled before the file was saved");
+            // A cancelled multipart read can leave Kestrel's body reader pending.
+            // Complete the rejection and abort this request instead of allowing
+            // the server to drain/reuse an interrupted upload connection.
+            try
+            {
+                if (!context.RequestAborted.IsCancellationRequested)
+                {
+                    if (context.Request.Protocol is "HTTP/1.0" or "HTTP/1.1")
+                        context.Response.Headers["Connection"] = "close";
+                    await ErrorAsync(StatusCodes.Status409Conflict, "Transfer cancelled before the file was saved");
+                    await context.Response.CompleteAsync();
+                }
+            }
+            finally { context.Abort(); }
         }
         catch (Exception error)
         {

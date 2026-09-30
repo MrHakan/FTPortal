@@ -98,8 +98,13 @@ internal static class Smoke
                 var id = transfers.Active()[0].Id;
                 Check(transfers.Cancel(id), "Could not cancel an active streaming upload.");
                 gateBody.Release();
-                using var response = await request;
-                Check(!response.IsSuccessStatusCode, "Cancelled upload reported success.");
+                try
+                {
+                    using var response = await request;
+                    Check(!response.IsSuccessStatusCode, "Cancelled upload reported success.");
+                    Check(response.Headers.ConnectionClose == true, "Interrupted upload connection stayed reusable.");
+                }
+                catch (HttpRequestException) { /* The cancelled request may be aborted before its rejection arrives. */ }
                 Check(!File.Exists(Path.Combine(received, "cancelled.txt")), "Cancelled upload was published.");
             }
             Check(transfers.Active().Count == 0, "Active transfer state leaked after completion/cancellation.");
