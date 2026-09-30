@@ -311,6 +311,7 @@ internal sealed class PortalServer : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
+            if (!saved && temporary is not null) TryDelete(temporary);
             if (!saved && transferId is not null)
                 _transfers.Finish(transferId, success: false, detail: "Transfer cancelled", finalBytes: transferred);
             // A cancelled multipart read can leave Kestrel's body reader pending.
@@ -330,6 +331,7 @@ internal sealed class PortalServer : IAsyncDisposable
         }
         catch (Exception error)
         {
+            if (!saved && temporary is not null) TryDelete(temporary);
             if (!saved && transferId is not null)
                 _transfers.Finish(transferId, success: false, detail: "Could not save the uploaded file", finalBytes: transferred);
             var status = error is BadHttpRequestException badRequest ? badRequest.StatusCode
