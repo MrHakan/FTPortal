@@ -94,7 +94,7 @@ internal sealed class PortalServer : IAsyncDisposable
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = Array.Empty<string>() });
         builder.Services.Configure<FormOptions>(options =>
         {
-            options.MultipartBodyLengthLimit = _browserUploadLimit + 128 * 1024024 * 1024;
+            options.MultipartBodyLengthLimit = _browserUploadLimit + 128 * 1024;
             options.ValueLengthLimit = 16 * 1024;
             options.MultipartHeadersLengthLimit = 32 * 1024;
         });
