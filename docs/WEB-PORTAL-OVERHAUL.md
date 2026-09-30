@@ -114,8 +114,9 @@ header once, avoiding repeated full-body copies. The 32 MiB browser limit remain
   QR rendering under the host CSP, uploads, cancellation, search, selected
   addresses and keyboard file selection. `FTPORTAL_CHROMIUM` can select an
   installed Chromium executable for local checks.
-- On Windows: `dotnet run --project WINDOWS/tests/Smoke/FTPortal.Smoke.csproj
-  -c Release -r win-x64 -p:SelfContained=false -p:PublishSingleFile=false`:
+- On Windows, build with `dotnet build WINDOWS/tests/Smoke/FTPortal.Smoke.csproj
+  -c Release -r win-x64 -p:SelfContained=false -p:PublishSingleFile=false`, then
+  run `dotnet WINDOWS/tests/Smoke/bin/Release/net8.0-windows10.0.19041.0/win-x64/FTPortal.Smoke.dll`:
   actual Kestrel uploads/downloads, empty and oversized uploads, malformed and
   multiple-part rejection, collision handling, cancellation cleanup, stable
   selections, local admission, HEAD and claim/release/consume behavior. State and
