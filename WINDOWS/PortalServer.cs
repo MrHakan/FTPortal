@@ -2,6 +2,8 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.Net.Http.Headers;
 using System.Buffers;
 using System.Net.Sockets;
 using System.Text;
@@ -16,6 +18,12 @@ internal sealed class PortalServer : IAsyncDisposable
     private readonly ShareRegistry _shares;
     private readonly TransferCenter _transfers;
     private readonly NetworkTransportManager _network;
+    private readonly string? _uploadDirectory;
+    private readonly long _browserUploadLimit;
+    private readonly object _uploadCommitGate = new();
+    private readonly SemaphoreSlim _uploadSlots = new(2, 2);
+    private static readonly string? PortalAsset = EmbeddedAsset("FTPortal.Portal.html");
+    private static readonly string QrAsset = EmbeddedAsset("FTPortal.QR.js") ?? "/* QR unavailable */";
     private WebApplication? _legacyApp;
     private WebApplication? _peerApp;
 
@@ -23,11 +31,13 @@ internal sealed class PortalServer : IAsyncDisposable
     public bool PeerAvailable => _peerApp is not null;
     public string? PeerError { get; private set; }
 
-    public PortalServer(ShareRegistry shares, TransferCenter transfers, NetworkTransportManager network)
+    public PortalServer(ShareRegistry shares, TransferCenter transfers, NetworkTransportManager network, string? uploadDirectory = null, long browserUploadLimit = MaximumBrowserUploadBytes)
     {
         _shares = shares;
         _transfers = transfers;
         _network = network;
+        _uploadDirectory = uploadDirectory;
+        _browserUploadLimit = Math.Clamp(browserUploadLimit, 1, MaximumBrowserUploadBytes);
     }
 
     public async Task<int> StartAsync(params int[] ports)
@@ -84,7 +94,7 @@ internal sealed class PortalServer : IAsyncDisposable
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = Array.Empty<string>() });
         builder.Services.Configure<FormOptions>(options =>
         {
-            options.MultipartBodyLengthLimit = MaximumBrowserUploadBytes + 1024 * 1024;
+            options.MultipartBodyLengthLimit = _browserUploadLimit + 128 * 1024;
             options.ValueLengthLimit = 16 * 1024;
             options.MultipartHeadersLengthLimit = 32 * 1024;
         });
@@ -94,7 +104,7 @@ internal sealed class PortalServer : IAsyncDisposable
             // Browser form data has a small multipart envelope in addition to
             // the file.  Keep the hard limit explicit instead of accepting an
             // unbounded request body from a local client.
-            options.Limits.MaxRequestBodySize = MaximumBrowserUploadBytes + 1024 * 1024;
+            options.Limits.MaxRequestBodySize = _browserUploadLimit + 1024 * 1024;
         });
         var app = builder.Build();
         Configure(app, legacySurface);
@@ -149,12 +159,12 @@ internal sealed class PortalServer : IAsyncDisposable
         app.MapGet("/", () => Results.Content(Html(), "text/html; charset=utf-8"));
         app.MapGet("/dashboard", () => Results.Content(Html(), "text/html; charset=utf-8"));
         app.MapGet("/lobby", () => Results.Content(Html(), "text/html; charset=utf-8"));
-        app.MapGet("/qr.js", () => Results.Content(EmbeddedAsset("FTPortal.QR.js") ?? "/* QR unavailable */", "application/javascript; charset=utf-8"));
+        app.MapGet("/qr.js", () => Results.Content(QrAsset, "application/javascript; charset=utf-8"));
         app.MapGet("/api/portal", () => Results.Json(new
         {
             platform = "Windows",
             alias = Environment.MachineName,
-            maxUploadBytes = MaximumBrowserUploadBytes,
+            maxUploadBytes = _browserUploadLimit,
             lobbyActive = _shares.All().Count > 0 && PeerAvailable,
             peerAvailable = PeerAvailable,
             peerError = PeerError,
@@ -202,111 +212,137 @@ internal sealed class PortalServer : IAsyncDisposable
 
     private async Task ReceiveBrowserUploadAsync(HttpContext context)
     {
-        if (!context.Request.HasFormContentType)
+        async Task ErrorAsync(int status, string message)
         {
-            context.Response.StatusCode = StatusCodes.Status415UnsupportedMediaType;
-            await context.Response.WriteAsJsonAsync(new { ok = false, error = "Multipart form data is required" }, context.RequestAborted);
+            if (context.Response.HasStarted || context.RequestAborted.IsCancellationRequested) return;
+            context.Response.StatusCode = status;
+            await context.Response.WriteAsJsonAsync(new { ok = false, error = message }, CancellationToken.None);
+        }
+
+        if (!MediaTypeHeaderValue.TryParse(context.Request.ContentType, out var mediaType) ||
+            !string.Equals(mediaType.MediaType.Value, "multipart/form-data", StringComparison.OrdinalIgnoreCase))
+        {
+            await ErrorAsync(StatusCodes.Status415UnsupportedMediaType, "Multipart form data is required");
             return;
         }
-        if (context.Request.ContentLength is > MaximumBrowserUploadBytes + 1024 * 1024)
+        var boundary = HeaderUtilities.RemoveQuotes(mediaType.Boundary).Value;
+        if (string.IsNullOrWhiteSpace(boundary) || boundary.Length > 128)
         {
-            context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
-            await context.Response.WriteAsJsonAsync(new { ok = false, error = "File is too large for this portal" }, context.RequestAborted);
+            await ErrorAsync(StatusCodes.Status400BadRequest, "Invalid multipart boundary");
+            return;
+        }
+        if (context.Request.ContentLength > _browserUploadLimit + 1024 * 1024)
+        {
+            await ErrorAsync(StatusCodes.Status413PayloadTooLarge, "File is too large for this portal");
+            return;
+        }
+        if (!await _uploadSlots.WaitAsync(0, context.RequestAborted))
+        {
+            context.Response.Headers["Retry-After"] = "3";
+            await ErrorAsync(StatusCodes.Status503ServiceUnavailable, "Host is receiving two files. Retry when a transfer finishes.");
             return;
         }
 
-        IFormFile? upload;
-        try
-        {
-            var form = await context.Request.ReadFormAsync(context.RequestAborted);
-            upload = form.Files.GetFile("file") ?? form.Files.FirstOrDefault();
-        }
-        catch (Exception)
-        {
-            context.Response.StatusCode = StatusCodes.Status400BadRequest;
-            await context.Response.WriteAsJsonAsync(new { ok = false, error = "Could not read the upload" }, context.RequestAborted);
-            return;
-        }
-
-        if (upload is null || upload.Length <= 0)
-        {
-            context.Response.StatusCode = StatusCodes.Status400BadRequest;
-            await context.Response.WriteAsJsonAsync(new { ok = false, error = "No file was included" }, context.RequestAborted);
-            return;
-        }
-        if (upload.Length > MaximumBrowserUploadBytes)
-        {
-            context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
-            await context.Response.WriteAsJsonAsync(new { ok = false, error = "File is too large for this portal" }, context.RequestAborted);
-            return;
-        }
-
-        var fileName = SafeFileName(upload.FileName);
-        var destination = CreateBrowserUploadPath(fileName);
-        var transferId = _transfers.Begin(TransferDirection.Receive, fileName, RemotePeer(context), upload.Length);
+        string? temporary = null;
+        string? transferId = null;
         var transferred = 0L;
+        var saved = false;
         try
         {
-            using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
-                context.RequestAborted,
-                _transfers.Token(transferId)
-            );
+            // Read directly from the network into one unpublished .part file.
+            // Avoid ReadFormAsync/IFormFile's full temporary-disk buffering.
+            var reader = new MultipartReader(boundary, context.Request.Body)
+            {
+                HeadersLengthLimit = 16 * 1024,
+                BodyLengthLimit = _browserUploadLimit + 128 * 1024
+            };
+            var section = await reader.ReadNextSectionAsync(context.RequestAborted);
+            if (section is null ||
+                !ContentDispositionHeaderValue.TryParse(section.ContentDisposition, out var disposition) ||
+                !string.Equals(disposition.DispositionType.Value, "form-data", StringComparison.OrdinalIgnoreCase) ||
+                (!disposition.FileName.HasValue && !disposition.FileNameStar.HasValue))
+            {
+                await ErrorAsync(StatusCodes.Status400BadRequest, "Include exactly one file per upload");
+                return;
+            }
+            var fileName = SafeFileName(HeaderUtilities.RemoveQuotes(
+                disposition.FileNameStar.HasValue ? disposition.FileNameStar : disposition.FileName).Value ?? "upload");
+            var destination = CreateBrowserUploadPath(fileName);
+            temporary = destination + $".{Guid.NewGuid():N}.part";
+            transferId = _transfers.Begin(TransferDirection.Receive, fileName, RemotePeer(context), -1);
+            using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, _transfers.Token(transferId));
             var token = cancellation.Token;
-            // The request and parsed IFormFile length were validated above;
-            // IFormFile itself exposes its stream without a size parameter.
-            await using var input = upload.OpenReadStream();
-            await using var output = new FileStream(
-                destination,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.None,
-                128 * 1024,
-                FileOptions.Asynchronous | FileOptions.SequentialScan
-            );
-            var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
-            try
+            await using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
-                while (true)
+                var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+                try
                 {
-                    var read = await input.ReadAsync(buffer.AsMemory(), token);
-                    if (read == 0) break;
-                    await output.WriteAsync(buffer.AsMemory(0, read), token);
-                    transferred += read;
-                    _transfers.Update(transferId, transferred);
+                    while (true)
+                    {
+                        var read = await section.Body.ReadAsync(buffer.AsMemory(), token);
+                        if (read == 0) break;
+                        if (transferred + read > _browserUploadLimit)
+                            throw new BadHttpRequestException("File is too large for this portal", StatusCodes.Status413PayloadTooLarge);
+                        await output.WriteAsync(buffer.AsMemory(0, read), token);
+                        transferred += read;
+                        _transfers.Update(transferId, transferred);
+                    }
+                    if (await reader.ReadNextSectionAsync(token) is not null)
+                        throw new BadHttpRequestException("Include exactly one file per upload", StatusCodes.Status400BadRequest);
+                    await output.FlushAsync(token);
                 }
-                await output.FlushAsync(token);
+                finally { ArrayPool<byte>.Shared.Return(buffer); }
             }
-            finally
+            token.ThrowIfCancellationRequested();
+            // Another upload can choose the same name while this one streams.
+            // Resolve collisions at commit time and never overwrite a receipt.
+            lock (_uploadCommitGate)
             {
-                ArrayPool<byte>.Shared.Return(buffer);
+                destination = CreateBrowserUploadPath(fileName);
+                File.Move(temporary, destination, overwrite: false);
             }
-
-            if (transferred != upload.Length)
-                throw new IOException("Upload length changed while receiving the file.");
-
+            saved = true;
             _transfers.Finish(transferId, success: true, finalBytes: transferred);
             await context.Response.WriteAsJsonAsync(new
             {
-                ok = true,
-                name = fileName,
-                bytes = transferred,
-                destination = "Downloads/FTPortal"
+                ok = true, name = Path.GetFileName(destination), bytes = transferred, destination = "Downloads/FTPortal"
             }, cancellationToken: context.RequestAborted);
         }
         catch (OperationCanceledException)
         {
-            TryDelete(destination);
-            _transfers.Finish(transferId, success: false, detail: "Connection interrupted", finalBytes: transferred);
-        }
-        catch (Exception)
-        {
-            TryDelete(destination);
-            _transfers.Finish(transferId, success: false, detail: "Could not save the uploaded file", finalBytes: transferred);
-            if (!context.Response.HasStarted && !context.RequestAborted.IsCancellationRequested)
+            if (!saved && temporary is not null) TryDelete(temporary);
+            if (!saved && transferId is not null)
+                _transfers.Finish(transferId, success: false, detail: "Transfer cancelled", finalBytes: transferred);
+            // A cancelled multipart read can leave Kestrel's body reader pending.
+            // Complete the rejection and abort this request instead of allowing
+            // the server to drain/reuse an interrupted upload connection.
+            try
             {
-                context.Response.StatusCode = StatusCodes.Status500InternalServerError;
-                await context.Response.WriteAsJsonAsync(new { ok = false, error = "Could not save the uploaded file" }, CancellationToken.None);
+                if (!context.RequestAborted.IsCancellationRequested)
+                {
+                    if (context.Request.Protocol is "HTTP/1.0" or "HTTP/1.1")
+                        context.Response.Headers["Connection"] = "close";
+                    await ErrorAsync(StatusCodes.Status409Conflict, "Transfer cancelled before the file was saved");
+                    await context.Response.CompleteAsync();
+                }
             }
+            finally { context.Abort(); }
+        }
+        catch (Exception error)
+        {
+            if (!saved && temporary is not null) TryDelete(temporary);
+            if (!saved && transferId is not null)
+                _transfers.Finish(transferId, success: false, detail: "Could not save the uploaded file", finalBytes: transferred);
+            var status = error is BadHttpRequestException badRequest ? badRequest.StatusCode
+                : error is InvalidDataException ? StatusCodes.Status400BadRequest : StatusCodes.Status500InternalServerError;
+            await ErrorAsync(status, status == StatusCodes.Status413PayloadTooLarge ? "File is too large for this portal"
+                : status == StatusCodes.Status400BadRequest ? "Incomplete or invalid multipart upload" : "Could not save the uploaded file");
+        }
+        finally
+        {
+            if (temporary is not null) TryDelete(temporary);
+            _uploadSlots.Release();
         }
     }
 
@@ -533,13 +569,10 @@ internal sealed class PortalServer : IAsyncDisposable
         return clean.Length <= 180 ? clean : clean[..180];
     }
 
-    private static string CreateBrowserUploadPath(string fileName)
+    private string CreateBrowserUploadPath(string fileName)
     {
-        var root = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            "Downloads",
-            "FTPortal"
-        );
+        var root = _uploadDirectory ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "FTPortal");
         Directory.CreateDirectory(root);
 
         var candidate = Path.Combine(root, fileName);
@@ -574,7 +607,7 @@ internal sealed class PortalServer : IAsyncDisposable
 
     private string Html()
     {
-        var page = EmbeddedAsset("FTPortal.Portal.html");
+        var page = PortalAsset;
         if (page is not null) return page;
         // Keep the self-contained legacy page as a packaging fallback.
         var encoder = HtmlEncoder.Default;

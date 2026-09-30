@@ -1,0 +1,10 @@
+{
+  "name": "ftportal-web-checks",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/portal.test.mjs",
+    "test:browser": "node tests/browser-smoke.mjs"
+  },
+  "devDependencies": { "playwright": "1.62.1" }
+}

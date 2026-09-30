@@ -310,6 +310,7 @@ internal static class PeerOfferReceiver
                     {
                         var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), transferToken);
                         if (read == 0) break;
+                        if (file.Size >= 0 && received + read > file.Size) throw new IOException("Peer exceeded the advertised file size.");
                         await destination.WriteAsync(buffer.AsMemory(0, read), transferToken);
                         received += read;
                         transfers.Update(transferId, received);

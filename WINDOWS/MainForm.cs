@@ -36,6 +36,15 @@ internal sealed class MainForm : Form
     private IReadOnlyList<SharedFile> _visibleShares = [];
     private IReadOnlyList<PeerLobby> _visibleLobbies = [];
     private IReadOnlyList<IncomingPeerOffer> _visibleOffers = [];
+    private readonly CancellationTokenSource _lifetime = new();
+    private Task _startupTask = Task.CompletedTask;
+    private Task _maintenanceTask = Task.CompletedTask;
+    private Task _discoveryTask = Task.CompletedTask;
+    private readonly HashSet<string> _receivingOffers = new(StringComparer.Ordinal);
+    private readonly Button _cancelShareButton = new() { Text = "Remove selected", AutoSize = true };
+    private readonly Button _joinButton = new() { Text = "Open selected lobby", AutoSize = true };
+    private readonly Button _acceptButton = new() { Text = "Accept selected", AutoSize = true };
+    private readonly Button _declineButton = new() { Text = "Decline selected", AutoSize = true };
     private bool _allowExit;
     private bool _scanInProgress;
     private int _networkChanged;
@@ -46,9 +55,12 @@ internal sealed class MainForm : Form
     public MainForm()
     {
         Text = "FTPortal · Windows";
-        Width = 940;
-        Height = 720;
-        MinimumSize = new Size(760, 560);
+        Width = 1100;
+        Height = 790;
+        MinimumSize = new Size(850, 620);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        Font = new Font("Segoe UI", 10);
+        DoubleBuffered = true;
         StartPosition = FormStartPosition.CenterScreen;
         _transportSupervisor = new TransportSupervisor(_network, _ssid, _pass);
         _server = new PortalServer(_shares, _transfers, _network);
@@ -56,7 +68,7 @@ internal sealed class MainForm : Form
 
         var add = new Button { Text = "Share file", AutoSize = true };
         add.Click += (_, _) => AddFile();
-        var cancel = new Button { Text = "Cancel selected share", AutoSize = true };
+        var cancel = _cancelShareButton;
         cancel.Click += (_, _) => CancelSelectedShares();
         var cancelTransfers = new Button { Text = "Cancel active transfers", AutoSize = true };
         cancelTransfers.Click += (_, _) =>
@@ -71,84 +83,91 @@ internal sealed class MainForm : Form
         clear.Click += (_, _) => ClearPendingShares();
         var refreshLobbies = new Button { Text = "Refresh lobbies", AutoSize = true };
         refreshLobbies.Click += async (_, _) => await RefreshLobbiesAsync(force: true);
-        var joinLobby = new Button { Text = "Join selected lobby", AutoSize = true };
+        var joinLobby = _joinButton;
         joinLobby.Click += (_, _) => JoinSelectedLobby();
-        var acceptIncoming = new Button { Text = "Accept incoming", AutoSize = true };
+        var acceptIncoming = _acceptButton;
         acceptIncoming.Click += async (_, _) => await AcceptSelectedOfferAsync();
-        var declineIncoming = new Button { Text = "Decline incoming", AutoSize = true };
+        var declineIncoming = _declineButton;
         declineIncoming.Click += (_, _) => DeclineSelectedOffer();
         var browser = new Button { Text = "Open browser dashboard", AutoSize = true };
         browser.Click += (_, _) => OpenDashboard();
         var hotspot = new Button { Text = "Start hotspot fallback", AutoSize = true };
         hotspot.Click += async (_, _) =>
         {
-            _notice.Text = await _transportSupervisor.StartManualFallbackAsync();
+            hotspot.Enabled = false;
+            try { _notice.Text = await _transportSupervisor.StartManualFallbackAsync(_lifetime.Token); }
+            catch (OperationCanceledException) { }
+            finally { hotspot.Enabled = true; }
             RefreshDashboard();
         };
         var stopHotspot = new Button { Text = "Stop hotspot", AutoSize = true };
         stopHotspot.Click += async (_, _) =>
         {
-            _notice.Text = await _transportSupervisor.StopManualFallbackAsync();
+            stopHotspot.Enabled = false;
+            try { _notice.Text = await _transportSupervisor.StopManualFallbackAsync(_lifetime.Token); }
+            catch (OperationCanceledException) { }
+            finally { stopHotspot.Enabled = true; }
             RefreshDashboard();
         };
 
-        var buttons = new FlowLayoutPanel
+        var copyAddress = new Button { Text = "Copy invite link", AutoSize = true };
+        copyAddress.Click += (_, _) =>
         {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            WrapContents = true,
-            Padding = new Padding(0, 8, 0, 8)
+            var url = DashboardUrl();
+            if (url is null) { _notice.Text = "Connect to a local network first."; return; }
+            try { Clipboard.SetText(url); _notice.Text = "Invite link copied. The other device must join the same network."; }
+            catch { _notice.Text = "Clipboard unavailable. Copy the displayed address manually."; }
         };
-        buttons.Controls.AddRange([
-            add, cancel, clear, cancelTransfers, history, refreshLobbies, joinLobby, acceptIncoming, declineIncoming, browser, hotspot, stopHotspot
-        ]);
-
+        var lobbyPage = new Button { Text = "Invite / QR", AutoSize = true };
+        lobbyPage.Click += (_, _) =>
+        {
+            var url = DashboardUrl();
+            if (url is not null) Process.Start(new ProcessStartInfo(url.Replace("/dashboard", "/lobby")) { UseShellExecute = true });
+        };
         var header = new FlowLayoutPanel
         {
-            Dock = DockStyle.Top,
-            FlowDirection = FlowDirection.TopDown,
-            AutoSize = true,
-            WrapContents = false,
-            Padding = new Padding(12)
+            Dock = DockStyle.Top, FlowDirection = FlowDirection.TopDown,
+            AutoSize = true, WrapContents = false, Padding = new Padding(16, 12, 16, 8)
         };
         header.Controls.Add(new Label { Text = "FTPortal", AutoSize = true, Font = new Font("Segoe UI", 24, FontStyle.Bold) });
         header.Controls.Add(_address);
         header.Controls.Add(_transport);
-        header.Controls.Add(_discovery);
         header.Controls.Add(_transferStatus);
-        header.Controls.Add(new Label { Text = $"Hotspot fallback: SSID {_ssid} · password {_pass}", AutoSize = true });
-        header.Controls.Add(_notice);
-        header.Controls.Add(buttons);
-
-        var mySharesGroup = new GroupBox { Text = "My one-shot shares", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        mySharesGroup.Controls.Add(_files);
-        var lobbiesGroup = new GroupBox { Text = "Nearby FTPortal lobbies", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        lobbiesGroup.Controls.Add(_lobbies);
-        var incomingGroup = new GroupBox { Text = "Incoming v2 offers · Accept / Decline", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        incomingGroup.Controls.Add(_incoming);
-        var activeTransfersGroup = new GroupBox { Text = "Active transfers · cancellation releases one-shot claims", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        activeTransfersGroup.Controls.Add(_activeTransfers);
-        _lobbies.DoubleClick += (_, _) => JoinSelectedLobby();
-        _incoming.DoubleClick += async (_, _) => await AcceptSelectedOfferAsync();
+        header.Controls.Add(ActionRow(browser, copyAddress, lobbyPage));
+        var advanced = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Visible = false };
+        advanced.Controls.Add(_discovery);
+        advanced.Controls.Add(new Label { Text = $"Hotspot: {_ssid} · password {_pass}", AutoSize = true });
+        advanced.Controls.Add(ActionRow(hotspot, stopHotspot));
+        var networkDetails = new CheckBox { Text = "Network details and hotspot controls", AutoSize = true };
+        networkDetails.CheckedChanged += (_, _) => advanced.Visible = networkDetails.Checked;
+        header.Controls.Add(networkDetails); header.Controls.Add(advanced); header.Controls.Add(_notice);
 
         var lists = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill,
-            RowCount = 4,
-            ColumnCount = 1,
+            Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 2,
             Padding = new Padding(12, 0, 12, 12)
         };
-        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 32));
-        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 30));
-        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
-        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 18));
-        lists.Controls.Add(mySharesGroup, 0, 0);
-        lists.Controls.Add(lobbiesGroup, 0, 1);
-        lists.Controls.Add(incomingGroup, 0, 2);
-        lists.Controls.Add(activeTransfersGroup, 0, 3);
-
-        Controls.Add(lists);
-        Controls.Add(header);
+        lists.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        lists.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 54));
+        lists.RowStyles.Add(new RowStyle(SizeType.Percent, 46));
+        lists.Controls.Add(ListPanel("My one-shot shares", _files, add, cancel, clear), 0, 0);
+        lists.Controls.Add(ListPanel("Nearby lobbies", _lobbies, refreshLobbies, joinLobby), 1, 0);
+        lists.Controls.Add(ListPanel("Incoming offers · verify the code before accepting", _incoming, acceptIncoming, declineIncoming), 0, 1);
+        lists.Controls.Add(ListPanel("Transfers", _activeTransfers, cancelTransfers, history), 1, 1);
+        _lobbies.DoubleClick += (_, _) => JoinSelectedLobby();
+        _incoming.DoubleClick += async (_, _) => await AcceptSelectedOfferAsync();
+        _files.SelectedIndexChanged += (_, _) => UpdateSelectionActions();
+        _lobbies.SelectedIndexChanged += (_, _) => UpdateSelectionActions();
+        _incoming.SelectedIndexChanged += (_, _) => UpdateSelectionActions();
+        Controls.Add(lists); Controls.Add(header);
+        void FitHeader()
+        {
+            foreach (var label in new[] { _address, _transport, _discovery, _transferStatus, _notice })
+                label.MaximumSize = new Size(Math.Max(400, ClientSize.Width - 64), 0);
+        }
+        SizeChanged += (_, _) => FitHeader(); FitHeader();
+        ApplyTheme(this); UpdateSelectionActions();
 
         _tray.Icon = SystemIcons.Application;
         _tray.Text = "FTPortal";
@@ -162,17 +181,82 @@ internal sealed class MainForm : Form
         _tray.ContextMenuStrip = menu;
 
         FormClosing += OnFormClosing;
-        Shown += async (_, _) => await StartAsync();
+        Shown += async (_, _) => { _startupTask = StartAsync(); await _startupTask; };
         _timer.Tick += async (_, _) =>
         {
+            if (_allowExit || !_maintenanceTask.IsCompleted) return;
+            _maintenanceTask = MaintainAsync();
+            await _maintenanceTask;
+        };
+    }
+
+    private static FlowLayoutPanel ActionRow(params Button[] buttons)
+    {
+        var row = new FlowLayoutPanel { AutoSize = true, WrapContents = true, Padding = new Padding(0, 6, 0, 6) };
+        row.Controls.AddRange(buttons); return row;
+    }
+
+    private static GroupBox ListPanel(string title, ListBox list, params Button[] buttons)
+    {
+        var panel = new GroupBox { Text = title, Dock = DockStyle.Fill, Padding = new Padding(10), Margin = new Padding(4) };
+        list.IntegralHeight = false; list.HorizontalScrollbar = true; list.BorderStyle = BorderStyle.FixedSingle;
+        var actions = ActionRow(buttons); actions.Dock = DockStyle.Bottom;
+        panel.Controls.Add(list); panel.Controls.Add(actions); return panel;
+    }
+
+    private static void ApplyTheme(Control control)
+    {
+        control.BackColor = control is ListBox ? Color.FromArgb(13, 15, 18) : Color.FromArgb(20, 23, 32);
+        control.ForeColor = Color.FromArgb(232, 236, 245);
+        if (control is Button button)
+        {
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderColor = Color.FromArgb(55, 71, 95);
+            button.Padding = new Padding(8, 3, 8, 3);
+            button.MinimumSize = new Size(0, 34);
+        }
+        foreach (Control child in control.Controls) ApplyTheme(child);
+    }
+
+    private void UpdateSelectionActions()
+    {
+        _cancelShareButton.Enabled = _files.SelectedIndices.Count > 0;
+        _joinButton.Enabled = _lobbies.SelectedIndex >= 0;
+        var index = _incoming.SelectedIndex;
+        var available = index >= 0 && index < _visibleOffers.Count && !_receivingOffers.Contains(_visibleOffers[index].OfferId);
+        _acceptButton.Enabled = available; _declineButton.Enabled = available;
+    }
+
+    private async Task MaintainAsync()
+    {
+        try
+        {
             var networkChanged = Interlocked.Exchange(ref _networkChanged, 0) == 1;
-            var fallbackNotice = await _transportSupervisor.EnsureFallbackAsync();
+            var notice = await _transportSupervisor.EnsureFallbackAsync(cancellationToken: _lifetime.Token);
+            if (_allowExit) return;
             if (networkChanged) await RebindMdnsAsync();
             RefreshDashboard();
-            if (!string.IsNullOrWhiteSpace(fallbackNotice)) _notice.Text = fallbackNotice;
+            if (!string.IsNullOrWhiteSpace(notice)) _notice.Text = notice;
             await RefreshLobbiesAsync(force: networkChanged);
-        };
-        _timer.Start();
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (!_allowExit) _notice.Text = "Network refresh failed: " + ex.Message; }
+    }
+
+    // Preserve selections by stable identity and skip unchanged list rebuilds.
+    internal static void UpdateList(ListBox list, IReadOnlyList<string> oldIds, IReadOnlyList<string> newIds, string[] items)
+    {
+        if (list.Items.Cast<string>().SequenceEqual(items) && oldIds.SequenceEqual(newIds)) return;
+        var selected = list.SelectedIndices.Cast<int>().Where(index => index < oldIds.Count).Select(index => oldIds[index]).ToHashSet(StringComparer.Ordinal);
+        var top = list.TopIndex;
+        list.BeginUpdate();
+        try
+        {
+            list.Items.Clear(); list.Items.AddRange(items);
+            for (var index = 0; index < newIds.Count; index++) if (selected.Contains(newIds[index])) list.SetSelected(index, true);
+            if (items.Length > 0) list.TopIndex = Math.Min(top, items.Length - 1);
+        }
+        finally { list.EndUpdate(); }
     }
 
     private async Task StartAsync()
@@ -180,16 +264,19 @@ internal sealed class MainForm : Form
         try
         {
             await _server.StartAsync(80, 8080, 8787);
-            var fallbackNotice = await _transportSupervisor.EnsureFallbackAsync(force: true);
+            if (_allowExit) return;
+            var fallbackNotice = await _transportSupervisor.EnsureFallbackAsync(force: true, cancellationToken: _lifetime.Token);
+            if (_allowExit) return;
             if (!string.IsNullOrWhiteSpace(fallbackNotice)) _notice.Text = fallbackNotice;
             _mdns = new MdnsResponder(client => _network.AddressForClient(client));
             _mdns.Start();
             RefreshDashboard();
             await RefreshLobbiesAsync(force: true);
+            if (!_allowExit) _timer.Start();
         }
         catch (Exception ex)
         {
-            _notice.Text = "Server failed: " + ex.Message;
+            if (!_allowExit) _notice.Text = "Server failed: " + ex.Message;
         }
     }
 
@@ -249,6 +336,7 @@ internal sealed class MainForm : Form
 
     private void RefreshDashboard()
     {
+        if (_allowExit) return;
         var primary = _network.Primary();
         if (primary is null || _server.Port == 0)
         {
@@ -275,27 +363,23 @@ internal sealed class MainForm : Form
         };
         _discovery.Text = $"{peerText} · {mdnsText}";
 
-        _visibleShares = _shares.All();
-        var items = _visibleShares.Select(file => $"{file.Name}  ·  {file.Size:N0} bytes  ·  one-shot").ToArray();
-        _files.BeginUpdate();
-        _files.Items.Clear();
-        _files.Items.AddRange(items);
-        _files.EndUpdate();
+        var shares = _shares.All();
+        var items = shares.Select(file => $"{file.Name}  ·  {file.Size:N0} bytes  ·  one-shot").ToArray();
+        var oldShareIds = _visibleShares.Select(file => file.Id).ToArray();
+        _visibleShares = shares;
+        UpdateList(_files, oldShareIds, shares.Select(file => file.Id).ToArray(), items);
 
         var activeTransfers = _transfers.Active();
         var historyCount = _transfers.History().Count;
         _transferStatus.Text = activeTransfers.Count == 0
             ? $"Transfers: idle · history: {historyCount}"
             : $"Transfers: {activeTransfers.Count} active · {string.Join(" · ", activeTransfers.Take(2).Select(FormatTransfer))}";
-        _activeTransfers.BeginUpdate();
-        _activeTransfers.Items.Clear();
         var transferItems = activeTransfers.Count == 0
             ? new[] { "No active transfers." }
             : activeTransfers.Select(transfer =>
                 $"{FormatTransfer(transfer)}  ·  {transfer.Peer}  ·  {transfer.BytesTransferred:N0}/{(transfer.TotalBytes >= 0 ? transfer.TotalBytes.ToString("N0") : "stream")} bytes"
             ).ToArray();
-        _activeTransfers.Items.AddRange(transferItems);
-        _activeTransfers.EndUpdate();
+        UpdateList(_activeTransfers, [], [], transferItems);
 
         RefreshIncomingOffers();
     }
@@ -382,20 +466,19 @@ internal sealed class MainForm : Form
 
     private void RefreshIncomingOffers()
     {
+        var oldIds = _visibleOffers.Select(offer => offer.OfferId).ToArray();
         _visibleOffers = PeerOfferStore.Incoming();
         var items = _visibleOffers.Select(offer =>
             $"{offer.SenderAlias}  ·  {offer.SenderPlatform}  ·  {offer.Files.Count} file{(offer.Files.Count == 1 ? "" : "s")}  ·  code {offer.VerificationCode}"
         ).ToArray();
-        _incoming.BeginUpdate();
-        _incoming.Items.Clear();
-        _incoming.Items.AddRange(items);
-        _incoming.EndUpdate();
+        UpdateList(_incoming, oldIds, _visibleOffers.Select(offer => offer.OfferId).ToArray(), items);
+        UpdateSelectionActions();
     }
 
     private async Task RefreshLobbiesAsync(bool force)
     {
-        if (_scanInProgress) return;
-        if (!force && DateTime.UtcNow - _lastLobbyScan < TimeSpan.FromSeconds(15)) return;
+        if (_scanInProgress || _allowExit) return;
+        if (!force && DateTime.UtcNow - _lastLobbyScan < TimeSpan.FromSeconds(30)) return;
         _scanInProgress = true;
         _lastLobbyScan = DateTime.UtcNow;
 
@@ -403,20 +486,23 @@ internal sealed class MainForm : Form
         {
             _notice.Text = "Scanning for FTPortal lobbies…";
             var transports = _network.Snapshot();
-            _visibleLobbies = await PeerDiscovery.DiscoverAsync(transports);
-            _lobbies.BeginUpdate();
-            _lobbies.Items.Clear();
-            _lobbies.Items.AddRange(_visibleLobbies.Select(lobby =>
+            var scan = PeerDiscovery.DiscoverAsync(transports, _lifetime.Token);
+            _discoveryTask = scan;
+            var lobbies = await scan;
+            if (_allowExit) return;
+            var oldIds = _visibleLobbies.Select(lobby => lobby.DeviceId).ToArray();
+            _visibleLobbies = lobbies;
+            UpdateList(_lobbies, oldIds, lobbies.Select(lobby => lobby.DeviceId).ToArray(), lobbies.Select(lobby =>
                 $"{lobby.Alias}  ·  {lobby.Platform}  ·  {lobby.Files.Count} file{(lobby.Files.Count == 1 ? "" : "s")}  ·  {(lobby.SupportsOffers ? "v2" : "v1")}  ·  {lobby.Host}"
             ).ToArray());
-            _lobbies.EndUpdate();
+            UpdateSelectionActions();
             _notice.Text = _visibleLobbies.Count == 0
                 ? "No active FTPortal lobbies found."
                 : $"Found {_visibleLobbies.Count} active FTPortal lobb{(_visibleLobbies.Count == 1 ? "y" : "ies")}.";
         }
         catch (Exception ex)
         {
-            _notice.Text = "Lobby scan failed: " + ex.Message;
+            if (!_allowExit) _notice.Text = "Lobby scan failed: " + ex.Message;
         }
         finally
         {
@@ -487,11 +573,11 @@ internal sealed class MainForm : Form
             {
                 if (ReferenceEquals(activeCancellation, cancellation)) activeCancellation = null;
                 cancellation.Dispose();
-                cancelTransfer.Enabled = false;
-                if (!dialog.IsDisposed) download.Enabled = true;
+                if (!dialog.IsDisposed) { cancelTransfer.Enabled = false; download.Enabled = true; }
             }
         };
         cancelTransfer.Click += (_, _) => activeCancellation?.Cancel();
+        dialog.FormClosing += (_, _) => activeCancellation?.Cancel();
         actions.Controls.Add(download);
         actions.Controls.Add(cancelTransfer);
 
@@ -551,6 +637,7 @@ internal sealed class MainForm : Form
         var index = _incoming.SelectedIndex;
         if (index < 0 || index >= _visibleOffers.Count) return;
         var offer = _visibleOffers[index];
+        if (_receivingOffers.Contains(offer.OfferId)) return;
         var files = string.Join(Environment.NewLine, offer.Files.Select(file =>
             $"• {file.Name}{(file.Size >= 0 ? $" · {file.Size:N0} bytes" : "")}"
         ));
@@ -575,7 +662,11 @@ internal sealed class MainForm : Form
         if (folder.ShowDialog(this) != DialogResult.OK) return;
 
         _notice.Text = $"Receiving {offer.Files.Count} file{(offer.Files.Count == 1 ? "" : "s")} from {offer.SenderAlias}…";
-        var result = await PeerOfferReceiver.ReceiveAllAsync(offer, folder.SelectedPath, _transfers);
+        _receivingOffers.Add(offer.OfferId); UpdateSelectionActions();
+        PeerOfferReceiveResult result;
+        try { result = await PeerOfferReceiver.ReceiveAllAsync(offer, folder.SelectedPath, _transfers, _lifetime.Token); }
+        finally { _receivingOffers.Remove(offer.OfferId); UpdateSelectionActions(); }
+        if (_allowExit) return;
         RefreshIncomingOffers();
         RefreshDashboard();
         await RefreshLobbiesAsync(force: true);
@@ -627,6 +718,8 @@ internal sealed class MainForm : Form
             $"{lobby.Alias} ({lobby.Host})",
             file.Size
         );
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _transfers.Token(transferId), _lifetime.Token);
+        cancellationToken = cancellation.Token;
         var received = 0L;
         try
         {
@@ -651,6 +744,7 @@ internal sealed class MainForm : Form
                 {
                     var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken);
                     if (read == 0) break;
+                    if (file.Size >= 0 && received + read > file.Size) throw new IOException("Peer sent more bytes than advertised.");
                     await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
                     received += read;
                     _transfers.Update(transferId, received);
@@ -665,7 +759,7 @@ internal sealed class MainForm : Form
 
             File.Move(temp, target, overwrite: true);
             _transfers.Finish(transferId, success: true, finalBytes: received);
-            MessageBox.Show(this, $"Received {file.Name}", "FTPortal", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            if (!_allowExit) MessageBox.Show(this, $"Received {file.Name}", "FTPortal", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return true;
         }
         catch (Exception ex)
@@ -673,7 +767,7 @@ internal sealed class MainForm : Form
             try { if (File.Exists(temp)) File.Delete(temp); } catch { }
             var detail = TransferError(ex);
             _transfers.Finish(transferId, success: false, detail: detail, finalBytes: received);
-            MessageBox.Show(this, "Transfer failed: " + detail, "FTPortal", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!_allowExit) MessageBox.Show(this, "Transfer failed: " + detail, "FTPortal", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
     }
@@ -696,12 +790,18 @@ internal sealed class MainForm : Form
         return leaf;
     }
 
-    private void OpenDashboard()
+    private string? DashboardUrl()
     {
         var primary = _network.Primary();
-        if (primary is null || _server.Port == 0) return;
+        if (primary is null || _server.Port == 0) return null;
         var suffix = _server.Port == 80 ? "" : $":{_server.Port}";
-        Process.Start(new ProcessStartInfo($"http://{primary.Address}{suffix}") { UseShellExecute = true });
+        return $"http://{primary.Address}{suffix}/dashboard";
+    }
+
+    private void OpenDashboard()
+    {
+        var url = DashboardUrl();
+        if (url is not null) Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
     }
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
@@ -732,6 +832,11 @@ internal sealed class MainForm : Form
         if (_allowExit) return;
         _allowExit = true;
         _timer.Stop();
+        _lifetime.Cancel(); _transfers.CancelAll();
+        // Refresh handlers already report failures. A previously failed scan
+        // must not prevent listener and tray cleanup during shutdown.
+        try { await Task.WhenAll(_startupTask, _maintenanceTask, _discoveryTask); }
+        catch (Exception) { }
         if (_mdns is not null) await _mdns.DisposeAsync();
         await _server.DisposeAsync();
         _transportSupervisor.Dispose();

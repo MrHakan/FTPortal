@@ -55,9 +55,9 @@ internal sealed class TransferCenter
         Converters = { new JsonStringEnumConverter() }
     };
 
-    public TransferCenter()
+    public TransferCenter(string? stateDirectory = null)
     {
-        var directory = Path.Combine(
+        var directory = stateDirectory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "FTPortal"
         );

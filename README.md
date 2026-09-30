@@ -56,7 +56,10 @@ Windows, Android and iOS now share the same offline `/dashboard` and `/lobby`
 browser views, visually aligned with the original FTPHAKAN dashboard and
 PowerShell lobby. The lobby shows a local address QR, active bearer addresses
 and native peer availability; the dashboard shows an invite QR, file queue,
-one-shot transfers and browser uploads. The
+one-shot transfers and browser uploads. Sending supports a bounded queue,
+explicit cancellation/retry, progress and connection recovery; search and
+pagination keep large transfer lists manageable. Windows browser uploads stream
+directly to disk, and native Windows selections survive background refreshes. The
 webpage does not pretend to offer private recipient selection: use the native
 Nearby view for discovery and v2 offers. PowerShell retains its more advanced
 existing dashboard, sessions, QR enrollment and transport supervisor. See
